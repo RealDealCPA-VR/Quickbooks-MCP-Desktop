@@ -297,15 +297,68 @@ export class SimulationStore {
       entity.FullName = String(addData.Name);
     }
 
+    const finalEntity = isTransaction
+      ? this.convertLinesAddToRet(entity)
+      : entity;
+
     const storeKey = isTransaction ? id : id;
-    store.set(storeKey, entity);
+    store.set(storeKey, finalEntity);
 
     return {
       type: rsType,
       statusCode: 0,
       statusSeverity: "Info",
       statusMessage: "Status OK",
-      data: { [retName]: entity },
+      data: { [retName]: finalEntity },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Line conversion: *LineAdd → *LineRet
+  // -----------------------------------------------------------------------
+
+  // Real QB returns line items as *LineRet with a generated TxnLineID and a
+  // resolved Amount. The simulation has to do the same so downstream tools
+  // (totals, payment application, reports) see the response shape they expect.
+  private convertLinesAddToRet(
+    entity: StoredEntity
+  ): StoredEntity {
+    const result: StoredEntity = { ...entity };
+    for (const key of Object.keys(result)) {
+      const match = key.match(/^(.+?)Line(s?)Add$/);
+      if (!match) continue;
+      const [, prefix, plural] = match;
+      const retKey = `${prefix}Line${plural}Ret`;
+      const value = result[key];
+      const lines = Array.isArray(value)
+        ? (value as Record<string, unknown>[])
+        : value && typeof value === "object"
+          ? [value as Record<string, unknown>]
+          : [];
+      result[retKey] = lines.map((line) => this.convertLineAddToRet(line));
+      delete result[key];
+    }
+    return result;
+  }
+
+  private convertLineAddToRet(
+    line: Record<string, unknown>
+  ): Record<string, unknown> {
+    const qty = line.Quantity;
+    const rate = line.Rate;
+    const explicitAmount = line.Amount;
+    let amount: number;
+    if (qty !== undefined && qty !== null && rate !== undefined && rate !== null) {
+      amount = Number(qty) * Number(rate);
+    } else if (explicitAmount !== undefined && explicitAmount !== null) {
+      amount = Number(explicitAmount);
+    } else {
+      amount = 0;
+    }
+    return {
+      TxnLineID: this.nextId(),
+      ...line,
+      Amount: amount,
     };
   }
 

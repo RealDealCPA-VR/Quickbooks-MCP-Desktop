@@ -43,30 +43,6 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 1 — Simulation correctness
 
-### Item 17 — Convert `*LineAdd` to `*LineRet` in simulation responses _(Phase 1)_
-
-**Status:** pending
-
-**Behavioral criteria**:
-- [ ] Creating an invoice with 2 lines via `qb_invoice_create` returns a response containing `InvoiceLineRet` (not `InvoiceLineAdd`) with 2 entries.
-- [ ] Each `InvoiceLineRet` entry has a generated `TxnLineID`.
-- [ ] Each line has `Amount` computed as `Quantity * Rate` if both supplied; otherwise echoes the explicit `Amount` if provided; otherwise `0`.
-- [ ] Subsequent `qb_invoice_list` retrieval of the same invoice returns the same `InvoiceLineRet` array (persistence verification).
-- [ ] Same conversion happens for `BillExpenseLineRet`, `BillItemLineRet`, `EstimateLineRet`, and any other `*LineAdd` → `*LineRet` pair.
-
-**Regression criteria**:
-- [ ] Existing seed invoices (which have no lines) still list correctly.
-- [ ] Item 15's filters still work after this change.
-
-**Documentation criteria**:
-- [ ] None required — this is internal correctness.
-
-**Notes**:
-- The parser's `arrayElements` set already includes `InvoiceLineRet`, `BillLineRet`, `EstimateLineRet` — no parser change needed.
-- `TxnLineID` generation can reuse `nextId()` helper.
-
----
-
 ### Item 16 — Compute totals in simulation `handleAdd` _(Phase 1)_
 
 **Status:** pending
@@ -210,6 +186,35 @@ _(Add criteria for items 6, 7, 8, 9, etc. as they are picked up. Don't pre-write
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 17 — Convert `*LineAdd` to `*LineRet` in simulation responses _(Phase 1)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] Creating an invoice with 2 lines via `qb_invoice_create` returns a response containing `InvoiceLineRet` (not `InvoiceLineAdd`) with 2 entries.
+- [x] Each `InvoiceLineRet` entry has a generated `TxnLineID`.
+- [x] Each line has `Amount` computed as `Quantity * Rate` if both supplied; otherwise echoes the explicit `Amount` if provided; otherwise `0`.
+- [x] Subsequent `qb_invoice_list` retrieval of the same invoice returns the same `InvoiceLineRet` array (persistence verification).
+- [x] Same conversion happens for `EstimateLineRet`, Bill `ExpenseLineRet` + `ItemLineRet`, and any other `*LineAdd` → `*LineRet` pair.
+
+**Regression criteria**:
+- [x] Existing seed invoices (which have no lines) still list correctly.
+- [x] Item 15's filters still work after this change.
+
+**Documentation criteria**:
+- [x] None required — internal correctness change.
+
+**Implementation notes**:
+- Generic helper `convertLinesAddToRet` at [src/session/simulation-store.ts:312-359](src/session/simulation-store.ts#L312-L359) scans the entity for keys matching `/^(.+?)Line(s?)Add$/` and rewrites each into a `*LineRet` array. Only invoked for transaction entities (the `isTransactionType` gate in `handleAdd`) — list entities never carry line arrays.
+- Single-line input (parsed by fast-xml-parser as an object, not array) is normalized to a 1-element array before mapping, so the response always has a homogeneous `*LineRet` shape regardless of input cardinality.
+- `Amount` rule per acceptance: `Quantity * Rate` if both present → fallback to explicit `Amount` → fallback to `0`. Bill `ItemLineAdd` uses `Cost`, not `Rate`, so `Quantity * Cost` is NOT auto-computed — explicit `Amount` is required for those lines (matches real QB behavior).
+- Adopted real QBXML element names (`ExpenseLineRet`, `ItemLineRet`, no Bill prefix) over the handoff's draft `BillExpenseLineRet` / `BillItemLineRet` because live mode will return the standard names — staying consistent across modes.
+- Parser `arrayElements` extended at [src/qbxml/parser.ts:39-55](src/qbxml/parser.ts#L39-L55) with `ExpenseLineRet`, `ItemLineRet`, `SalesReceiptLineRet`, `CreditMemoLineRet`, `PurchaseOrderLineRet`, `SalesOrderLineRet`, `DepositLineRet` — single-line responses now parse as 1-element arrays for live mode.
+- `TxnLineID` reuses `nextId()` (counter + base36 timestamp). Real QB uses a different ID format but downstream code only cares about presence + uniqueness.
+- Verified end-to-end with a 30-check inline script (deleted post-verification per "no test infra yet"): 2-line invoice, persistence via list, single-line normalization, all three Amount fallback paths, no-line invoice (no `*LineRet` key produced — preserves seed invoice shape), Bill with parallel `ExpenseLineAdd` + `ItemLineAdd`, Estimate, Customer non-transaction (no conversion attempted), and Item 15 filter regression.
+
+---
 
 ### Item 15 — Transaction filters in simulation store _(Phase 1)_ — done 2026-04-25
 
