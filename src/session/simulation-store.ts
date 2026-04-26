@@ -336,6 +336,19 @@ export class SimulationStore {
           data: {},
         };
       }
+    } else if (entityType === "JournalEntry") {
+      // Balance invariant: sum(debits) === sum(credits) to the cent. Validate
+      // BEFORE persisting — a doomed JE must not pollute the store.
+      const balanceCheck = this.validateJournalEntryBalance(finalEntity);
+      if (!balanceCheck.ok) {
+        return {
+          type: rsType,
+          statusCode: 3030,
+          statusSeverity: "Error",
+          statusMessage: balanceCheck.error,
+          data: {},
+        };
+      }
     }
 
     const storeKey = isTransaction ? id : id;
@@ -995,7 +1008,62 @@ export class SimulationStore {
       result.TotalAmount = lineSum;
     }
 
+    // JournalEntry has no single TotalAmount — debit and credit lines are two
+    // independent sums that must equal each other (validated separately by
+    // validateJournalEntryBalance before persist). Store both for inspection;
+    // the lineSum loop above blindly added both sides together so it's not
+    // useful here. No Subtotal, no SalesTaxTotal, no AR/AP bookkeeping (the
+    // balance invariant is the only structural rule this entity carries).
+    if (entityType === "JournalEntry") {
+      result.TotalDebit = this.sumLineAmounts(result.JournalDebitLineRet);
+      result.TotalCredit = this.sumLineAmounts(result.JournalCreditLineRet);
+    }
+
     return result;
+  }
+
+  // -----------------------------------------------------------------------
+  // JournalEntry balance invariant
+  // -----------------------------------------------------------------------
+
+  // sum(debits) === sum(credits) to the cent. Real QB rejects unbalanced
+  // entries with statusCode 3030 ("request data is invalid"); the simulation
+  // mirrors that. Tolerance is 0.005 to absorb floating-point drift on the
+  // sums (a JE with cents-level amounts shouldn't fail because 0.1 + 0.2 !==
+  // 0.3 in IEEE 754).
+  //
+  // Called from handleAdd BEFORE persist so a doomed JE never lands in the
+  // store, and from handleMod AFTER applyLineMods + computeTotals (post-mod
+  // sums) BEFORE persist so a mod that breaks the invariant is rejected
+  // without corrupting the stored entry.
+  private validateJournalEntryBalance(
+    entity: StoredEntity
+  ): { ok: true } | { ok: false; error: string } {
+    const debit = this.sumLineAmounts(entity.JournalDebitLineRet);
+    const credit = this.sumLineAmounts(entity.JournalCreditLineRet);
+    if (Math.abs(debit - credit) > 0.005) {
+      return {
+        ok: false,
+        error: `JournalEntry debits (${debit.toFixed(2)}) must equal credits (${credit.toFixed(2)})`,
+      };
+    }
+    if (debit === 0 && credit === 0) {
+      return {
+        ok: false,
+        error: "JournalEntry requires at least one debit and one credit line",
+      };
+    }
+    return { ok: true };
+  }
+
+  private sumLineAmounts(lines: unknown): number {
+    if (!Array.isArray(lines)) return 0;
+    let sum = 0;
+    for (const line of lines as Record<string, unknown>[]) {
+      const amt = Number(line.Amount ?? 0);
+      if (!Number.isNaN(amt)) sum += amt;
+    }
+    return sum;
   }
 
   // -----------------------------------------------------------------------
@@ -1213,12 +1281,31 @@ export class SimulationStore {
         entityType === "Estimate" ||
         entityType === "SalesReceipt" ||
         entityType === "CreditMemo" ||
-        entityType === "PurchaseOrder")
+        entityType === "PurchaseOrder" ||
+        entityType === "JournalEntry")
     ) {
       if (entityType === "Bill") {
         delete updated.AmountDue;
       }
       updated = this.computeTotals(updated, entityType);
+    }
+
+    // JE balance invariant re-check on every mod — both line mods (which can
+    // unbalance the entry) and header-only mods (defensive — should already
+    // be balanced from the prior add/mod). Return 3030 BEFORE persist so a
+    // doomed mod never lands in the store. Runs after computeTotals so
+    // TotalDebit/TotalCredit on `updated` reflect the post-mod sums.
+    if (entityType === "JournalEntry") {
+      const balanceCheck = this.validateJournalEntryBalance(updated);
+      if (!balanceCheck.ok) {
+        return {
+          type: rsType,
+          statusCode: 3030,
+          statusSeverity: "Error",
+          statusMessage: balanceCheck.error,
+          data: {},
+        };
+      }
     }
 
     store.set(id, updated);

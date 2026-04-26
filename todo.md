@@ -32,7 +32,7 @@ So that everything below can actually be verified without a Windows box.
 
 - [x] **10.** Add `qb_account_delete` / `qb_account_make_inactive` — currently only list/add/update; needed to deactivate unused accounts (QB usually disallows hard delete if transactions exist, so `make_inactive` is the correct primary).
 - [x] **11.** Add `qb_employee_delete` / `make_inactive` (currently only list/add/update).
-- [ ] **12.** Add missing transaction tools: ~~`qb_sales_receipt_*`~~ (done 2026-04-26), ~~`qb_credit_memo_*`~~ (done 2026-04-26), ~~`qb_purchase_order_*`~~ (done 2026-04-26), `qb_journal_entry_*` (parser already declares `Ret` arrays for these, but no tool exposes them).
+- [x] **12.** Add missing transaction tools: ~~`qb_sales_receipt_*`~~ (done 2026-04-26), ~~`qb_credit_memo_*`~~ (done 2026-04-26), ~~`qb_purchase_order_*`~~ (done 2026-04-26), ~~`qb_journal_entry_*`~~ (done 2026-04-26).
 - [x] **13.** Add `qb_estimate_update`, `qb_estimate_delete`, `qb_estimate_convert_to_invoice` tools — currently only list/create.
 - [x] **30.** Add `Class`, `Terms`, `PaymentMethod`, `SalesRep`, `CustomerType`, `VendorType` list tools — needed because invoice/bill creation references these by `FullName` but there's no way to list/discover them.
 
@@ -61,4 +61,4 @@ So that everything below can actually be verified without a Windows box.
 
 - [ ] **31.** Add `tests/` directory with Vitest: round-trip tests for builder→parser, simulation-store CRUD per entity, filter handling, and tool integration tests through the MCP server transport.
 - [ ] **32.** Add `.gitignore` (`node_modules/`, `dist/`, `*.log`, `.env`), `.env.example` documenting all `QB_*` vars, and run `npm run build` to verify `dist/` produces working node entry.
-- [ ] **33.** Update README tool count and tables once new tools (~~bill_update~~, ~~payment_apply~~, ~~bill_pay~~, ~~account_delete~~, ~~sales_receipt~~/~~credit_memo~~/~~PO~~/JE, ~~estimate_update/delete/convert~~, ~~supporting list tools~~) are added. _(2026-04-26: only `qb_journal_entry_*` README work pending — close this item when JE lands.)_
+- [x] **33.** Update README tool count and tables once new tools (~~bill_update~~, ~~payment_apply~~, ~~bill_pay~~, ~~account_delete~~, ~~sales_receipt~~/~~credit_memo~~/~~PO~~/~~JE~~, ~~estimate_update/delete/convert~~, ~~supporting list tools~~) are added. _(Closed 2026-04-26 when JE README work landed.)_

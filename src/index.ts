@@ -17,6 +17,7 @@
  * - Payment recording
  * - Estimate / Quote management
  * - Purchase Order management (vendor-side, non-posting)
+ * - Journal Entry management (debit/credit balanced GL postings)
  * - Employee management
  * - Financial reporting (AR/AP aging, balance summaries)
  * - Raw QBXML query access for advanced operations
@@ -51,6 +52,7 @@ import { registerEstimateTools } from "./tools/estimates.js";
 import { registerSalesReceiptTools } from "./tools/sales-receipts.js";
 import { registerCreditMemoTools } from "./tools/credit-memos.js";
 import { registerPurchaseOrderTools } from "./tools/purchase-orders.js";
+import { registerJournalEntryTools } from "./tools/journal-entries.js";
 import { registerEmployeeTools } from "./tools/employees.js";
 import { registerListTools } from "./tools/lists.js";
 import { registerReportTools } from "./tools/reports.js";
@@ -96,6 +98,7 @@ const server = new McpServer(
       "  • qb_sales_receipt_*— Sales receipt (cash sale) management (list, create, update, delete). Cash-sale equivalent of an invoice — sale settles instantly, no AR balance, no payment application. Funds post to depositToAccountName (typically 'Undeposited Funds' or a bank account); paymentMethodName documents how the customer paid. qb_sales_receipt_create accepts a `lines` array (same shape as qb_invoice_create); Subtotal derives from the line set and TotalAmount = Subtotal + SalesTaxTotal. qb_sales_receipt_update takes txnId + editSequence (from a prior list); passing `lines` REPLACES the line set wholesale and Subtotal/TotalAmount recompute. There is no BalanceRemaining or IsPaid (the receipt is closed on creation) and no customer-balance side effect (cash sales don't post to AR). Stale editSequence rejects with 3170.",
       "  • qb_credit_memo_* — Credit memo management (list, create, update, apply, delete). AR-negative analog of an invoice — same line shape, but TotalAmount credits the customer instead of billing them. On creation customer.Balance moves by -TotalAmount; RemainingValue = TotalAmount − AppliedAmount tracks the unapplied credit pool. qb_credit_memo_create accepts `lines` (Subtotal + TotalAmount derive from the set) and an optional `appliedTo: [{txnId, amount}]` to immediately close out part or all of one or more open invoices on creation; sum(amount) ≤ TotalAmount, unknown invoice TxnID rejects atomically. qb_credit_memo_update mirrors qb_invoice_update for header/line edits — passing `lines` REPLACES the line set wholesale, Subtotal/TotalAmount recompute, and customer balance moves by -(newTotal − oldTotal) (memo grew → customer balance drops further). qb_credit_memo_apply re-targets an EXISTING memo to a different invoice set via txnId + editSequence + replacement applyTo array; the prior application is reversed and the new one applied atomically without further customer-balance movement (the credit pool just shifts to invoice-level). Pass applyTo: [] to fully unapply. TotalAmount is immutable on this path; stale editSequence rejects with 3170.",
       "  • qb_purchase_order_* — Purchase order management (list, create, update, delete). Vendor-side analog of Estimate — a non-posting commitment to buy from a vendor. Does NOT touch Vendor.Balance / AP (that only moves when items are received against the PO via a bill). Lines use Cost (not Rate); each line's Amount = Quantity * Cost is computed at the tool layer. qb_purchase_order_create requires at least one line; TotalAmount = sum(line amounts) — POs have no separate Subtotal header. qb_purchase_order_update mirrors qb_invoice_update for header/line edits — passing `lines` REPLACES the line set wholesale and TotalAmount recomputes; no vendor-balance side effect on either header or line changes. isManuallyClosed: true on create or update marks the PO closed regardless of receipt activity (typical workflow: cancel a PO that won't be received). Stale editSequence rejects with 3170.",
+      "  • qb_journal_entry_* — Journal entry management (list, create, update, delete). Two-sided GL posting — every entry carries a `debits` array AND a `credits` array, each line naming a GL account by full name. The hard invariant is sum(debits.amount) === sum(credits.amount) to the cent — unbalanced entries reject with statusCode 3030 (validated before persist on both create and update). qb_journal_entry_create requires at least one line on each side. qb_journal_entry_update takes txnId + editSequence; passing `debits` or `credits` REPLACES that side wholesale (lines with a matching txnLineID are merged, lines you don't list are dropped) and the post-mod sums must still balance. Each line accepts an optional entityName (Customer/Vendor/Employee/OtherName) — recorded faithfully but does NOT move that entity's open balance in this server's first cut (real QB moves AR/AP per-line; that bookkeeping is deferred). Stale editSequence rejects with 3170.",
       "  • qb_employee_*    — Employee management (list, add, update, make_inactive, delete) — qb_employee_make_inactive flips IsActive to false (preferred — preserves history; employee hides from the default list view but stays referenceable by historical paychecks/timesheets). qb_employee_delete is a hard delete that real QB rejects (statusCode 3260/3170) for employees with any transaction history; use only for empty employee records created in error.",
       "  • qb_class_list / qb_terms_list / qb_payment_method_list / qb_sales_rep_list / qb_customer_type_list / qb_vendor_type_list — Reference lists (read-only). Used to discover valid FullName values that transactions reference (Class on lines, Terms on invoice/bill headers, PaymentMethod on receive-payments, SalesRep/CustomerType/VendorType for segmentation). qb_terms_list fans across both StandardTerms and DateDrivenTerms by default — pass termsType to scope.",
       "  • qb_balance_summary / qb_ar_aging / qb_ap_aging — Financial reports",
@@ -141,6 +144,7 @@ registerEstimateTools(server, getSessionManager);
 registerSalesReceiptTools(server, getSessionManager);
 registerCreditMemoTools(server, getSessionManager);
 registerPurchaseOrderTools(server, getSessionManager);
+registerJournalEntryTools(server, getSessionManager);
 registerEmployeeTools(server, getSessionManager);
 registerListTools(server, getSessionManager);
 registerReportTools(server, getSessionManager);

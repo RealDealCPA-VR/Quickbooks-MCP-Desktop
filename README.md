@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (66 total)
+## Tools (70 total)
 
 ### Customers
 | Tool | Description |
@@ -147,6 +147,21 @@ A `PurchaseOrder` is the vendor-side analog of an `Estimate` — a non-posting c
 | `qb_purchase_order_create` | Create a PO. Takes `lines: [{itemName, quantity, cost, description?, memo?}]` (at least one required). `TotalAmount = sum(quantity * cost)`. Optional `dueDate`, `shipToEntity`, `isManuallyClosed`. |
 | `qb_purchase_order_update` | Modify an existing PO. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, cost?, memo?}]`. Header-only mods leave existing lines untouched. `TotalAmount` recomputes after line mods. |
 | `qb_purchase_order_delete` | Delete a PO. Non-posting, so no vendor balance to reverse — pure record removal. |
+
+### Journal Entries
+
+A `JournalEntry` is the structural outlier of the transaction family — every other transaction posts from a single side (invoice → AR, bill → AP, etc.) but a JE is fundamentally two-sided: every entry carries a `debits` array AND a `credits` array, each line naming a GL account by full name. The hard invariant is `sum(debits.amount) === sum(credits.amount)` to the cent (real QB rejects unbalanced entries with statusCode 3030; the simulation matches this and validates **before persist** on both create and update so a doomed entry never lands in the store). The simulation stores `TotalDebit` + `TotalCredit` on the entry for inspection (always equal by invariant); there is no single `TotalAmount` header field on a JE.
+
+Each line accepts an optional `entityName` to attach a Customer / Vendor / Employee / OtherName reference. **The reference is recorded faithfully but does NOT move that entity's open balance in this server's first cut.** Real QB moves AR/AP per-line when a debit/credit on a Customer or Vendor line lands; that bookkeeping is meaningfully more involved than a single `adjustPartyBalanceForTxn` call (each line is its own posting, sign depends on debit-vs-credit + AR-vs-AP, and a single JE can touch many entities) and is deferred. Per-line `className` is similarly recorded but not used for any reporting rollup yet.
+
+`qb_journal_entry_update` mirrors the rest of the transaction-update tools for header / line edits. Pass `txnId` + `editSequence` (from a prior `qb_journal_entry_list`) plus any header fields and/or replacement `debits` / `credits` arrays. Passing `debits` REPLACES the debit-side wholesale (matching `txnLineID`s are merged in place, lines you don't list are dropped); same for `credits`. Either side can be replaced independently — but the **post-mod sums must still balance** or the mod is rejected with statusCode 3030 and nothing is persisted (no partial state). A stale `editSequence` rejects with statusCode 3170.
+
+| Tool | Description |
+|------|-------------|
+| `qb_journal_entry_list` | List/search journal entries with date / refNumber / modified-date filters. |
+| `qb_journal_entry_create` | Create a JE. Takes `debits: [{accountName, amount, memo?, entityName?, className?}]` AND `credits: [...]` (at least one line on each side). `sum(debits) === sum(credits)` enforced; statusCode 3030 on imbalance. |
+| `qb_journal_entry_update` | Modify an existing JE. Pass `txnId` + `editSequence` plus any header fields and/or replacement `debits` / `credits`. Either side can be replaced independently; the post-mod sums must still balance or the mod rejects with 3030. |
+| `qb_journal_entry_delete` | Delete a JE. No AR/AP balance to reverse (per-line entity-balance moves are deferred) — pure record removal. |
 
 ### Employees
 
@@ -294,5 +309,6 @@ The server targets QBXML version 16.0 and supports the following request types:
 - `ItemQueryRq/AddRq/ModRq` — Items
 - `ReceivePaymentAddRq/QueryRq` — Payments
 - `EstimateQueryRq/AddRq` — Estimates
+- `JournalEntryQueryRq/AddRq/ModRq` — Journal entries (debit/credit balanced GL postings)
 - `EmployeeQueryRq/AddRq/ModRq` — Employees
 - `ListDelRq / TxnDelRq` — Deletions

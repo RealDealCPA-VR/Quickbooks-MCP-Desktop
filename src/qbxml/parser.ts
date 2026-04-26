@@ -62,6 +62,8 @@ const arrayElements = new Set([
   "PurchaseOrderRet",
   "PurchaseOrderLineRet",
   "JournalEntryRet",
+  "JournalDebitLineRet",
+  "JournalCreditLineRet",
   "DepositRet",
   "DepositLineRet",
   "TransferRet",

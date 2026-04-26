@@ -49,13 +49,7 @@ _(All Phase 3 items complete — see Completed below.)_
 
 ## Phase 4 — Missing tools / coverage gaps
 
-_(In progress — Items 10, 11, 13, 30 complete; Item 12 partial — SalesReceipt + CreditMemo + PurchaseOrder families done, JournalEntry pending. See Completed for entries.)_
-
-## Item 12 — Missing transaction tools (`qb_journal_entry_*`) _(Phase 4)_
-
-**Status:** in-progress (SalesReceipt + CreditMemo + PurchaseOrder families done — see Completed; JournalEntry remaining)
-
-Per-family criteria are deferred and written when the family is picked up. JournalEntry is the outlier — debits/credits must balance; reject unbalanced entries with statusCode 3030 at the simulation layer (or tool layer). Per-line entity-balance moves only apply when journal lines reference Customer/Vendor entities via `EntityRef` — defer that bookkeeping until after the basic CRUD + balance-validation shape lands.
+_(All Phase 4 in-scope items complete — Items 10, 11, 12, 13, 30. See Completed for entries. Item 24 (dead-code hygiene) and remaining Phase 4 plumbing items (23, 25-29) still open per `todo.md`.)_
 
 ---
 
@@ -66,6 +60,49 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 12 (JournalEntry) — Journal entry tools (`qb_journal_entry_list` / `_create` / `_update` / `_delete`) _(Phase 4)_ — done 2026-04-26
+
+**Status:** done (4 of 4 families in Item 12 — Item 12 is now fully complete).
+
+**Behavioral criteria** _(create / list / delete)_:
+- [x] All four tools registered and listed by the MCP server. Verified J1.
+- [x] `qb_journal_entry_create` with balanced `debits` + `credits` arrays returns a JE with both `JournalDebitLineRet` + `JournalCreditLineRet` arrays (each line carrying `TxnLineID` + `AccountRef` + `Amount`) plus `TotalDebit` and `TotalCredit` (always equal, derived in `computeTotals`). Verified J2.
+- [x] `qb_journal_entry_create` with `sum(debits) !== sum(credits)` is rejected with `isError: true` + `statusCode: 3030` and the entry is NOT persisted (subsequent `qb_journal_entry_list` cannot find it). Verified J3.
+- [x] `qb_journal_entry_create` with empty `debits` (or empty `credits`) is rejected by zod (`.min(1)`); the simulation never receives the request. Verified J4.
+- [x] `qb_journal_entry_create` does NOT move any Customer/Vendor balance, even when lines carry `entityName` (per-line entity-balance moves are deferred per the handoff — `EntityRef` is recorded faithfully on the stored entity but no balance side effect). Verified J5.
+- [x] `qb_journal_entry_list` filters by `txnId` (TxnID), `refNumber`, `fromDate`/`toDate` (TxnDateRangeFilter), `modifiedFrom`/`modifiedTo` (ModifiedDateRangeFilter). Verified J6.
+- [x] `qb_journal_entry_delete` happy path: subsequent `qb_journal_entry_list { txnId }` returns `count: 0`. No customer/vendor balance side effect (no per-line entity bookkeeping to reverse). Verified J7.
+- [x] `qb_journal_entry_delete` unknown `txnId` returns `isError: true` with `statusCode: 500`. Verified J8.
+
+**Behavioral criteria** _(`qb_journal_entry_update` — header / line edits, balance invariant)_:
+- [x] Header-only mod (no `debits`, no `credits`) leaves the existing line sets, `TotalDebit`, and `TotalCredit` untouched; `EditSequence` rotates and `TimeModified` updates. Verified U1.
+- [x] When `debits` is provided, the array REPLACES the JE's `JournalDebitLineRet` wholesale — debit lines whose `TxnLineID` is not listed are dropped. Same for `credits` and `JournalCreditLineRet`. The two sides are independent. Verified U2.
+- [x] A line entry with a `txnLineID` matching an existing line preserves that `TxnLineID` and merges the mod's fields onto the existing line (e.g. memo-only mod preserves accountName and amount). Verified U2.
+- [x] After a line mod, `TotalDebit` and `TotalCredit` recompute from the new line sets via `computeTotals` (JournalEntry branch added to the post-mod recompute conjunction). Verified U2.
+- [x] A mod that breaks the balance invariant (post-mod `sum(debits) !== sum(credits)`) is rejected with `statusCode: 3030`; the JE does NOT mutate (re-fetched JE has the pre-mod amounts, line shapes, and `EditSequence`). Verified U3.
+- [x] Updating only one side (e.g. `debits` provided, `credits` omitted) is allowed when the post-mod sums still balance (the unmodified side carries forward). Verified U4.
+- [x] Stale `editSequence` rejects with `statusCode: 3170`; the JE does NOT mutate. Verified U5.
+- [x] `EditSequence` rotates after every successful mod. Verified U6.
+
+**Regression criteria**:
+- [x] `qb_invoice_update` line mod still recomputes `Subtotal` + `BalanceRemaining` (computeTotals JournalEntry branch did not regress Invoice path). Verified R1.
+- [x] `qb_estimate_update` line mod still recomputes `Subtotal`. Verified R2.
+- [x] `qb_bill_update` line mod still recomputes `AmountDue`. Verified R3.
+- [x] `qb_sales_receipt_update` line mod still recomputes `Subtotal` + `TotalAmount`. Verified R4.
+- [x] `qb_credit_memo_update` line mod still recomputes `Subtotal` + `TotalAmount` + `RemainingValue` and moves customer balance by the delta. Verified R5.
+- [x] `qb_purchase_order_update` line mod still recomputes `TotalAmount`; vendor balance unchanged. Verified R6.
+
+**Build / structural criteria**:
+- [x] `npm run build` passes (no TypeScript errors).
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated with a `qb_journal_entry_*` bullet describing the debit/credit balance invariant (3030), per-line entity-balance deferral, and replacement-line semantics.
+- [x] README tool count bumped 66 → 70; new "Journal Entries" section with intro paragraphs + 4-row tool table; `JournalEntryQueryRq/AddRq/ModRq` added to the QBXML reference list.
+- [x] `JournalDebitLineRet` and `JournalCreditLineRet` added to `arrayElements` in [src/qbxml/parser.ts](src/qbxml/parser.ts) so single-line responses still come back as arrays.
+- [x] `convertLinesAddToRet` regex `/^(.+?)Line(s?)Add$/` matches `JournalDebitLineAdd` / `JournalCreditLineAdd` for free; tool layer pre-computes `Amount` so `convertLineAddToRet` honors it (no qty/rate/cost on JE lines).
+- [x] `applyLineMods` regex `/^(.+?)Line(s?)Mod$/` matches `JournalDebitLineMod` / `JournalCreditLineMod` for free.
+- [x] JournalEntry already wired in `isTransactionType` ([src/session/simulation-store.ts](src/session/simulation-store.ts)), `buildDeleteRequest` transaction list ([src/qbxml/builder.ts](src/qbxml/builder.ts)), `deleteEntity` transaction list ([src/session/manager.ts](src/session/manager.ts)).
+
+---
 
 ### Item 12 (PurchaseOrder) — Purchase order tools (`qb_purchase_order_list` / `_create` / `_update` / `_delete`) _(Phase 4)_ — done 2026-04-26
 
