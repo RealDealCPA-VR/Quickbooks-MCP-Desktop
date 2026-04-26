@@ -55,7 +55,7 @@ _(All Phase 4 in-scope items complete — Items 10, 11, 12, 13, 30. See Complete
 
 ## Phase 5 — Reporting
 
-_(Item 14 done — see Completed below. Items 19, 20, 21 still open per `todo.md`.)_
+_(Items 14, 21 done — see Completed below. Items 19, 20 still open per `todo.md`.)_
 
 ---
 
@@ -66,6 +66,43 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 21 — `qb_balance_summary` canonical ordering + subtotals + advisory date range _(Phase 5)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] `qb_balance_summary` (no args) returns `balanceSummary` as an **array** (not an object) of `{ accountType, accounts, total }` entries.
+- [x] Entries are emitted in canonical QB order: Assets (Bank → AccountsReceivable → OtherCurrentAsset → Inventory → FixedAsset → OtherAsset) → Liabilities (AccountsPayable → CreditCard → OtherCurrentLiability → LongTermLiability) → Equity → Income (Income → OtherIncome) → Expenses (CostOfGoodsSold → Expense → OtherExpense) → NonPosting. Empty groups are skipped (operator-friendly).
+- [x] Unknown / future AccountType values land in a trailing `Other` bucket so nothing is silently dropped.
+- [x] Response includes a `subtotals` block: `{ assets, liabilities, equity, income, expenses, netIncome }` where `netIncome = income − expenses`. With seed data: assets=191700, liabilities=3700, equity=0, income=257000, expenses=279800, netIncome=−22800.
+- [x] Optional `fromDate` / `toDate` zod params (regex-validated `YYYY-MM-DD`). When either is passed, the response surfaces `asOfDateRange: { from, to }` (the unset side is `null`) AND a string `asOfNote` explaining that simulation balances are a current snapshot, not date-windowed.
+- [x] When neither date is passed, `asOfDateRange` is `null` and `asOfNote` is omitted from the JSON entirely (not `null`, not empty string).
+- [x] Invalid date strings (e.g. `"01/01/2026"`) are rejected by the zod schema before the handler runs.
+- [x] Errors from the underlying `session.queryEntity("Account", {})` call are translated into `{ success: false, statusCode, statusMessage }` with `isError: true` (Item 25 reference shape, mirroring `qb_company_info`).
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `totalAccounts: 10` in the response (seed unchanged).
+- [x] Per-group account name ordering preserved from seed insertion order (Bank: `["Checking","Savings"]`; Income: `["Sales Revenue","Consulting Revenue"]`).
+- [x] `qb_company_info` still works (no shared state damaged).
+- [x] `qb_account_list` regression: still returns 10 accounts (the new constants + handler are tool-local).
+
+**Documentation criteria**:
+- [x] README "Reports & Queries" table description updated to reflect canonical ordering, subtotals, and advisory date params.
+- [x] `instructions` block in [src/index.ts](src/index.ts) — left as `"Connection & company info"` for the section ownership of `qb_company_info`; the `qb_balance_summary` description string carries the granular detail.
+- [x] No DECISIONS.md entry needed (canonical ordering is from QB's documented report layout; not a tradeoff).
+- [x] No ARCHITECTURE.md change (still a thin reshape over `queryEntity("Account", ...)` — `runReport` was deliberately not touched; that debt belongs with Item 20).
+
+**Verification commands**:
+```bash
+npm run build
+# Then via verification harness:
+#   qb_balance_summary({}) -> assert canonical order, 6 non-empty groups, subtotals correct, totalAccounts=10
+#   qb_balance_summary({fromDate, toDate}) -> assert asOfDateRange + asOfNote present
+#   zod schema rejects "01/01/2026"
+```
+
+**Notes**: The shape change (`balanceSummary: Record<string,...>` → `balanceSummary: [...]`) is intentional and breaking — the previous shape relied on JS object insertion order which is brittle and operator-meaningless. Any future caller is expected to read by `accountType` field. Item 21 deliberately does NOT implement actual date-window balance reconstruction — that's a transaction-walk problem that lands with Item 20 (P&L / Balance Sheet via `GeneralSummaryReportQueryRq`). The `asOfNote` is the honesty mechanism: surface the simulation gap rather than fake the calculation. Numeric totals are rounded to 2 decimals via a local `round2` helper to avoid floating-point fuzz showing up in the response.
 
 ### Item 14 — Real `CompanyQueryRq` in `qb_company_info` _(Phase 5)_ — done 2026-04-26
 

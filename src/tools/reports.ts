@@ -8,6 +8,25 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 
+const ASSET_TYPES = ["Bank", "AccountsReceivable", "OtherCurrentAsset", "Inventory", "FixedAsset", "OtherAsset"] as const;
+const LIABILITY_TYPES = ["AccountsPayable", "CreditCard", "OtherCurrentLiability", "LongTermLiability"] as const;
+const EQUITY_TYPES = ["Equity"] as const;
+const INCOME_TYPES = ["Income", "OtherIncome"] as const;
+const EXPENSE_TYPES = ["CostOfGoodsSold", "Expense", "OtherExpense"] as const;
+const NONPOSTING_TYPES = ["NonPosting"] as const;
+const CANONICAL_ACCOUNT_TYPES: readonly string[] = [
+  ...ASSET_TYPES,
+  ...LIABILITY_TYPES,
+  ...EQUITY_TYPES,
+  ...INCOME_TYPES,
+  ...EXPENSE_TYPES,
+  ...NONPOSTING_TYPES,
+];
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
 export function registerReportTools(
   server: McpServer,
   getSession: () => QBSessionManager
@@ -61,32 +80,98 @@ export function registerReportTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_balance_summary",
-    "Get a summary of key account balances (AR, AP, bank, income, expenses).",
-    {},
-    async () => {
+    "Get a balance summary across all accounts, grouped by AccountType in canonical QB order (Assets → Liabilities → Equity → Income → Expenses → NonPosting) with category subtotals (assets, liabilities, equity, income, expenses, netIncome). Optional fromDate/toDate are advisory in simulation mode (the seeded Balance is a current snapshot — historical reconstruction lands with the P&L / Balance Sheet work).",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Optional start of reporting window (YYYY-MM-DD). Advisory in simulation mode — see asOfNote in the response."),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("Optional end of reporting window (YYYY-MM-DD). Advisory in simulation mode — see asOfNote in the response."),
+    },
+    async ({ fromDate, toDate }) => {
       const session = getSession();
-      const accounts = await session.queryEntity("Account", {});
+      try {
+        const accounts = await session.queryEntity("Account", {});
 
-      const summary: Record<string, { accounts: string[]; total: number }> = {};
-
-      for (const acct of accounts) {
-        const type = String(acct.AccountType ?? "Unknown");
-        if (!summary[type]) {
-          summary[type] = { accounts: [], total: 0 };
+        const buckets = new Map<string, { name: string; balance: number }[]>();
+        for (const acct of accounts) {
+          const type = String(acct.AccountType ?? "Unknown");
+          const entry = {
+            name: String(acct.FullName ?? acct.Name ?? ""),
+            balance: Number(acct.Balance ?? 0),
+          };
+          const list = buckets.get(type);
+          if (list) list.push(entry);
+          else buckets.set(type, [entry]);
         }
-        summary[type].accounts.push(String(acct.FullName ?? acct.Name ?? ""));
-        summary[type].total += Number(acct.Balance ?? 0);
-      }
 
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            balanceSummary: summary,
-            totalAccounts: accounts.length,
-          }, null, 2),
-        }],
-      };
+        const balanceSummary: { accountType: string; accounts: string[]; total: number }[] = [];
+        const usedTypes = new Set<string>();
+        for (const type of CANONICAL_ACCOUNT_TYPES) {
+          const items = buckets.get(type);
+          if (!items || items.length === 0) continue;
+          usedTypes.add(type);
+          balanceSummary.push({
+            accountType: type,
+            accounts: items.map((i) => i.name),
+            total: round2(items.reduce((s, i) => s + i.balance, 0)),
+          });
+        }
+
+        const otherAccounts: string[] = [];
+        let otherTotal = 0;
+        for (const [type, items] of buckets) {
+          if (usedTypes.has(type)) continue;
+          for (const i of items) otherAccounts.push(`${i.name} [${type}]`);
+          otherTotal += items.reduce((s, i) => s + i.balance, 0);
+        }
+        if (otherAccounts.length > 0) {
+          balanceSummary.push({ accountType: "Other", accounts: otherAccounts, total: round2(otherTotal) });
+        }
+
+        const sumOf = (types: readonly string[]) =>
+          types.reduce((s, t) => s + (buckets.get(t)?.reduce((ss, i) => ss + i.balance, 0) ?? 0), 0);
+
+        const income = sumOf(INCOME_TYPES);
+        const expenses = sumOf(EXPENSE_TYPES);
+        const subtotals = {
+          assets: round2(sumOf(ASSET_TYPES)),
+          liabilities: round2(sumOf(LIABILITY_TYPES)),
+          equity: round2(sumOf(EQUITY_TYPES)),
+          income: round2(income),
+          expenses: round2(expenses),
+          netIncome: round2(income - expenses),
+        };
+
+        const dateRangeRequested = Boolean(fromDate || toDate);
+        const asOfDateRange = dateRangeRequested ? { from: fromDate ?? null, to: toDate ?? null } : null;
+        const asOfNote = dateRangeRequested
+          ? "Simulation mode: Balance reflects current snapshot, not the requested date range. Historical reconstruction requires walking transactions per account — pending Phase 5 P&L / Balance Sheet work."
+          : undefined;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              asOfDateRange,
+              asOfNote,
+              balanceSummary,
+              subtotals,
+              totalAccounts: accounts.length,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "AccountQueryRq failed",
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 

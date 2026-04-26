@@ -194,7 +194,7 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 | Tool | Description |
 |------|-------------|
 | `qb_company_info` | Run `CompanyQueryRq` for company name/legal name/address/fiscal year/tax form/EIN, plus session state (connected/simulationMode/sessionTicket/openedAt). Auto-connects on first call. |
-| `qb_balance_summary` | Account balance overview |
+| `qb_balance_summary` | Balance summary across all accounts, grouped by AccountType in canonical QB order (Assets → Liabilities → Equity → Income → Expenses → NonPosting) with category subtotals (assets/liabilities/equity/income/expenses/netIncome). Optional `fromDate` / `toDate` (YYYY-MM-DD) — advisory in simulation mode (current snapshot only; surfaces an `asOfNote`). |
 | `qb_ar_aging` | Accounts receivable aging |
 | `qb_ap_aging` | Accounts payable aging |
 | `qb_raw_query` | Execute raw QBXML queries |
