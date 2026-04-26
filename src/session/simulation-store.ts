@@ -311,6 +311,20 @@ export class SimulationStore {
           data: {},
         };
       }
+    } else if (
+      entityType === "BillPaymentCheck" ||
+      entityType === "BillPaymentCreditCard"
+    ) {
+      const applyResult = this.applyBillPayment(finalEntity);
+      if (!applyResult.ok) {
+        return {
+          type: rsType,
+          statusCode: 500,
+          statusSeverity: "Error",
+          statusMessage: applyResult.error,
+          data: {},
+        };
+      }
     }
 
     const storeKey = isTransaction ? id : id;
@@ -547,6 +561,98 @@ export class SimulationStore {
   }
 
   // -----------------------------------------------------------------------
+  // BillPayment application — close out bills, move vendor balance
+  // -----------------------------------------------------------------------
+
+  // AP-side analog to applyReceivePayment. Each AppliedToTxn block reduces
+  // the named bill's AmountDue, flips IsPaid when AmountDue hits zero, and
+  // moves the vendor's Balance by the applied portion. BillPayments don't
+  // track AppliedAmount / UnusedPayment on the payment header (real QB
+  // BillPaymentCheckRet / BillPaymentCreditCardRet have no such fields —
+  // the operator-facing TotalAmount is just the sum of the applied amounts,
+  // not a separable header total like ReceivePayment carries).
+  //
+  // Strict on missing TxnIDs (returns 500) — same as the AR side: a named
+  // target ghost would let payments record against deleted bills. Two-pass
+  // for atomicity: validate every TxnID first (orphan in line N must NOT
+  // leave lines 1..N-1 mutated). Discount handling mirrors AR: DiscountAmount
+  // closes AmountDue alongside the payment but does NOT reduce vendor balance
+  // (the vendor didn't receive it — they granted it).
+  private applyBillPayment(
+    payment: StoredEntity
+  ): { ok: true } | { ok: false; error: string } {
+    const raw = payment.AppliedToTxnAdd;
+    delete payment.AppliedToTxnAdd;
+    const lines = !raw
+      ? []
+      : Array.isArray(raw)
+        ? (raw as Record<string, unknown>[])
+        : [raw as Record<string, unknown>];
+
+    if (lines.length === 0) {
+      return { ok: false, error: "BillPayment requires at least one AppliedToTxnAdd entry" };
+    }
+
+    const billStore = this.getStore("Bill");
+    for (const line of lines) {
+      const txnId = String(line.TxnID ?? "");
+      if (!txnId) {
+        return { ok: false, error: "AppliedToTxn requires TxnID" };
+      }
+      if (!billStore.has(txnId)) {
+        return {
+          ok: false,
+          error: `Bill "${txnId}" specified in AppliedToTxn cannot be found`,
+        };
+      }
+    }
+
+    let appliedSum = 0;
+    const appliedRet: Record<string, unknown>[] = [];
+    for (const line of lines) {
+      const txnId = String(line.TxnID);
+      const paymentAmount = Number(line.PaymentAmount ?? 0);
+      const discountAmount = Number(line.DiscountAmount ?? 0);
+
+      const bill = billStore.get(txnId)!;
+      const amountDue = Number(bill.AmountDue ?? 0);
+      bill.AmountDue = amountDue - paymentAmount - discountAmount;
+      bill.IsPaid = bill.AmountDue === 0;
+
+      appliedSum += paymentAmount;
+
+      const ret: Record<string, unknown> = {
+        TxnLineID: this.nextId(),
+        TxnID: txnId,
+        PaymentAmount: paymentAmount,
+      };
+      if (discountAmount > 0) {
+        ret.DiscountAmount = discountAmount;
+        if (line.DiscountAccountRef) ret.DiscountAccountRef = line.DiscountAccountRef;
+      }
+      appliedRet.push(ret);
+    }
+
+    if (appliedSum > 0) {
+      const vendorRef = payment.VendorRef as Record<string, unknown> | undefined;
+      if (vendorRef) {
+        this.adjustEntityBalance(
+          "Vendor",
+          {
+            listID: vendorRef.ListID ? String(vendorRef.ListID) : undefined,
+            fullName: vendorRef.FullName ? String(vendorRef.FullName) : undefined,
+          },
+          -appliedSum
+        );
+      }
+    }
+
+    payment.AppliedToTxnRet = appliedRet;
+    payment.TotalAmount = appliedSum;
+    return { ok: true };
+  }
+
+  // -----------------------------------------------------------------------
   // Line conversion: *LineAdd → *LineRet
   // -----------------------------------------------------------------------
 
@@ -627,6 +733,10 @@ export class SimulationStore {
 
     if (entityType === "Bill" && result.AmountDue === undefined) {
       result.AmountDue = lineSum;
+    }
+
+    if (entityType === "Bill") {
+      result.IsPaid = Number(result.AmountDue ?? 0) === 0;
     }
 
     if (entityType === "Invoice") {

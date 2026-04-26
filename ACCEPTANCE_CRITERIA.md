@@ -43,17 +43,72 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 3 — Transaction completeness
 
-_(Item 9 — criteria pending pickup.)_
+_(All Phase 3 items complete — see Completed below.)_
 
 ---
 
-_(Add criteria for items 9, etc. as they are picked up. Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
+_(Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
 
 ---
 
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 9 — `qb_bill_pay` + `qb_bill_payment_list` _(Phase 3)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_bill_pay` is registered and listed by the MCP server. Routes via `paymentMethod: "check" | "creditcard"` discriminator to `BillPaymentCheck` or `BillPaymentCreditCard`. Verified A1–A10 (check route) + E1–E5 (credit card route — payment lands in correct store, NOT the other).
+- [x] `applyTo: [{txnId, amount, discountAmount?, discountAccountName?}]` is required and non-empty (`z.array(...).min(1)`); empty array rejected at the simulation level too with statusCode 500. Verified G1/G2.
+- [x] Each `applyTo` entry reduces the named bill's `AmountDue` by `paymentAmount + discountAmount`. Verified A3 (500 → 0), B1 (1000 → 700), C1+C3 (multi-bill split), D1 (950 + 50 discount → 0), H1 (over-payment → -50).
+- [x] Bill `IsPaid` flips to true when `AmountDue` hits 0 exactly. Verified A4, C2/C4, D2, E2.
+- [x] Over-payment leaves `AmountDue` negative + `IsPaid` false (vendor credit semantics — matches Invoice over-application policy from Item 6). Verified H1/H2 (AmountDue = -50, IsPaid = false).
+- [x] Vendor `Balance` decreases by the applied sum (NOT including discount). Verified A5 (-500), B3 (-300), C5 (-500 across two bills), D3 (-950 NOT -1000), E3 (-400), H3 (-150 on over-pay).
+- [x] `BillPaymentCheck.TotalAmount` / `BillPaymentCreditCard.TotalAmount` returned on the response = sum of applied PaymentAmounts (NOT including discount, since discount isn't a cash flow). Verified A6, C6, D4, H4.
+- [x] `AppliedToTxnRet` array carries `TxnLineID`, `TxnID`, `PaymentAmount`, optional `DiscountAmount` + `DiscountAccountRef`. Verified A7–A9, C7, D5/D6.
+- [x] `qb_bill_payment_list` fans out across both `BillPaymentCheck` + `BillPaymentCreditCard` stores by default; `paymentType: "check" | "creditcard"` scopes to one. Verified I1/I2 (mixed inventory: count = checkStore + ccStore, both stores have entries from prior checks).
+- [x] `Bill.IsPaid` field added by `computeTotals` symmetric with Invoice — bills created via `qb_bill_create` have `IsPaid = false` initially (since `AmountDue > 0`); bills with no lines or explicit `AmountDue: 0` have `IsPaid = true`. Verified A1/A2 (created bill has `AmountDue=500`, `IsPaid=false`).
+
+**Error criteria**:
+- [x] Unknown bill `txnId` in `applyTo` rejects with `isError: true`, statusCode 500. CRITICAL atomicity invariant: a valid line followed by an orphan in the SAME `AppliedToTxnAdd` array does NOT mutate the valid bill or move vendor balance. Verified F1–F6 (line 1 = real bill $800, line 2 = orphan; rejected; real bill still AmountDue=800/IsPaid=false; vendor balance UNCHANGED; NO phantom payment in store).
+- [x] Empty `applyTo` array rejected at the simulation level (defensive — tool layer's `z.array(...).min(1)` gates this first, but the simulation guards too in case a future caller bypasses the schema). Verified G1/G2.
+- [x] Tool layer's try/catch wraps `session.addEntity` so simulation 500s surface as structured `isError: true` + `statusCode` (same pattern as Items 5/8).
+
+**Regression criteria**:
+- [x] `qb_payment_receive` (Item 5) Add path with `appliedTo` still closes invoices and moves customer balance. Verified J1/J2.
+- [x] `qb_payment_apply` (Item 8) `ReceivePaymentMod` path still re-applies an existing payment to a new invoice. Verified L1.
+- [x] `qb_bill_update` (Item 7) line mod still recomputes `AmountDue` and moves vendor balance by the delta. Verified K1/K2/K3 — including the new `IsPaid` field staying false on a non-zero AmountDue post-update.
+- [x] `qb_bill_create` (Item 4) still creates a bill with `AmountDue = sum(lines)` and `IsPaid = false`. Verified A1/A2 (used as setup throughout).
+- [x] AP aging would reflect the post-payment vendor balance — `qb_ap_aging` reads `Vendor.Balance` directly per Item 18, which is moved end-to-end via `adjustEntityBalance("Vendor", refKey, -appliedSum)` in `applyBillPayment`.
+- [x] No new TypeScript errors; `npm run build` green throughout.
+
+**Documentation criteria**:
+- [x] README bill section: two new paragraphs explain `qb_bill_pay` semantics (paymentMethod discriminator, applyTo required, AmountDue reduction, IsPaid flip, discount handling, over-payment policy, atomic orphan rejection) and `qb_bill_payment_list` fan-out. Tool table rows added for both.
+- [x] `instructions` block in [src/index.ts](src/index.ts) bill bullet expanded with `qb_bill_pay` + `qb_bill_payment_list` semantics.
+- [x] Tool count in README header bumped 38 → 40.
+- [x] `ACCEPTANCE_CRITERIA.md` entry moved to Completed (this entry).
+- [x] No new `DECISIONS.md` entry — single-tool-with-discriminator + single-list-with-fanout were the recommended choices in the prior handoff and don't introduce surprise tradeoffs. Parallel `applyBillPayment` (rather than a generic `applyTxnPayments` extracted from the AR side) follows CLAUDE.md's "three similar lines is better than a premature abstraction" — there are exactly 2 call sites and the divergent fields (no AppliedAmount/UnusedPayment on bill payments, different store/balance/ref) make the abstraction shape uncertain. Will revisit if a third payment kind lands.
+
+**Implementation notes**:
+- Tool layer in [src/tools/bills.ts](src/tools/bills.ts):
+  - New `appliedToBillSchema` duplicated alongside `appliedToSchema` from [src/tools/payments.ts](src/tools/payments.ts) — same field shape but the named entity is a Bill. Hoisting to a shared file deferred (8 lines, two call sites; no share-pressure yet).
+  - `qb_bill_pay` is a single tool with `paymentMethod: z.enum(["check", "creditcard"])` discriminator. Routes to `addEntity("BillPaymentCheck", ...)` or `addEntity("BillPaymentCreditCard", ...)` in the handler. Optional `bankAccountName` / `creditCardAccountName` / `apAccountName` fields propagate as `BankAccountRef` / `CreditCardAccountRef` / `APAccountRef` (real QB SDK shape).
+  - `applyTo` uses `.min(1)` so the schema rejects empty arrays at the boundary.
+  - try/catch wraps `session.addEntity` so simulation 500s surface as structured tool errors with `isError: true` + `statusCode` (same pattern as Items 5/8).
+  - `qb_bill_payment_list` fans out via `Promise.all` when no `paymentType` is provided (parallel queries on both stores). Single-type queries skip the fan-out. `MaxReturned` is applied per-store on the fan-out path — documented in the field's `.describe()`.
+- Simulation in [src/session/simulation-store.ts](src/session/simulation-store.ts):
+  - New `applyBillPayment(payment)` is a parallel function to `applyReceivePayment`. Two-pass: validate every TxnID exists in the Bill store first (atomicity), then mutate. No overapplication-vs-TotalAmount check because BillPayment's TotalAmount is derived from the applied sum (not a separable header total like ReceivePayment's). Sets `payment.TotalAmount = appliedSum` so consumers don't have to re-derive.
+  - Bill mutation: `bill.AmountDue -= paymentAmount + discountAmount`, `bill.IsPaid = bill.AmountDue === 0`. Strict equality (no clamping on over-payment) matches Item 6's BalanceRemaining policy.
+  - Vendor balance moves via the existing `adjustEntityBalance("Vendor", refKey, -appliedSum)` helper from Item 18 — same machinery as Item 5's AR-side customer balance move.
+  - `handleAdd` branches on `entityType === "BillPaymentCheck" || entityType === "BillPaymentCreditCard"` and dispatches to `applyBillPayment`. Mirrors the existing `entityType === "ReceivePayment"` branch.
+  - `computeTotals` extended: Bill branch now sets `result.IsPaid = Number(result.AmountDue ?? 0) === 0`. Symmetric with Invoice's `IsPaid` derivation. Invoice's `IsPaid` set independently a few lines below — kept separate for readability since Invoice's `BalanceRemaining` formula has more inputs (Subtotal + SalesTaxTotal − AppliedAmount).
+  - No `BillPaymentCheckMod` / `BillPaymentCreditCardMod` path — Item 9 is Add-only. Re-targeting bill payments is implicit Phase 4 work; not currently in the todo list.
+- Parser in [src/qbxml/parser.ts](src/qbxml/parser.ts): added `BillPaymentCheckRet`, `BillPaymentCreditCardRet` to `arrayElements` so live mode parses single-bill-payment responses as 1-element arrays. `AppliedToTxnRet` was already there from Item 5.
+- Verified end-to-end with a 51-check inline script (deleted post-verification per "no test infra yet"): single-bill check happy path with full close-out + IsPaid flip + vendor balance drop (A1–A10), partial pay with bill open + IsPaid false (B1–B3), multi-bill split closing both bills atomically (C1–C7), discount preservation with vendor-balance-only-by-paid-amount (D1–D6), credit card route lands in correct store (E1–E5), orphan TxnID atomicity — line 1 valid + line 2 orphan = NO mutation anywhere (F1–F6), empty applyTo rejection (G1/G2), over-payment producing negative AmountDue + IsPaid false + full vendor balance hit (H1–H4), `qb_bill_payment_list` fan-out (I1/I2), regressions for Item 5 `qb_payment_receive` (J1/J2), Item 7 `qb_bill_update` line mod with new IsPaid field (K1–K3), Item 8 `qb_payment_apply` (L1). One verification-script bug surfaced and fixed: `vbal()` helper used `ListFilter: { FullName: ... }` which the sim doesn't recognize, so it silently returned all vendors and `r[0]` was wrong on any non-first vendor. Fixed by querying all + `find(v => v.FullName === name)`. Implementation was correct throughout. `npm run build` green.
+
+---
 
 ### Item 8 — `qb_payment_apply` (`ReceivePaymentMod` + `AppliedToTxnMod`) _(Phase 3)_ — done 2026-04-26
 

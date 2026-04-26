@@ -26,7 +26,7 @@ So that everything below can actually be verified without a Windows box.
 - [x] **7.** Implement `qb_bill_update` tool (`BillModRq`) — header fields plus `ExpenseLineMod` / `ItemLineMod` support, register in [index.ts](src/index.ts).
 - [x] **6.** Add `InvoiceLineMod` support to `qb_invoice_update` — accept `lines` arg with optional `txnLineID` (existing line) or `'-1'` (new line) and build `InvoiceLineMod` blocks.
 - [x] **8.** Add `qb_payment_apply` tool — apply an existing unapplied `ReceivePayment` to specific invoices via `ReceivePaymentMod` + `AppliedToTxnMod`.
-- [ ] **9.** Add `qb_bill_pay` tool — record `BillPaymentCheck` or `BillPaymentCreditCard` against existing bills (currently no way to mark a bill as paid).
+- [x] **9.** Add `qb_bill_pay` tool — record `BillPaymentCheck` or `BillPaymentCreditCard` against existing bills (currently no way to mark a bill as paid).
 
 ## Phase 4 — Missing tools / coverage gaps
 

@@ -77,6 +77,20 @@ const itemLineModSchema = z
     { message: "New item lines (no txnLineID) require itemName/itemListId, quantity, and cost" }
   );
 
+// AP-side analog of payments.ts appliedToSchema — same field shape, but the
+// named entity is a Bill (not an Invoice) and PaymentAmount reduces
+// Bill.AmountDue + Vendor.Balance. Duplicated rather than hoisted because
+// there's only one other call site and CLAUDE.md prefers a few similar
+// lines over a premature shared module.
+const appliedToBillSchema = z.object({
+  txnId: z.string().describe("TxnID of the bill this payment applies to"),
+  amount: z.number().describe("Amount of this payment to apply against the bill"),
+  discountAmount: z.number().optional()
+    .describe("Optional discount applied to the bill (closes AmountDue alongside the payment, posts to DiscountAccountRef)"),
+  discountAccountName: z.string().optional()
+    .describe("Income/expense account full name for the discount (required when discountAmount > 0)"),
+});
+
 export function registerBillTools(
   server: McpServer,
   getSession: () => QBSessionManager
@@ -320,6 +334,149 @@ export function registerBillTools(
         content: [{
           type: "text" as const,
           text: JSON.stringify({ success: true, deleted: result }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // Bill payment (BillPaymentCheck / BillPaymentCreditCard)
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_bill_pay",
+    "Pay one or more bills via a check or credit card in QuickBooks Desktop. paymentMethod: 'check' routes to BillPaymentCheck (with optional bankAccountName); 'creditcard' routes to BillPaymentCreditCard (with optional creditCardAccountName). applyTo: [{txnId, amount, discountAmount?, discountAccountName?}] is required and non-empty — each entry reduces the named bill's AmountDue and decrements the vendor's Balance by the applied amount. Pass discountAmount > 0 to close part of the bill via a vendor discount (does NOT count toward vendor balance reduction). Bill IsPaid flips to true when AmountDue hits 0; over-payment leaves AmountDue negative and IsPaid false (vendor credit). TotalAmount on the response = sum(applyTo.amount). Unknown bill TxnID rejects atomically — no partial mutations.",
+    {
+      vendorName: z.string().optional().describe("Vendor full name (or use vendorListId)"),
+      vendorListId: z.string().optional().describe("Vendor ListID (or use vendorName)"),
+      paymentMethod: z.enum(["check", "creditcard"])
+        .describe("'check' creates a BillPaymentCheck, 'creditcard' creates a BillPaymentCreditCard"),
+      applyTo: z.array(appliedToBillSchema).min(1)
+        .describe("Bill applications. At least one entry required — pure unapplied bill payments are not supported (use qb_payment_receive for the AR side if you meant a customer credit)."),
+      txnDate: z.string().optional().describe("Payment date (YYYY-MM-DD)"),
+      refNumber: z.string().optional().describe("Reference/check number"),
+      memo: z.string().optional().describe("Memo"),
+      bankAccountName: z.string().optional()
+        .describe("Bank account full name (BillPaymentCheck only — ignored for credit card)"),
+      creditCardAccountName: z.string().optional()
+        .describe("Credit card account full name (BillPaymentCreditCard only — ignored for check)"),
+      apAccountName: z.string().optional()
+        .describe("Accounts Payable account full name (defaults to the operator's standard AP account)"),
+    },
+    async (args) => {
+      const session = getSession();
+
+      if (!args.vendorName && !args.vendorListId) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: "Either vendorName or vendorListId is required",
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const data: Record<string, unknown> = {};
+      if (args.vendorListId) {
+        data.VendorRef = { ListID: args.vendorListId };
+      } else {
+        data.VendorRef = { FullName: args.vendorName };
+      }
+      if (args.txnDate) data.TxnDate = args.txnDate;
+      if (args.refNumber) data.RefNumber = args.refNumber;
+      if (args.memo) data.Memo = args.memo;
+      if (args.apAccountName) {
+        data.APAccountRef = { FullName: args.apAccountName };
+      }
+
+      if (args.paymentMethod === "check" && args.bankAccountName) {
+        data.BankAccountRef = { FullName: args.bankAccountName };
+      } else if (args.paymentMethod === "creditcard" && args.creditCardAccountName) {
+        data.CreditCardAccountRef = { FullName: args.creditCardAccountName };
+      }
+
+      data.AppliedToTxnAdd = args.applyTo.map((line) => {
+        const lineData: Record<string, unknown> = {
+          TxnID: line.txnId,
+          PaymentAmount: line.amount,
+        };
+        if (line.discountAmount !== undefined && line.discountAmount > 0) {
+          lineData.DiscountAmount = line.discountAmount;
+          if (line.discountAccountName) {
+            lineData.DiscountAccountRef = { FullName: line.discountAccountName };
+          }
+        }
+        return lineData;
+      });
+
+      const entityType =
+        args.paymentMethod === "check"
+          ? "BillPaymentCheck"
+          : "BillPaymentCreditCard";
+
+      try {
+        const result = await session.addEntity(entityType, data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, billPayment: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: message, statusCode }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "qb_bill_payment_list",
+    "List bill payments (BillPaymentCheck and/or BillPaymentCreditCard). Pass paymentType to scope to one type; omit it to fan out across both stores.",
+    {
+      vendorName: z.string().optional().describe("Filter by vendor name"),
+      paymentType: z.enum(["check", "creditcard"]).optional()
+        .describe("Filter by payment method. Omit to query both BillPaymentCheck + BillPaymentCreditCard and merge."),
+      fromDate: z.string().optional().describe("Start date (YYYY-MM-DD)"),
+      toDate: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      maxReturned: z.number().optional().describe("Maximum results (applied per-store when fanning out)"),
+    },
+    async (args) => {
+      const session = getSession();
+      const filters: Record<string, unknown> = {};
+
+      if (args.vendorName) {
+        filters.EntityFilter = { FullName: args.vendorName };
+      }
+      if (args.fromDate || args.toDate) {
+        filters.TxnDateRangeFilter = { FromTxnDate: args.fromDate, ToTxnDate: args.toDate };
+      }
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+
+      const types: ("BillPaymentCheck" | "BillPaymentCreditCard")[] =
+        args.paymentType === "check"
+          ? ["BillPaymentCheck"]
+          : args.paymentType === "creditcard"
+            ? ["BillPaymentCreditCard"]
+            : ["BillPaymentCheck", "BillPaymentCreditCard"];
+
+      const results = await Promise.all(
+        types.map((t) => session.queryEntity(t, filters))
+      );
+      const billPayments = results.flat();
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ count: billPayments.length, billPayments }, null, 2),
         }],
       };
     }
