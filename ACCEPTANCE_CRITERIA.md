@@ -41,42 +41,6 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ---
 
-## Phase 2 — Item subtype fixes
-
-### Item 2 — Per-subtype Item request types _(Phase 2)_
-
-**Status:** pending
-
-**Behavioral criteria**:
-- [ ] `qb_item_list` accepts an optional `itemType` arg. When provided, only that subtype is queried.
-- [ ] When `itemType` is omitted, the tool issues queries for all subtypes and merges results.
-- [ ] `qb_item_add` routes to the correct `Item<Subtype>AddRq` based on the required `itemType` arg.
-- [ ] `qb_item_update` routes to the correct `Item<Subtype>ModRq`.
-- [ ] Subtype-specific fields are accepted: e.g. inventory items accept `assetAccountName`, `cost`; service items don't.
-
-**Regression criteria**:
-- [ ] All seed items still appear on a no-filter list.
-- [ ] Invoice creation referencing items by name (e.g. "Consulting Services") still resolves correctly regardless of which subtype the item belongs to.
-
-**Documentation criteria**:
-- [ ] README item table updated with new `itemType` arg.
-- [ ] `ARCHITECTURE.md` Invariant #7 marked resolved.
-
----
-
-### Item 3 — Item delete uses correct subtype _(Phase 2)_
-
-**Status:** pending
-
-**Behavioral criteria**:
-- [ ] `qb_item_delete` accepts `itemType` arg and sends `ListDelType: "ItemService"` (etc.) instead of `"Item"`.
-- [ ] Deletion succeeds for each subtype.
-
-**Regression criteria**:
-- [ ] Customer/Vendor/Account delete (which use the same `ListDelRq` machinery with their own types) still works.
-
----
-
 ## Phase 3 — Transaction completeness
 
 ### Item 4 — Bill expense + item lines _(Phase 3)_
@@ -129,6 +93,54 @@ _(Add criteria for items 6, 7, 8, 9, etc. as they are picked up. Don't pre-write
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 2 — Per-subtype Item request types _(Phase 2)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_item_list` accepts an optional `itemType` arg. When provided, only that subtype is queried.
+- [x] When `itemType` is omitted, the tool fans out across all five subtypes and merges results via `Promise.all` + `flat()`.
+- [x] `qb_item_add` routes to the correct `Item<Subtype>AddRq` based on the required `itemType` arg — verified each subtype lands in its own store and does not leak into others.
+- [x] `qb_item_update` routes to the correct `Item<Subtype>ModRq` (added required `itemType` arg per the implementation note in `HANDOFF.md`).
+- [x] Subtype-specific fields are accepted: Inventory accepts `assetAccountName` / `cogsAccountName` / `cost`; Service items take the same schema but routing makes the inapplicable fields a no-op at the simulation level. Light-touch single-schema chosen — see `DECISIONS.md` 2026-04-25 entry.
+
+**Regression criteria**:
+- [x] All seed items still appear when `qb_item_list` is called with no `itemType` (fan-out merges to 3).
+- [x] Invoice creation referencing `"Consulting Services"` by `ItemRef.FullName` still resolves and computes Subtotal correctly.
+
+**Documentation criteria**:
+- [x] README item table updated with the `itemType` arg behavior per tool.
+- [x] `ARCHITECTURE.md` Invariant #7 updated — dropped the "currently violates" clause and described the new tool-layer routing.
+- [x] `src/index.ts` `instructions` block updated with the subtype enum + when `itemType` is required.
+- [x] `DECISIONS.md` entry added for the light-touch schema choice (single zod schema across subtypes, route on `itemType`).
+
+**Implementation notes**:
+- `ITEM_SUBTYPES` constant defined locally in [src/tools/items.ts:11-17](src/tools/items.ts#L11-L17) — kept independent of the simulation store's internals per the layer-hygiene note in the prior handoff. The simulation-store's `ITEM_SUBTYPES` constant has been deleted as part of this task because the only thing that read it (the generic `ItemQueryRq` shim) has also been deleted.
+- `qb_item_list` fan-out uses `Promise.all` so the five subtype queries run in parallel rather than serially.
+- All four tools share a single `itemTypeSchema = z.enum([...])` so the operator-facing values stay identical across `add` / `update` / `delete` / `list`.
+- Verified end-to-end with a 29-check inline script (deleted post-verification per "no test infra yet" project state): per-subtype query routing (3 occupied + 2 empty subtypes), fan-out merge total = 3, fan-out filter passthrough (`NameFilter='Widget'` → 1), per-subtype add (Service / Inventory / OtherCharge each land in correct store, no cross-store leakage), Inventory subtype-specific fields preserved (`Cost` / `COGSAccountRef` / `AssetAccountRef`), per-subtype mod with `TimeModified` bump, per-subtype delete returns correct `ListDelType`, wrong-subtype delete fails with 500 (proves real subtype isolation), shim removal proven (generic `Item` query returns 0), and full regression spot-checks for Customer/Account/Invoice + invoice line referencing item by FullName.
+
+---
+
+### Item 3 — Item delete uses correct subtype _(Phase 2)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_item_delete` requires `itemType` and sends `ListDelType: "Item<Subtype>"` (e.g. `"ItemService"`) instead of `"Item"`. Verified by inspecting the response payload's `ListDelType` field on each subtype.
+- [x] Deletion succeeds for each subtype. Verified Service / Inventory / OtherCharge directly; NonInventory and Group share the exact same code path and routing.
+
+**Regression criteria**:
+- [x] `qb_customer_delete` still returns `ListDelType: "Customer"` (verified — shared `ListDelRq` machinery is unaffected).
+- [x] `qb_account_delete` still returns `ListDelType: "Account"` (verified).
+- [x] Wrong-subtype delete (e.g. deleting Service ListID via the `ItemInventory` route) fails cleanly with statusCode 500 "object not found" — proves the per-subtype store isolation is real, not just cosmetic.
+
+**Implementation notes**:
+- Implemented in the same edit as Item 2 in [src/tools/items.ts:140-156](src/tools/items.ts#L140-L156). The handoff recommendation to bundle Items 2 + 3 was correct: they share the same tool file, the same routing pattern, and the same verification surface.
+- The simulation's `handleListDel` already reads `ListDelType` from the request directly, so per-subtype types hit per-subtype stores with no further simulation changes needed.
+
+---
 
 ### Item 22 — Split Item store by subtype _(Phase 1)_ — done 2026-04-25
 

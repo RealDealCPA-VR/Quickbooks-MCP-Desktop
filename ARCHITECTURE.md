@@ -65,7 +65,7 @@ These rules are non-negotiable unless explicitly changed via `DECISIONS.md`.
 4. **Tool registration is centralized.** Every `register*Tools(server, getSession)` call lives in [src/index.ts](src/index.ts). Adding a tool module means adding the import and the call there — and updating the `instructions` block in the same file.
 5. **Transaction-vs-List classification is a shared constant in three places** ([builder.ts:115-131](src/qbxml/builder.ts#L115-L131), [manager.ts:200-203](src/session/manager.ts#L200-L203), [simulation-store.ts:359-366](src/session/simulation-store.ts#L359-L366)). Until extracted, all three must be updated together when a new transaction type is added. Extracting to a shared constant is a deferred refactor — see `DECISIONS.md`.
 6. **Parser `arrayElements` is the contract** for which response elements collapse to single objects vs. always-arrays. New `*Ret` element names must be registered in [src/qbxml/parser.ts:27-61](src/qbxml/parser.ts#L27-L61) or downstream code will break on single-element responses.
-7. **Item types are not generic.** Real QBXML uses `ItemServiceQueryRq`, `ItemInventoryAddRq`, etc. — there is no generic `ItemQueryRq`. The current code violates this; fixing it is Phase 2 of `todo.md`.
+7. **Item types are not generic.** Real QBXML uses `ItemServiceQueryRq`, `ItemInventoryAddRq`, etc. — there is no generic `ItemQueryRq`. The four `qb_item_*` tools take an `itemType` arg (`Service` / `Inventory` / `NonInventory` / `OtherCharge` / `Group`) and route to `Item<Subtype>*Rq` accordingly; `qb_item_list` fans out across all five subtypes when `itemType` is omitted.
 
 ---
 

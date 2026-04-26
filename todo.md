@@ -16,8 +16,8 @@ So that everything below can actually be verified without a Windows box.
 
 ## Phase 2 — Item request types (touches schema everywhere)
 
-- [ ] **2.** Fix Item request types: replace generic `ItemQueryRq` / `AddRq` / `ModRq` with per-type variants (`ItemServiceQueryRq`, `ItemInventoryQueryRq`, `ItemNonInventoryQueryRq`, `ItemOtherChargeQueryRq`, `ItemGroupQueryRq`) in [tools/items.ts](src/tools/items.ts) and route through manager based on `itemType` arg.
-- [ ] **3.** Fix Item delete to use correct `ListDelType` subtype (`ItemService`, `ItemInventory`, etc.) — currently sends `'Item'` which QB rejects.
+- [x] **2.** Fix Item request types: replace generic `ItemQueryRq` / `AddRq` / `ModRq` with per-type variants (`ItemServiceQueryRq`, `ItemInventoryQueryRq`, `ItemNonInventoryQueryRq`, `ItemOtherChargeQueryRq`, `ItemGroupQueryRq`) in [tools/items.ts](src/tools/items.ts) and route through manager based on `itemType` arg.
+- [x] **3.** Fix Item delete to use correct `ListDelType` subtype (`ItemService`, `ItemInventory`, etc.) — currently sends `'Item'` which QB rejects.
 
 ## Phase 3 — Transaction completeness (the workflows that matter)
 

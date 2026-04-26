@@ -50,12 +50,15 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 | `qb_bill_delete` | Delete a bill |
 
 ### Items (Products & Services)
+
+QuickBooks has no generic "Item" — every item belongs to one of five subtypes. The `itemType` arg selects the subtype: `Service`, `Inventory`, `NonInventory`, `OtherCharge`, or `Group`.
+
 | Tool | Description |
 |------|-------------|
-| `qb_item_list` | List/search items |
-| `qb_item_add` | Create a new item |
-| `qb_item_update` | Update item details |
-| `qb_item_delete` | Delete an item |
+| `qb_item_list` | List/search items. `itemType` is optional — omit to query all five subtypes and merge. |
+| `qb_item_add` | Create a new item. `itemType` is required. |
+| `qb_item_update` | Update item details. `itemType` is required and must match the stored subtype. |
+| `qb_item_delete` | Delete an item. `itemType` is required so the correct `ListDelType` is sent. |
 
 ### Payments
 | Tool | Description |

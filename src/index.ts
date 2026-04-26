@@ -84,7 +84,7 @@ const server = new McpServer(
       "  • qb_account_*     — Chart of Accounts (list, add, update)",
       "  • qb_invoice_*     — Invoice management (list, create, update, delete)",
       "  • qb_bill_*        — Bill/AP management (list, create, delete)",
-      "  • qb_item_*        — Product & Service items (list, add, update, delete)",
+      "  • qb_item_*        — Product & Service items (list, add, update, delete) — itemType is one of Service / Inventory / NonInventory / OtherCharge / Group; required on add/update/delete, optional on list",
       "  • qb_payment_*     — Payment recording and queries",
       "  • qb_estimate_*    — Estimate/quote management",
       "  • qb_employee_*    — Employee management",

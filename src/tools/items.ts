@@ -6,20 +6,34 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 
+// Real QB has no generic Item entity — each item belongs to one of these five
+// subtypes, each with its own *QueryRq / *AddRq / *ModRq / ListDelType.
+const ITEM_SUBTYPES = [
+  "Service",
+  "Inventory",
+  "NonInventory",
+  "OtherCharge",
+  "Group",
+] as const;
+
+const itemTypeSchema = z.enum(ITEM_SUBTYPES);
+
 export function registerItemTools(
   server: McpServer,
   getSession: () => QBSessionManager
 ): void {
   server.tool(
     "qb_item_list",
-    "List or search items (products and services) in QuickBooks Desktop.",
+    "List or search items (products and services) in QuickBooks Desktop. Omit itemType to query all subtypes.",
     {
-      nameFilter: z.string().optional().describe("Filter items by name"),
-      activeOnly: z.boolean().optional().describe("Only return active items"),
-      maxReturned: z.number().optional().describe("Maximum results"),
+      itemType: itemTypeSchema.optional()
+        .describe("Restrict to a single subtype. Omit to query all five subtypes and merge."),
+      nameFilter: z.string().optional().describe("Filter items by name (Contains match)"),
+      activeOnly: z.boolean().optional().describe("Only return active items (default true)"),
+      maxReturned: z.number().optional().describe("Maximum results per subtype query"),
       listId: z.string().optional().describe("Fetch a specific item by ListID"),
     },
-    async ({ nameFilter, activeOnly, maxReturned, listId }) => {
+    async ({ itemType, nameFilter, activeOnly, maxReturned, listId }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -28,7 +42,16 @@ export function registerItemTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const items = await session.queryEntity("Item", filters);
+      let items: Record<string, unknown>[];
+      if (itemType) {
+        items = await session.queryEntity(`Item${itemType}`, filters);
+      } else {
+        const perSubtype = await Promise.all(
+          ITEM_SUBTYPES.map((sub) => session.queryEntity(`Item${sub}`, filters))
+        );
+        items = perSubtype.flat();
+      }
+
       return {
         content: [{
           type: "text" as const,
@@ -43,14 +66,13 @@ export function registerItemTools(
     "Create a new item (product or service) in QuickBooks Desktop.",
     {
       name: z.string().describe("Item name"),
-      itemType: z.enum(["Service", "Inventory", "NonInventory", "OtherCharge", "Group"])
-        .describe("Type of item"),
+      itemType: itemTypeSchema.describe("Subtype of item — determines the QBXML request type"),
       description: z.string().optional().describe("Item description"),
       price: z.number().optional().describe("Sales price"),
-      cost: z.number().optional().describe("Purchase cost (for inventory items)"),
+      cost: z.number().optional().describe("Purchase cost (Inventory / NonInventory)"),
       incomeAccountName: z.string().optional().describe("Income account name"),
-      cogsAccountName: z.string().optional().describe("COGS account name (inventory)"),
-      assetAccountName: z.string().optional().describe("Asset account name (inventory)"),
+      cogsAccountName: z.string().optional().describe("COGS account name (Inventory)"),
+      assetAccountName: z.string().optional().describe("Asset account name (Inventory)"),
     },
     async (args) => {
       const session = getSession();
@@ -72,7 +94,7 @@ export function registerItemTools(
         data.AssetAccountRef = { FullName: args.assetAccountName };
       }
 
-      const result = await session.addEntity("Item", data);
+      const result = await session.addEntity(`Item${args.itemType}`, data);
       return {
         content: [{
           type: "text" as const,
@@ -86,6 +108,7 @@ export function registerItemTools(
     "qb_item_update",
     "Update an existing item in QuickBooks Desktop.",
     {
+      itemType: itemTypeSchema.describe("Subtype of the item being updated — must match the item's stored ItemType"),
       listId: z.string().describe("ListID of the item to update"),
       editSequence: z.string().describe("EditSequence for optimistic locking"),
       name: z.string().optional().describe("New item name"),
@@ -107,7 +130,7 @@ export function registerItemTools(
       if (args.cost !== undefined) data.Cost = args.cost;
       if (args.isActive !== undefined) data.IsActive = args.isActive;
 
-      const result = await session.modifyEntity("Item", data);
+      const result = await session.modifyEntity(`Item${args.itemType}`, data);
       return {
         content: [{
           type: "text" as const,
@@ -121,11 +144,12 @@ export function registerItemTools(
     "qb_item_delete",
     "Delete an item from QuickBooks Desktop. WARNING: Irreversible.",
     {
+      itemType: itemTypeSchema.describe("Subtype of the item being deleted — sets ListDelType to Item<Subtype>"),
       listId: z.string().describe("ListID of the item to delete"),
     },
-    async ({ listId }) => {
+    async ({ itemType, listId }) => {
       const session = getSession();
-      const result = await session.deleteEntity("Item", listId);
+      const result = await session.deleteEntity(`Item${itemType}`, listId);
       return {
         content: [{
           type: "text" as const,

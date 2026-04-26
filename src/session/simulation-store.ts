@@ -41,20 +41,6 @@ const xmlParser = new XMLParser({
 // ---------------------------------------------------------------------------
 
 export class SimulationStore {
-  // Real QB has no generic `Item` entity — every item is one of these five
-  // subtypes, each with its own *QueryRq / *AddRq / *ModRq request type and
-  // its own *Ret response element. The store mirrors that by keeping a
-  // separate Map per subtype. The generic `ItemQueryRq` shim in handleQuery
-  // merges across these so the legacy `qb_item_list` tool keeps working until
-  // Phase 2 item 2 rewrites it to issue per-subtype queries.
-  private static readonly ITEM_SUBTYPES = [
-    "ItemService",
-    "ItemInventory",
-    "ItemNonInventory",
-    "ItemOtherCharge",
-    "ItemGroup",
-  ] as const;
-
   private stores: Map<string, EntityStore> = new Map();
   private idCounter = 1000;
 
@@ -126,18 +112,7 @@ export class SimulationStore {
     const rsType = reqType.replace("Rq", "Rs");
     const retName = `${entityType}Ret`;
 
-    // Transitional shim: real QB has no `ItemQueryRq` (each subtype has its
-    // own request type), but the legacy `qb_item_list` tool still uses it.
-    // Merge across all five subtype stores so the tool keeps working until
-    // Phase 2 item 2 rewrites it. Removable in one delete when item 2 lands.
-    let results: StoredEntity[];
-    if (entityType === "Item") {
-      results = SimulationStore.ITEM_SUBTYPES.flatMap((sub) =>
-        Array.from(this.getStore(sub).values())
-      );
-    } else {
-      results = Array.from(this.getStore(entityType).values());
-    }
+    let results: StoredEntity[] = Array.from(this.getStore(entityType).values());
 
     // Apply filters
     if (reqData.ListID) {
