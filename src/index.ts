@@ -87,7 +87,7 @@ const server = new McpServer(
       "  • qb_item_*        — Product & Service items (list, add, update, delete) — itemType is one of Service / Inventory / NonInventory / OtherCharge / Group; required on add/update/delete, optional on list",
       "  • qb_payment_*     — Payment recording, application, queries — qb_payment_receive accepts optional appliedTo: [{txnId, amount, discountAmount?, discountAccountName?}] to close out invoices on creation (without appliedTo the payment is recorded as a customer credit). qb_payment_apply re-targets an EXISTING payment to a different invoice set via txnId + editSequence (from a prior qb_payment_list) plus a replacement applyTo array — the prior application is reversed and the new one applied atomically, customer balance moves by the delta. Pass applyTo: [] to fully unapply. TotalAmount is immutable on this path; stale editSequence rejects with 3170.",
       "  • qb_estimate_*    — Estimate/quote management",
-      "  • qb_employee_*    — Employee management",
+      "  • qb_employee_*    — Employee management (list, add, update, make_inactive, delete) — qb_employee_make_inactive flips IsActive to false (preferred — preserves history; employee hides from the default list view but stays referenceable by historical paychecks/timesheets). qb_employee_delete is a hard delete that real QB rejects (statusCode 3260/3170) for employees with any transaction history; use only for empty employee records created in error.",
       "  • qb_balance_summary / qb_ar_aging / qb_ap_aging — Financial reports",
       "  • qb_company_info  — Connection & company info",
       "  • qb_raw_query     — Direct QBXML queries for advanced use",

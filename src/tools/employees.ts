@@ -107,4 +107,69 @@ export function registerEmployeeTools(
       };
     }
   );
+
+  server.tool(
+    "qb_employee_make_inactive",
+    "Deactivate an employee in QuickBooks Desktop (sets IsActive: false). Preferred over qb_employee_delete because real QB rejects hard deletion of employees with paycheck or timesheet history. Inactive employees no longer appear in the default qb_employee_list view but are preserved (so historical payroll reports still resolve their references). Reversible via qb_employee_update { isActive: true }. Requires listId + editSequence (from a prior qb_employee_list).",
+    {
+      listId: z.string().describe("ListID of the employee to deactivate"),
+      editSequence: z.string().describe("EditSequence for optimistic locking (from a prior qb_employee_list)"),
+    },
+    async ({ listId, editSequence }) => {
+      const session = getSession();
+      try {
+        const result = await session.modifyEntity("Employee", {
+          ListID: listId,
+          EditSequence: editSequence,
+          IsActive: false,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, employee: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: message, statusCode }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "qb_employee_delete",
+    "Hard-delete an employee from QuickBooks Desktop. WARNING: real QB rejects deletion of employees with any paycheck, timesheet, or other transaction history (returns statusCode 3260) or with references from other records (3170). Prefer qb_employee_make_inactive for employees with history — it hides the employee from the default list view but preserves the record so historical payroll reports still resolve. Use this tool only for empty employee records created in error.",
+    {
+      listId: z.string().describe("ListID of the employee to delete"),
+    },
+    async ({ listId }) => {
+      const session = getSession();
+      try {
+        const result = await session.deleteEntity("Employee", listId);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, deleted: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: message, statusCode }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
 }

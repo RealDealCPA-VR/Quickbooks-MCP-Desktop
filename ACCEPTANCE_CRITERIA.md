@@ -49,7 +49,7 @@ _(All Phase 3 items complete — see Completed below.)_
 
 ## Phase 4 — Missing tools / coverage gaps
 
-_(In progress — Item 10 complete, see Completed below.)_
+_(In progress — Items 10, 11 complete, see Completed below.)_
 
 ---
 
@@ -60,6 +60,52 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 11 — `qb_employee_make_inactive` + `qb_employee_delete` _(Phase 4)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_employee_make_inactive` is registered and listed by the MCP server. Accepts `listId` + `editSequence` only (bare-minimum schema). Verified A1.
+- [x] Calling `qb_employee_make_inactive` with a valid `listId` + matching `editSequence` returns the modified employee with `IsActive: false` and a fresh `EditSequence`. Verified A3/A4.
+- [x] After deactivation, the employee does NOT appear in `qb_employee_list { activeOnly: true }`. Verified A5.
+- [x] After deactivation, the employee DOES appear in `qb_employee_list { activeOnly: false }` — record preserved, just hidden. Verified A6.
+- [x] Reversible via `qb_employee_update { isActive: true }`. Verified A7/A8.
+- [x] `qb_employee_delete` is registered and listed. Accepts `listId` only. Verified C1.
+- [x] `qb_employee_delete` removes the employee from the store (subsequent list queries don't contain it). Verified C2.
+- [x] `qb_employee_delete` returns `{ success: true, deleted: { ListDelType: "Employee", ListID: <id> } }` on success. Verified C1.
+
+**Error criteria**:
+- [x] `qb_employee_make_inactive` with stale `editSequence` returns `isError: true` + `statusCode: 3170`. Verified B1; employee stays active after rejection (B2).
+- [x] `qb_employee_make_inactive` with unknown `listId` returns `isError: true` + `statusCode: 500`. Verified B3.
+- [x] `qb_employee_delete` with unknown `listId` returns `isError: true` + `statusCode: 500`. Verified D1.
+- [x] Both tools wrap session calls in try/catch (same pattern as Items 5/7/8/9/10) — simulation errors surface as structured `isError: true` + `statusCode`, not raw exceptions.
+- [x] `qb_employee_delete` tool description warns about the inactive-vs-delete tradeoff (real QB returns 3260/3170 for employees with paycheck/timesheet history).
+
+**Regression criteria**:
+- [x] `qb_employee_list` (existing) still returns seed employees. Verified E1.
+- [x] `qb_employee_add` (existing) still creates employees with `IsActive: true`. Verified E2.
+- [x] `qb_employee_update` (existing) still updates non-IsActive fields (Phone). Verified E3.
+- [x] Shared `handleListDel` plumbing intact — Account delete still works. Verified E4.
+- [x] Item 10 smoke — `qb_account_make_inactive` still flips `IsActive`. Verified E5.
+- [x] Phase 3 Item 9 smoke — `qb_bill_pay` still closes bills (AmountDue=0, IsPaid=true). Verified E6.
+
+**Documentation criteria**:
+- [x] README employee section: explains `qb_employee_make_inactive` (preferred for employees with history) vs `qb_employee_delete` (hard delete) tradeoff. Tool table rows added for both.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — employee bullet now mentions delete + make_inactive with the inactive-vs-delete tradeoff.
+- [x] Tool count in README header bumped 42 → 44.
+- [x] `ACCEPTANCE_CRITERIA.md` entry moved to Completed (this entry).
+- [x] No new `DECISIONS.md` entry — same two-separate-tools pattern as Item 10 (an established QB SDK convention, not a project-specific tradeoff).
+
+**Implementation notes**:
+- Tool layer in [src/tools/employees.ts](src/tools/employees.ts):
+  - `qb_employee_make_inactive` is a thin wrapper around `session.modifyEntity("Employee", { ListID, EditSequence, IsActive: false })`. Bare-minimum schema (just `listId` + `editSequence`) — operators wanting to mutate FirstName / LastName / Phone / Email should still use `qb_employee_update`.
+  - `qb_employee_delete` wraps `session.deleteEntity("Employee", listId)`. Tool description explicitly warns about real QB's 3260/3170 rejection for employees with paycheck/timesheet history and recommends `make_inactive` as the safer default.
+  - Both tools use the established try/catch pattern from Items 5/7/8/9/10.
+- Simulation in [src/session/simulation-store.ts](src/session/simulation-store.ts) — no changes needed. `handleMod`'s generic `{...modData}` spread already supports `IsActive` mutation; `handleListDel` already routes `Employee` to its own per-entity store generically (the entityType is read from `ListDelType`). Same as Item 10.
+- Verified end-to-end with a 20-check inline script (deleted post-verification): A1–A8 make_inactive happy path including reversibility via `qb_employee_update`; B1–B3 stale-EditSequence (3170) and unknown-listId (500) error paths with no side effects on rejection; C1–C2 delete happy path; D1 delete error path; E1–E6 regressions for `qb_employee_list` defaults, `qb_employee_add` IsActive default, `qb_employee_update` non-IsActive fields (Phone), shared `handleListDel` plumbing via Account delete, Item 10 `qb_account_make_inactive` smoke, and Phase 3 Item 9 `qb_bill_pay` smoke. `npm run build` green throughout.
+
+---
 
 ### Item 10 — `qb_account_delete` + `qb_account_make_inactive` _(Phase 4)_ — done 2026-04-26
 

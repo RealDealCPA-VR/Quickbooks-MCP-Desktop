@@ -4,71 +4,79 @@ _Last updated: 2026-04-26_
 
 ## Last Session Summary
 
-- Completed **Phase 4, Item 10** — `qb_account_make_inactive` + `qb_account_delete`. Two separate tools (rather than discriminated) since the semantics meaningfully differ. Tool count 40 → 42.
-- **`qb_account_make_inactive`** at [src/tools/accounts.ts:117-149](src/tools/accounts.ts#L117-L149) — bare-minimum schema (`listId` + `editSequence` only). Wraps `session.modifyEntity("Account", { ListID, EditSequence, IsActive: false })`. Reversible via the existing `qb_account_update { listId, editSequence, isActive: true }` (verified A8/A9). Stale `editSequence` rejects with `statusCode: 3170`; unknown `listId` rejects with `statusCode: 500`.
-- **`qb_account_delete`** at [src/tools/accounts.ts:151-180](src/tools/accounts.ts#L151-L180) — single-arg `listId`. Wraps `session.deleteEntity("Account", listId)`. Tool description explicitly warns about the inactive-vs-delete tradeoff (real QB rejects deletion of accounts with transaction history with statusCode 3260/3170). Returns `{ success: true, deleted: { ListDelType: "Account", ListID } }` on success.
-- **No simulation changes needed** — `handleMod`'s generic `{...modData}` spread already supports `IsActive` mutation, and `handleListDel` already routes to the per-entity store generically (the entityType comes from `ListDelType` in the request).
-- Both tools use the established try/catch pattern from Items 5/7/8/9 — simulation errors surface as `isError: true` + structured `{ error, statusCode }`, not raw exceptions.
-- README chart-of-accounts section updated with the inactive-vs-delete tradeoff explanation; tool table rows added for both new tools; tool count bumped 40 → 42; `instructions` block in [src/index.ts](src/index.ts) updated with the new semantics. ACCEPTANCE_CRITERIA.md Item 10 entry written and moved to Completed. No new DECISIONS.md entry — two-separate-tools (vs discriminated) is the recommended choice and matches the existing pattern (e.g. `qb_invoice_delete` is its own tool, not a mode of `qb_invoice_update`).
-- Verified with a 30-check inline script (deleted post-verification): A1–A9 make_inactive happy path including reversibility via `qb_account_update`; B1–B5 stale-EditSequence (3170) and unknown-listId (500) error paths with no side effects on the rejected mod; C1–C4 delete happy path; D1/D2 delete error path; E1–E7 regressions for `qb_account_list` defaults, `qb_account_add` IsActive, `qb_account_update` non-IsActive fields, and shared `handleListDel` plumbing via Customer; F1–F3 Phase 3 Item 9 smoke (bill_pay closure + IsPaid flip). `npm run build` green throughout.
+- Completed **Phase 4, Item 11** — `qb_employee_make_inactive` + `qb_employee_delete`. Two separate tools (matching the Item 10 split) since the schemas/descriptions diverge meaningfully. Tool count 42 → 44.
+- **`qb_employee_make_inactive`** at [src/tools/employees.ts:111-144](src/tools/employees.ts#L111-L144) — bare-minimum schema (`listId` + `editSequence` only). Wraps `session.modifyEntity("Employee", { ListID, EditSequence, IsActive: false })`. Reversible via the existing `qb_employee_update { listId, editSequence, isActive: true }` (verified A7/A8). Stale `editSequence` rejects with `statusCode: 3170`; unknown `listId` rejects with `statusCode: 500`.
+- **`qb_employee_delete`** at [src/tools/employees.ts:146-175](src/tools/employees.ts#L146-L175) — single-arg `listId`. Wraps `session.deleteEntity("Employee", listId)`. Tool description warns about real QB rejecting deletion of employees with paycheck/timesheet history (3260/3170). Returns `{ success: true, deleted: { ListDelType: "Employee", ListID } }` on success.
+- **No simulation changes needed** — exactly as Item 10 predicted. `handleMod`'s generic `{...modData}` spread already supports `IsActive` mutation, and `handleListDel` already routes `Employee` to its per-entity store generically (the entityType is read from `ListDelType`).
+- Both tools use the established try/catch pattern from Items 5/7/8/9/10 — simulation errors surface as `isError: true` + structured `{ error, statusCode }`, not raw exceptions.
+- README employees section updated with the inactive-vs-delete tradeoff explanation (mirrors the accounts section); tool table rows added for both new tools; tool count bumped 42 → 44; `instructions` block in [src/index.ts](src/index.ts) updated with the new semantics. ACCEPTANCE_CRITERIA.md Item 11 entry written and moved to Completed. No new DECISIONS.md entry — two-separate-tools (vs discriminated) is the established pattern from Item 10.
+- Verified with a 20-check inline script (deleted post-verification): A1–A8 make_inactive happy path including reversibility via `qb_employee_update`; B1–B3 stale-EditSequence (3170) and unknown-listId (500) error paths with no side effects on the rejected mod; C1–C2 delete happy path; D1 delete error path; E1–E6 regressions for `qb_employee_list` defaults, `qb_employee_add` IsActive default, `qb_employee_update` non-IsActive fields (Phone), shared `handleListDel` via Account, Item 10 `qb_account_make_inactive` smoke, and Phase 3 Item 9 `qb_bill_pay` smoke. `npm run build` green throughout.
 
 ## Verify Before Continuing
 
 - [ ] **Build.** `npm run build` exits 0.
-- [ ] **`make_inactive` happy path.** `qb_account_add { name: "Test Acct", accountType: "Expense" }` — capture `listId` + `editSequence`. Snapshot `qb_account_list { activeOnly: true }` (default). Call `qb_account_make_inactive { listId, editSequence }`. Confirm: (a) response `account.IsActive === false`; (b) response carries a fresh `EditSequence`; (c) `qb_account_list { activeOnly: true }` no longer contains the account; (d) `qb_account_list { activeOnly: false }` DOES contain it (record preserved).
-- [ ] **Reversibility.** With the now-inactive account, call `qb_account_update { listId, editSequence: <fresh>, isActive: true }`. Confirm the account is back in `qb_account_list { activeOnly: true }`.
-- [ ] **Stale `editSequence` rejected.** Call `qb_account_make_inactive` with the ORIGINAL (now-stale) `editSequence`. Confirm `isError: true` + `statusCode: 3170`. Then verify the account is still in its current state (not deactivated by the rejected call).
-- [ ] **Unknown `listId` on `make_inactive`.** Call `qb_account_make_inactive { listId: "BOGUS", editSequence: "any" }`. Confirm `isError: true` + `statusCode: 500`.
-- [ ] **`delete` happy path.** Create another account; call `qb_account_delete { listId }`. Confirm: (a) response `success: true` with `deleted.ListDelType === "Account"` and `deleted.ListID` matching; (b) `qb_account_list { activeOnly: false }` no longer contains the account.
-- [ ] **Unknown `listId` on `delete`.** `qb_account_delete { listId: "BOGUS" }` returns `isError: true` + `statusCode: 500`.
-- [ ] **Regression — `qb_account_list` defaults.** Default call returns the seed accounts (Checking, Utilities, Sales Revenue, etc.). `activeOnly: false` returns the same set (since seed accounts are all active).
-- [ ] **Regression — `qb_account_add` produces active accounts.** Newly-added accounts appear in the default `activeOnly: true` list view.
-- [ ] **Regression — `qb_account_update` non-IsActive path.** Update an account's `description` only; confirm `Name` is preserved and `Description` updated. (The new `IsActive` flow goes through the same `session.modifyEntity` plumbing — no change to the existing path.)
-- [ ] **Regression — Phase 3 `qb_bill_pay`.** Quick smoke: create a bill, pay it via `qb_bill_pay { paymentMethod: "check" }`, confirm `AmountDue===0` + `IsPaid===true`. (Item 9 smoke — proves we didn't damage the AP flow.)
+- [ ] **`make_inactive` happy path.** `qb_employee_add { firstName: "Test", lastName: "Emp" }` — capture `listId` + `editSequence`. Snapshot `qb_employee_list { activeOnly: true }` (default). Call `qb_employee_make_inactive { listId, editSequence }`. Confirm: (a) response `employee.IsActive === false`; (b) response carries a fresh `EditSequence`; (c) `qb_employee_list { activeOnly: true }` no longer contains the employee; (d) `qb_employee_list { activeOnly: false }` DOES contain it (record preserved).
+- [ ] **Reversibility.** With the now-inactive employee, call `qb_employee_update { listId, editSequence: <fresh>, isActive: true }`. Confirm the employee is back in `qb_employee_list { activeOnly: true }`.
+- [ ] **Stale `editSequence` rejected.** Call `qb_employee_make_inactive` with the ORIGINAL (now-stale) `editSequence`. Confirm `isError: true` + `statusCode: 3170`. Then verify the employee is still in its current state (not deactivated by the rejected call).
+- [ ] **Unknown `listId` on `make_inactive`.** Call `qb_employee_make_inactive { listId: "BOGUS", editSequence: "any" }`. Confirm `isError: true` + `statusCode: 500`.
+- [ ] **`delete` happy path.** Create another employee; call `qb_employee_delete { listId }`. Confirm: (a) response `success: true` with `deleted.ListDelType === "Employee"` and `deleted.ListID` matching; (b) `qb_employee_list { activeOnly: false }` no longer contains the employee.
+- [ ] **Unknown `listId` on `delete`.** `qb_employee_delete { listId: "BOGUS" }` returns `isError: true` + `statusCode: 500`.
+- [ ] **Regression — `qb_employee_list` defaults.** Default call returns the seed employee(s).
+- [ ] **Regression — `qb_employee_add` produces active employees.** Newly-added employees appear in the default `activeOnly: true` list view.
+- [ ] **Regression — `qb_employee_update` non-IsActive path.** Update an employee's `phone` only; confirm `Name` is preserved and `Phone` updated.
+- [ ] **Regression — Item 10 `qb_account_make_inactive`.** Quick smoke: create an account, call `qb_account_make_inactive`, confirm `IsActive === false`. (Proves the shared mod plumbing wasn't damaged.)
+- [ ] **Regression — Phase 3 `qb_bill_pay`.** Quick smoke: create a bill, pay it via `qb_bill_pay { paymentMethod: "check" }`, confirm `AmountDue===0` + `IsPaid===true`.
 
 ## Next Task
 
-**Phase 4, Item 11** in [todo.md:34](todo.md#L34):
+**Phase 4, Item 30** in [todo.md:37](todo.md#L37):
 
-> Add `qb_employee_delete` / `make_inactive` (currently only list/add/update).
+> Add `Class`, `Terms`, `PaymentMethod`, `SalesRep`, `CustomerType`, `VendorType` list tools — needed because invoice/bill creation references these by `FullName` but there's no way to list/discover them.
 
-This is structurally identical to Item 10 — same shape, same simulation pathway, same testing surface. Tool count 42 → 44 if you go with two separate tools (recommended for consistency with Item 10).
+This is a "lots of small thin wrappers" session — six tools, each a thin wrapper around `session.queryEntity(<type>, filters)`. Fast and structurally similar; well-suited to one focused session. Tool count 44 → 50 if all six land.
 
 The work splits into:
 
-1. **Two new tools in [src/tools/employees.ts](src/tools/employees.ts)** — copy the Item 10 pattern almost verbatim:
-   - `qb_employee_make_inactive(listId, editSequence)` → `session.modifyEntity("Employee", { ListID, EditSequence, IsActive: false })`. Bare-minimum schema. Wrap with try/catch.
-   - `qb_employee_delete(listId)` → `session.deleteEntity("Employee", listId)`. Tool description should warn about real QB rejecting deletion of employees with paycheck history (3260/3170).
+1. **One new tools module — [src/tools/lists.ts](src/tools/lists.ts)** (new file). Each tool follows the pattern of `qb_account_list` / `qb_employee_list`: optional `nameFilter`, `activeOnly`, `listId`, `maxReturned`. Six tools:
+   - `qb_class_list` — Classes (e.g. departments / locations / cost centers)
+   - `qb_terms_list` — Standard payment terms (Net 30, 2% 10 Net 30, etc.). Note QB has TWO underlying types: `StandardTerms` and `DateDrivenTerms`. Default to fanning across both and merging (similar pattern to `qb_bill_payment_list`); pass `termsType` to scope.
+   - `qb_payment_method_list` — Payment methods (Check, Cash, Visa, etc.)
+   - `qb_sales_rep_list` — Sales reps
+   - `qb_customer_type_list` — Customer types
+   - `qb_vendor_type_list` — Vendor types
 
-2. **Simulation handles this generically** — `handleMod` already supports `IsActive` mutation, `handleListDel` already routes to the Employee store. Same as Item 10 — zero simulation work.
+2. **Verify the simulation store handles each entity type generically** — these are list-type entities, so `handleQuery` should work via the generic per-entity store path. Spot-check by invoking `mgr.queryEntity("Class", {})` etc. before adding tool wrappers; if any of the six aren't seeded with sample data, add 2-3 seed entries to [src/session/simulation-store.ts](src/session/simulation-store.ts) (mirror the Customer/Vendor seed pattern). Likely needs seeding — `Class`, `Terms`, `PaymentMethod` definitely useful for downstream invoice/bill testing.
 
-3. **Documentation**:
-   - README employees section: add the inactive-vs-delete tradeoff paragraph (mirror the accounts section).
-   - Tool table rows for both new tools.
-   - Tool count 42 → 44.
-   - `instructions` block in [src/index.ts](src/index.ts) — update employee bullet.
-   - Move ACCEPTANCE_CRITERIA Item 11 entry to Completed when done.
+3. **Verify QBXML builder handles these entity types** — [src/qbxml/builder.ts](src/qbxml/builder.ts)'s `buildQueryRequest` needs to know to send `ClassQueryRq` etc. If it builds `<EntityType>QueryRq` generically by appending "QueryRq" to the entity type name, then `Class` / `Terms` / `PaymentMethod` / `SalesRep` / `CustomerType` / `VendorType` should all just work. **Caveat**: Terms is special — needs to fan across `StandardTermsQueryRq` and `DateDrivenTermsQueryRq` and the parser needs `StandardTermsRet` and `DateDrivenTermsRet` registered in `arrayElements` (check first). Spot-check before assuming.
 
-4. **Acceptance considerations**:
-   - At minimum, deactivating an employee should hide them from `qb_employee_list { activeOnly: true }` but keep them in `activeOnly: false` queries.
-   - Stale editSequence → 3170; unknown listId → 500; same as Item 10.
-   - Both tools use the structured-error pattern from Items 5/7/8/9.
+4. **Parser `arrayElements`** — verify [src/qbxml/parser.ts](src/qbxml/parser.ts) registers `ClassRet`, `StandardTermsRet`, `DateDrivenTermsRet`, `PaymentMethodRet`, `SalesRepRet`, `CustomerTypeRet`, `VendorTypeRet`. If any are missing, add them.
 
-5. **If Item 11 feels too small as a session-bounded task, bundle it with Item 13** (`qb_estimate_update` / `qb_estimate_delete` / `qb_estimate_convert_to_invoice`). Item 13 is meatier — `qb_estimate_convert_to_invoice` requires creating an Invoice from an Estimate's line set (different shape, different store) and is a real piece of work, not just a list-tool addition. Or pair Item 11 with **Item 30** (`Class`, `Terms`, `PaymentMethod`, `SalesRep`, `CustomerType`, `VendorType` list tools) — each one is a thin wrapper around `session.queryEntity(<type>, filters)` and they're all structurally similar, so 6 tools could land in one focused session.
+5. **Documentation**:
+   - README: add a new "### Supporting Lists" or "### Reference Lists" section between Employees and Reports. One short paragraph + tool table rows for all six.
+   - Tool count 44 → 50.
+   - `instructions` block in [src/index.ts](src/index.ts) — add a bullet for `qb_*_list` reference lists.
+   - Move ACCEPTANCE_CRITERIA Item 30 entry to Completed when done.
 
-Acceptance criteria are NOT pre-written for Item 11 — write them when picking it up. The Item 10 entry in [ACCEPTANCE_CRITERIA.md](ACCEPTANCE_CRITERIA.md) is a good template to copy.
+6. **Acceptance considerations**:
+   - At minimum, each tool must return a non-empty array when seed data exists, and an empty array when no entities of that type are stored.
+   - Pass-through of `nameFilter`, `activeOnly`, `listId`, `maxReturned` should match the `qb_account_list` / `qb_employee_list` semantics.
+   - For `qb_terms_list`: `termsType: "Standard" | "DateDriven"` should scope; default fans across both.
+
+7. **If Item 30 feels too small as a session, consider bundling with Item 24** (dead-code cleanup — small mechanical hygiene that pairs well with a "lots of small wrappers" session). Item 24 is at [todo.md:49](todo.md#L49). Pure-positive cleanup with no behavioral risk.
+
+Acceptance criteria are NOT pre-written for Item 30 — write them when picking it up. The Item 11 entry in [ACCEPTANCE_CRITERIA.md](ACCEPTANCE_CRITERIA.md) is a good template to copy (same structure, smaller scope per tool).
 
 ## Context Notes
 
-- **Item 10 didn't need any simulation work**, which is why it was a fast bundle. Item 11 should be similarly fast — same generic `handleMod` + `handleListDel` plumbing already supports Employee. If you find yourself needing to extend the simulation, double-check the assumption — most likely you're reaching for a path that already works.
-- **`qb_account_update` already supports `isActive: true|false`.** That field has been there since before Item 10 — `qb_account_make_inactive` is a sugar tool that exists because (a) operators shouldn't have to remember `isActive: false` is the right shape, and (b) the dedicated tool can carry a description that warns about the inactive-vs-delete tradeoff at discovery time. Same logic applies to `qb_employee_make_inactive` if `qb_employee_update` already supports an `isActive` field — verify before adding.
-- **Two-separate-tools (vs discriminated mode arg) was the right call for Item 10** for two reasons: (1) the descriptions are different — `make_inactive` has the reversibility note, `delete` has the warning about transaction history; (2) `delete` doesn't need an `editSequence`, but `make_inactive` does, so a discriminated tool would have a confusing optional-field-depending-on-mode schema. Same applies to Item 11.
-- **Project conventions reminder** ([CLAUDE.md](CLAUDE.md) § Stable Code Conventions): TS strict, ESM with `.js` extensions on relative imports, every zod field has `.describe()`, every tool registered in [src/index.ts](src/index.ts) and listed in the README tool table.
-- **No new dependencies.** Item 10 didn't need any.
-- **No `DECISIONS.md` entry for Item 10** — the inactive-vs-delete split is an established QuickBooks SDK convention, not a project-specific tradeoff. If Item 11 follows the same pattern, no entry needed there either.
-- **Phase 4 progression**: Items 10 ✅, 11 (employees), 12 (sales receipt / credit memo / PO / journal entry — much bigger), 13 (estimate update/delete/convert — meaty), 30 (supporting list tools — fast). The remaining Phase 4 work skews toward "lots of small tools" once you get past Item 12. After Item 11, consider whether Item 12 or a bundle of 13+30 is the better next session.
-- **Verification-script gotcha** (still applies, surfaced in two prior sessions): manager-level `EntityFilter`/`FullName` filtering does NOT honor lookups by `FullName` reliably. Use query-all + `.find(x => x.FullName === name)` in verification scripts. Tool-layer `nameFilter` (with `.NameFilter` wrapping in the request) IS honored.
+- **Item 11 didn't need any simulation work**, exactly as the prior handoff predicted. The generic `handleMod` + `handleListDel` plumbing is solid for any List entity. Trust it for Item 30 too — `handleQuery` with no special filters should work generically across `Class`, `PaymentMethod`, `SalesRep`, `CustomerType`, `VendorType`. **Terms is the one to verify** since it's split across StandardTerms and DateDrivenTerms in real QB.
+- **Two-separate-tools (vs discriminated) was right for Items 10 + 11.** Same logic applies to any future delete/make_inactive pair (Item 12 transactions etc. — though delete-only for transactions, since IsActive is a list-entity concept).
+- **Project conventions reminder** ([CLAUDE.md](CLAUDE.md) § Stable Code Conventions): TS strict, ESM with `.js` extensions on relative imports, every zod field has `.describe()`, every tool registered in [src/index.ts](src/index.ts) and listed in the README tool table. New tool files go under [src/tools/](src/tools/) and export a `register<Domain>Tools(server, getSession)` function — Item 30 should add `registerListTools` and call it from index.ts.
+- **No new dependencies.** Items 10+11 didn't need any. Item 30 is pure tool wrappers — same.
+- **No `DECISIONS.md` entry** for Item 11 — same reasoning as Item 10. The make_inactive/delete split is a QB SDK convention, not a project tradeoff.
+- **Phase 4 progression**: Items 10 ✅, 11 ✅, 12 (sales receipt / credit memo / PO / journal entry — **biggest** remaining Phase 4 work, four new transaction tool families), 13 (estimate update/delete/convert — meaty; convert_to_invoice requires creating an Invoice from an Estimate's line set), 30 (six list tools — fastest). After Item 30, the natural next step is either Item 12 (the meatiest) or Item 13 (medium).
+- **Verification-script gotcha** (still applies — surfaced in three prior sessions now): manager-level `EntityFilter`/`FullName` filtering does NOT honor lookups by `FullName` reliably. Use query-all + `.find(x => x.FullName === name)` in verification scripts. Tool-layer `nameFilter` (with `.NameFilter` wrapping in the request) IS honored.
+- **Simulation seeded employees**: only 1 employee in the seed data (verified E1, count=1). If Item 30 needs richer seed data for `qb_class_list` etc. to be non-trivially testable, add 2-3 entries per type at the same time as the simulation handlers.
 
 ## Post-Task Chores
 
-When Item 11 is done: `npm run build` green, [REGRESSION_CHECKLIST.md](REGRESSION_CHECKLIST.md) walked (especially §3 Tool Surface for the new employee tools, §5 Simulation Store CRUD for `IsActive` flip + hard delete on Employee, §6 Prior Tool Verification for `qb_employee_list { activeOnly: true }` filtering and `qb_employee_update` to make sure shared mod plumbing didn't regress), Item 11 marked `[x]` in `todo.md`, acceptance entry added (then moved to Completed) in [ACCEPTANCE_CRITERIA.md](ACCEPTANCE_CRITERIA.md), README employee section updated, tool count bumped (42 → 44), `instructions` block in [src/index.ts](src/index.ts) updated, fresh `HANDOFF.md` pointing to the next Phase 4 task — likely Item 13 (estimate update/delete/convert — meatier) or Item 30 (supporting list tools — fast).
+When Item 30 is done: `npm run build` green, [REGRESSION_CHECKLIST.md](REGRESSION_CHECKLIST.md) walked (especially §3 Tool Surface for the six new list tools, §4 QBXML Round-Trip for any newly-registered `*Ret` parser entries, §5 Simulation Store for any seed data added, §6 Prior Tool Verification for `qb_account_list` / `qb_employee_list` / `qb_customer_list` to make sure shared query plumbing didn't regress), Item 30 marked `[x]` in `todo.md`, acceptance entry added (then moved to Completed) in [ACCEPTANCE_CRITERIA.md](ACCEPTANCE_CRITERIA.md), README updated with the new Reference Lists section, tool count bumped (44 → 50), `instructions` block in [src/index.ts](src/index.ts) updated, fresh `HANDOFF.md` pointing to the next Phase 4 task — likely Item 13 (estimate update/delete/convert — medium) or Item 12 (the four missing transaction tool families — biggest).

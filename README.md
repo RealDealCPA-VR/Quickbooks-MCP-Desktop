@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (42 total)
+## Tools (44 total)
 
 ### Customers
 | Tool | Description |
@@ -97,11 +97,16 @@ QuickBooks has no generic "Item" — every item belongs to one of five subtypes.
 | `qb_estimate_create` | Create a new estimate |
 
 ### Employees
+
+`qb_employee_make_inactive` is the preferred way to retire an employee — it flips `IsActive: false` so the employee hides from the default `qb_employee_list` view but stays referenceable by historical paychecks, timesheets, and payroll reports. `qb_employee_delete` is a hard delete that real QB rejects (statusCode 3260/3170) for employees with any transaction history; use it only for empty employee records created in error. Both wrap structured tool errors via `isError: true` + `statusCode` so stale `editSequence` (3170) and unknown `listId` (500) surface cleanly.
+
 | Tool | Description |
 |------|-------------|
 | `qb_employee_list` | List/search employees |
 | `qb_employee_add` | Create an employee record |
-| `qb_employee_update` | Update employee details |
+| `qb_employee_update` | Update employee details (firstName / lastName / phone / email / isActive) |
+| `qb_employee_make_inactive` | Deactivate an employee by ListID + EditSequence (sets IsActive: false). Reversible via `qb_employee_update { isActive: true }`. |
+| `qb_employee_delete` | Hard-delete an employee by ListID. Fails for employees with paycheck/timesheet history — use `qb_employee_make_inactive` instead. |
 
 ### Reports & Queries
 | Tool | Description |
