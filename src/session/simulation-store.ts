@@ -727,7 +727,11 @@ export class SimulationStore {
       }
     }
 
-    if (entityType === "Invoice" || entityType === "Estimate") {
+    if (
+      entityType === "Invoice" ||
+      entityType === "Estimate" ||
+      entityType === "SalesReceipt"
+    ) {
       result.Subtotal = lineSum;
     }
 
@@ -747,6 +751,18 @@ export class SimulationStore {
       const subtotal = Number(result.Subtotal ?? 0);
       result.BalanceRemaining = subtotal + salesTaxTotal - appliedAmount;
       result.IsPaid = result.BalanceRemaining === 0;
+    }
+
+    // SalesReceipt is a cash sale — instantly closed, no AR posting. TotalAmount
+    // is the only derived header total (Subtotal + SalesTaxTotal); there's no
+    // BalanceRemaining / AppliedAmount / IsPaid because the sale settles on
+    // creation. The deposit destination lives on DepositToAccountRef on the
+    // entity itself (set at create time) — no balance bookkeeping needed here.
+    if (entityType === "SalesReceipt") {
+      const salesTaxTotal = Number(result.SalesTaxTotal ?? 0);
+      result.SalesTaxTotal = salesTaxTotal;
+      const subtotal = Number(result.Subtotal ?? 0);
+      result.TotalAmount = subtotal + salesTaxTotal;
     }
 
     return result;
@@ -929,15 +945,17 @@ export class SimulationStore {
     // IsPaid (AppliedAmount is preserved — it's not derived from lines, it
     // tracks what payments have already closed against the invoice).
     // Estimate: Subtotal only — estimates have no AmountDue/AppliedAmount/IsPaid
-    // (they're a quote, not posted to AR/AP). For Invoice and Estimate,
-    // computeTotals always overwrites Subtotal so no pre-delete is needed;
-    // Bill needs AmountDue cleared because computeTotals only sets it when
-    // undefined (preserves explicit overrides).
+    // (they're a quote, not posted to AR/AP). SalesReceipt: Subtotal +
+    // TotalAmount — cash sale, instantly closed, no AR balance to track.
+    // For Invoice / Estimate / SalesReceipt, computeTotals always overwrites
+    // Subtotal so no pre-delete is needed; Bill needs AmountDue cleared
+    // because computeTotals only sets it when undefined (preserves explicit overrides).
     if (
       lineModResult.lineModKeys.size > 0 &&
       (entityType === "Bill" ||
         entityType === "Invoice" ||
-        entityType === "Estimate")
+        entityType === "Estimate" ||
+        entityType === "SalesReceipt")
     ) {
       if (entityType === "Bill") {
         delete updated.AmountDue;

@@ -49,7 +49,13 @@ _(All Phase 3 items complete — see Completed below.)_
 
 ## Phase 4 — Missing tools / coverage gaps
 
-_(In progress — Items 10, 11, 13, 30 complete, see Completed below.)_
+_(In progress — Items 10, 11, 13, 30 complete; Item 12 partial — SalesReceipt family done, CreditMemo / PurchaseOrder / JournalEntry pending. See Completed for SalesReceipt entry.)_
+
+## Item 12 — Missing transaction tools (`qb_credit_memo_*` / `qb_purchase_order_*` / `qb_journal_entry_*`) _(Phase 4)_
+
+**Status:** in-progress (SalesReceipt family done — see Completed; three families remaining)
+
+Per-family criteria are deferred and written when the family is picked up. Item 6 / Item 7 / Item 13 (Completed) are the closest templates for the standard CRUD shape; Item 8 (`qb_payment_apply`) is the precedent for the `qb_credit_memo_apply` path. JournalEntry is the outlier — debits/credits must balance; reject unbalanced entries with statusCode 3030 at the simulation layer (or tool layer).
 
 ---
 
@@ -60,6 +66,56 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 12 (SalesReceipt) — Sales receipt tools (`qb_sales_receipt_list` / `_create` / `_update` / `_delete`) _(Phase 4)_ — done 2026-04-26
+
+**Status:** done (1 of 4 families in Item 12; CreditMemo / PurchaseOrder / JournalEntry still pending under Item 12)
+
+**Behavioral criteria** _(create / list / delete)_:
+- [x] All four tools registered and listed by the MCP server.
+- [x] `qb_sales_receipt_create` with a `lines` array returns `Subtotal = sum(line.Amount)` derived server-side via `computeTotals`. Verified A1 (qty=10 × rate=100 → Subtotal=1000).
+- [x] `qb_sales_receipt_create` returns `TotalAmount = Subtotal + SalesTaxTotal` (SalesTaxTotal defaults to 0). Verified A2 (TotalAmount=1000).
+- [x] `qb_sales_receipt_create` returns `SalesReceiptLineRet` array with one entry per `lines[]`, each with a freshly-generated `TxnLineID` and computed `Amount`. Verified A3.
+- [x] `qb_sales_receipt_create` is AR-untouched — customer `Balance` does NOT change. Verified A4 (cash sale; no AR posting).
+- [x] `qb_sales_receipt_create` does NOT set `BalanceRemaining`, `IsPaid`, or `AppliedAmount` (no AR fields). Verified A5.
+- [x] `qb_sales_receipt_create` carries `PaymentMethodRef`, `DepositToAccountRef` onto the entity when supplied. Verified A6.
+- [x] `qb_sales_receipt_list` filters by `txnId` (TxnID), `customerName` (EntityFilter), `refNumber`, `fromDate`/`toDate` (TxnDateRangeFilter). Verified J-series.
+- [x] `qb_sales_receipt_delete` happy path: subsequent `qb_sales_receipt_list { txnId }` returns `count: 0`; customer balance unchanged. Verified G1, G2.
+- [x] `qb_sales_receipt_delete` unknown `txnId` returns `isError: true` with `statusCode: 500`. Verified H1.
+
+**Behavioral criteria** _(`qb_sales_receipt_update`)_:
+- [x] Header-only mod (no `lines`) leaves the existing `SalesReceiptLineRet`, `Subtotal`, `TotalAmount`, and `TxnLineID`s untouched. Verified B1–B4.
+- [x] When `lines` is provided, the array REPLACES the receipt's `SalesReceiptLineRet` wholesale — lines whose `TxnLineID` is not listed are dropped. Verified D1.
+- [x] A line entry with a `txnLineID` matching an existing line preserves that `TxnLineID` and merges the mod's fields onto the existing line (Rate carried over when only Quantity is passed). Verified D2, D3.
+- [x] After a line mod, `Subtotal` and `TotalAmount` recompute from the new line set via `computeTotals` (post-mod recompute branch extended to fire for SalesReceipt). Verified D4, D5.
+- [x] `qb_sales_receipt_update` is AR-untouched — customer `Balance` does NOT change before/after header or line mods. Verified B5, D6.
+- [x] Stale `editSequence` rejects with `statusCode: 3170`; the receipt does NOT mutate. Verified C1, C2.
+- [x] `EditSequence` rotates after every successful mod. Verified B6.
+
+**Regression criteria**:
+- [x] `qb_invoice_update` line mod still recomputes Subtotal + BalanceRemaining (computeTotals SalesReceipt branch did not regress Invoice path). Verified N1.
+- [x] `qb_estimate_update` line mod still recomputes Subtotal (Estimate branch in post-mod recompute condition still fires). Verified N2.
+- [x] `qb_bill_update` line mod still recomputes AmountDue. Verified N3.
+- [x] `qb_payment_apply` still closes invoices end-to-end. Verified N4.
+- [x] `qb_estimate_convert_to_invoice` still works (shared addEntity path). Verified N5.
+- [x] Seed data still loads and `qb_class_list` returns 3 active seed classes. Verified N6.
+
+**Documentation criteria**:
+- [x] README updated: tool count 53 → 57; new "Sales Receipts" section with intro paragraphs and 4-row tool table.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — qb_sales_receipt_* bullet documents the cash-sale semantics, deposit account, line + Subtotal + TotalAmount derivation, AR-untouched guarantee, and stale-editSequence rejection.
+- [x] No new `DECISIONS.md` entry — SalesReceipt fits the existing CRUD shape; no architectural choice was made (post-mod recompute extension mirrors the Estimate addition from Item 13).
+- [x] No `ARCHITECTURE.md` change — SalesReceipt is the same builder/parser/store path as Invoice/Estimate.
+
+**Verification commands**:
+```bash
+npm run build              # exits 0
+node scratch-verify.mjs    # 38-check inline script (deleted post-verification)
+```
+
+**Notes**:
+- SalesReceipt's `computeTotals` branch only derives `Subtotal` + `TotalAmount`. Real QB has additional tax fields (`SalesTaxPercentage`, etc.) but those are not derived from lines — they're carried as-is. The simulation defaults `SalesTaxTotal` to 0 if undefined.
+- `DepositToAccountRef` is preserved on the stored entity but the simulation does NOT post a corresponding ledger entry against the named account (no GL-balance bookkeeping yet — same scope-line as Invoice/Bill, which also don't update GL accounts in the sim, only the customer/vendor balance).
+- The `applyLineMods` regex `^(.+?)Line(s?)Mod$` at [simulation-store.ts:1087](src/session/simulation-store.ts#L1087) caught `SalesReceiptLineMod` with zero handler changes, exactly as predicted by the prior handoff.
 
 ### Item 13 — Estimate tools (`qb_estimate_update` / `qb_estimate_delete` / `qb_estimate_convert_to_invoice`) _(Phase 4)_ — done 2026-04-26
 

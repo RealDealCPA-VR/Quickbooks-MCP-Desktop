@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (53 total)
+## Tools (57 total)
 
 ### Customers
 | Tool | Description |
@@ -103,6 +103,19 @@ QuickBooks has no generic "Item" — every item belongs to one of five subtypes.
 | `qb_estimate_update` | Modify an existing estimate. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. `Subtotal` recomputes after line mods. Pass `isAccepted: true` to mark accepted manually. |
 | `qb_estimate_delete` | Delete an estimate. Estimates aren't posted to AR so there's no balance to reverse. |
 | `qb_estimate_convert_to_invoice` | Convert an estimate to an invoice. Carries `CustomerRef` + lines (and optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PORefNumber`). Operator-supplied `invoiceTxnDate` / `invoiceDueDate` / `invoiceRefNumber` / `invoiceMemo` override the carried values. Default flips the estimate `IsAccepted: true` after the invoice is created — pass `markAccepted: false` to skip. |
+
+### Sales Receipts
+
+A `SalesReceipt` is the cash-sale equivalent of an `Invoice` — same line shape, but the sale settles instantly. There is no AR posting, no `BalanceRemaining`, no `IsPaid`, and no payment-application step: funds land in the account named by `depositToAccountName` (typically "Undeposited Funds" or a bank account) the moment the receipt is created. `paymentMethodName` documents how the customer paid (Check, Cash, Visa, etc.) — discoverable via `qb_payment_method_list`. The simulation derives `Subtotal` from the line set and `TotalAmount = Subtotal + SalesTaxTotal` server-side; sales-receipt mods recompute both automatically. Customer balance is never touched — sales receipts don't post to AR.
+
+`qb_sales_receipt_update` mirrors `qb_invoice_update` / `qb_estimate_update`: pass `txnId` + `editSequence` (from a prior list) plus any header fields and/or replacement `lines`; passing `lines` REPLACES the receipt's existing line set wholesale (matching `txnLineID`s are merged in place, lines you don't list are dropped). Stale `editSequence` rejects with statusCode 3170.
+
+| Tool | Description |
+|------|-------------|
+| `qb_sales_receipt_list` | List/search sales receipts with customer/date/refNumber filters. |
+| `qb_sales_receipt_create` | Create a cash-sale receipt. Takes `lines: [{itemName, quantity, rate, amount?, description?}]` plus optional `paymentMethodName` and `depositToAccountName`. `Subtotal` + `TotalAmount` derive from the line set. |
+| `qb_sales_receipt_update` | Modify an existing receipt. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. `Subtotal` + `TotalAmount` recompute after line mods. |
+| `qb_sales_receipt_delete` | Delete a sales receipt. No AR balance to reverse; the deposit posting against `depositToAccountRef` is rolled back implicitly. |
 
 ### Employees
 
