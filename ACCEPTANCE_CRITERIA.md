@@ -43,17 +43,68 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 3 — Transaction completeness
 
-_(Items 8, 9 — criteria pending pickup.)_
+_(Item 9 — criteria pending pickup.)_
 
 ---
 
-_(Add criteria for items 6, 8, 9, etc. as they are picked up. Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
+_(Add criteria for items 9, etc. as they are picked up. Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
 
 ---
 
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 8 — `qb_payment_apply` (`ReceivePaymentMod` + `AppliedToTxnMod`) _(Phase 3)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_payment_apply` is registered and listed by the MCP server. Verified A5/B/C/D/E paths all execute through the tool's `session.modifyEntity("ReceivePayment", ...)` plumbing.
+- [x] Calling with `txnId` + `editSequence` + `applyTo: [{txnId, amount}]` against a previously-unapplied payment closes the named invoice (`BalanceRemaining` → 0, `IsPaid=true`, `AppliedAmount` bumps by amount), drops customer balance by the applied sum, and rotates the payment's `EditSequence`. Verified A5–A12.
+- [x] Re-targeting from invoice A → invoice B atomically reverses A (BR/AppliedAmount/IsPaid restored) and applies B. Customer balance moves by the *change* in applied sum (delta=0 in same-amount case, signed when amounts differ). Verified B4–B10 (re-target with delta=0) and C7 (delta=+700 → balance drops by 700) and D5 (delta=-600 → balance rises by 600).
+- [x] `applyTo: []` (or omitted `AppliedToTxnMod` block) fully unapplies the payment: the previously-applied invoices are restored, customer balance is restored, payment carries `AppliedToTxnRet=[]` + `AppliedAmount=0` + `UnusedPayment=TotalAmount`. Verified E2–E8.
+- [x] Discount is preserved through the mod path: `DiscountAmount` reduces `BalanceRemaining` alongside the payment but does NOT count toward `AppliedAmount` and does NOT move the customer balance. `DiscountAccountRef` round-trips. Verified F1–F7.
+- [x] Multi-invoice application splits a single payment across N invoices in one call. Verified J1–J6 (2-invoice split).
+- [x] Header fields (`memo`, `refNumber`, `txnDate`, `paymentMethodName`) propagate through the mod and persist via re-query. Verified K1–K4 for memo + refNumber.
+- [x] `payment.AppliedAmount = sum(new applied)` and `payment.UnusedPayment = TotalAmount - sum(new applied)` recompute after every mod. Verified across A6, B12/B13, C8/C9, D6/D7, E7/E8, F7, J5/J6.
+
+**Error criteria**:
+- [x] Unknown invoice `txnId` in `applyTo` rejects with `isError: true`, statusCode 500. The failed mod does NOT reverse the existing application or move the customer balance. Verified H2–H6.
+- [x] Overapplication (`sum(applyTo.amount) > payment.TotalAmount`) rejects with statusCode 500. The simulation is the authoritative gate (the tool can't validate against TotalAmount without a pre-query). Verified I1–I5; payment + invoice state untouched after rejection.
+- [x] Stale `editSequence` rejects with statusCode 3170 via the global `handleMod` EditSequence check. The failed mod does NOT mutate the payment or invoices. Verified G1–G4.
+
+**Regression criteria**:
+- [x] `qb_payment_receive` (Item 5) Add path with `appliedTo` still closes invoices and moves customer balance. Verified L1.
+- [x] `qb_invoice_update` (Item 6) header-only mod still propagates Memo. Verified M1.
+- [x] `qb_bill_update` (Item 7) line-mod still recomputes `AmountDue`. Verified N1.
+- [x] `qb_payment_list` returns the modded payment with intact `AppliedToTxnRet` (verified throughout — every check re-queried via `getPayment`).
+- [x] AR aging reflects the moved customer balance — Item 18's helpers `adjustEntityBalance` / `Customer.Balance` direct read drive both the apply and reverse paths.
+
+**Documentation criteria**:
+- [x] README payment section: intro paragraph explains `qb_payment_apply` semantics — replacement-array, reverse-then-apply, customer-balance-by-delta, empty-array-fully-unapplies, immutable TotalAmount, 3170 rejection on stale editSequence. Tool table row added.
+- [x] `instructions` block in [src/index.ts](src/index.ts): `qb_payment_*` line expanded to flag `qb_payment_apply` + the immutable-TotalAmount rule + 3170 rejection.
+- [x] Tool count in README header bumped 37 → 38.
+- [x] `ACCEPTANCE_CRITERIA.md` entry moved to Completed (this entry).
+- [x] No new `DECISIONS.md` entry — the validate-then-reverse-then-apply ordering is the obvious atomicity choice (avoids the rollback-on-orphan edge case) and falls naturally out of the existing two-pass pattern in `applyTxnApplications`. The "TotalAmount is immutable on this path" choice matches real QB and is documented in the tool description.
+
+**Implementation notes**:
+- Tool layer in [src/tools/payments.ts](src/tools/payments.ts):
+  - Reused the existing `appliedToSchema` from Item 5 — same shape (`txnId`, `amount`, optional `discountAmount` + `discountAccountName`).
+  - `applyTo` is required (no `.optional()`), but the tool accepts `applyTo: []` to fully unapply. Forcing the operator to pass an explicit array (even empty) makes intent unambiguous.
+  - Builds `AppliedToTxnMod` blocks in the same shape as `AppliedToTxnAdd` from Item 5 — the simulation engine accepts both because `applyTxnApplications` only reads `TxnID` / `PaymentAmount` / `DiscountAmount` / `DiscountAccountRef` from each line.
+  - try/catch wraps `session.modifyEntity` so simulation 500s (orphan TxnID, overapplication) and 3170s (stale EditSequence) surface as structured tool errors with `isError: true` + `statusCode`.
+  - Optional header fields (`memo`, `refNumber`, `txnDate`, `paymentMethodName`) propagate through the same merge path used by `qb_payment_receive`.
+- Simulation engine refactor in [src/session/simulation-store.ts](src/session/simulation-store.ts):
+  - Split `applyReceivePayment`'s validation pass into a standalone `validateTxnApplications(lines, totalAmount)` helper. Pure — returns ok/error with no mutation. Reused by `applyTxnApplications` (called inline) and by `handleReceivePaymentMod` (called BEFORE the reversal so a doomed mod never disturbs payment state).
+  - New `applyTxnApplications(payment, lines)` is the engine for both Add and Mod paths. Takes the line array directly so the caller controls where it comes from (`payment.AppliedToTxnAdd` for Add, `modData.AppliedToTxnMod` for Mod).
+  - `applyReceivePayment` is now a thin shim that reads `payment.AppliedToTxnAdd`, deletes it, and hands the array to `applyTxnApplications`.
+  - New `reverseReceivePaymentApplication(payment)` walks `payment.AppliedToTxnRet` and undoes every per-invoice bump + customer balance move. Tolerates orphan TxnIDs in the prior application (silently skipped on per-invoice undo, but still moves customer balance by the named applied sum — the original Add path moved the customer balance regardless of where the targets ended up). Resets `AppliedToTxnRet=[]`, `AppliedAmount=0`, `UnusedPayment=TotalAmount`.
+  - New `handleReceivePaymentMod` in `handleMod`: short-circuits before the Bill/Invoice line-mod plumbing (the AppliedToTxnMod block doesn't match `/^(.+?)Line(s?)Mod$/` and the rest of the path doesn't apply). Flow: validate → reverse → apply → merge headers → bump TimeModified + EditSequence → persist. Reserved keys (`AppliedToTxnMod`, `AppliedToTxnRet`, `AppliedAmount`, `UnusedPayment`, `TotalAmount`, `TxnID`, `EditSequence`) stripped from the header merge — the engine owns those, the operator can't overwrite.
+  - `validateTxnApplications` is called twice per mod (once in `handleReceivePaymentMod`, once inside `applyTxnApplications`). Cheap (O(N) per pass), and the redundant call is the price of keeping `applyTxnApplications` self-validating for the Add path.
+- Verified end-to-end with an 84-check inline script (deleted post-verification per "no test infra yet"): single-invoice apply (A1–A12), re-target with delta-zero balance (B1–B13), increase applied with positive delta on customer balance (C1–C9), decrease applied with negative delta (D1–D7), full unapply via empty AppliedToTxnMod (E1–E8), discount preservation through mod path (F1–F7), stale-EditSequence rejection without rollback (G1–G4), orphan TxnID rejection without side effects (H1–H6) — confirms the validate-first ordering works, overapplication rejection (I1–I5), multi-invoice split (J1–J6), header field propagation (K1–K4), and regressions for `qb_payment_receive` Item 5 (L1), `qb_invoice_update` Item 6 (M1), `qb_bill_update` Item 7 (N1). `npm run build` green throughout.
+
+---
 
 ### Item 6 — `qb_invoice_update` line mod (`InvoiceLineMod`) _(Phase 3)_ — done 2026-04-26
 
