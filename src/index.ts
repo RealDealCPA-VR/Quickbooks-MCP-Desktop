@@ -83,7 +83,7 @@ const server = new McpServer(
       "  • qb_vendor_*      — Vendor CRUD (list, add, update, delete)",
       "  • qb_account_*     — Chart of Accounts (list, add, update)",
       "  • qb_invoice_*     — Invoice management (list, create, update, delete)",
-      "  • qb_bill_*        — Bill/AP management (list, create, delete)",
+      "  • qb_bill_*        — Bill/AP management (list, create, delete) — qb_bill_create requires at least one of expenseLines or itemLines; AmountDue = sum of all line amounts",
       "  • qb_item_*        — Product & Service items (list, add, update, delete) — itemType is one of Service / Inventory / NonInventory / OtherCharge / Group; required on add/update/delete, optional on list",
       "  • qb_payment_*     — Payment recording and queries",
       "  • qb_estimate_*    — Estimate/quote management",

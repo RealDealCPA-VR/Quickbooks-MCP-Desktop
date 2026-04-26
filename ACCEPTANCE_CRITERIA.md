@@ -43,27 +43,6 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 3 — Transaction completeness
 
-### Item 4 — Bill expense + item lines _(Phase 3)_
-
-**Status:** pending
-
-**Behavioral criteria**:
-- [ ] `qb_bill_create` accepts `expenseLines: [{accountName, amount, memo?, classRef?}]` array.
-- [ ] `qb_bill_create` accepts `itemLines: [{itemName, quantity, cost, memo?}]` array.
-- [ ] At least one of `expenseLines` or `itemLines` is required (header-only bills are rejected with a clear error).
-- [ ] Created bill's `AmountDue` equals sum of all expense + item line amounts.
-- [ ] Vendor `Balance` increases accordingly (depends on Phase 1 item 18).
-- [ ] AP aging reflects the new bill.
-
-**Regression criteria**:
-- [ ] Seed bills (if any) still list.
-
-**Notes**:
-- Real QBXML uses `ExpenseLineAdd` and `ItemLineAdd` as siblings inside `BillAdd`.
-- Each expense line needs `AccountRef` (FullName or ListID) + `Amount`. Each item line needs `ItemRef` + `Quantity` + `Cost`.
-
----
-
 ### Item 5 — Payment applied to invoices _(Phase 3)_
 
 **Status:** pending
@@ -93,6 +72,37 @@ _(Add criteria for items 6, 7, 8, 9, etc. as they are picked up. Don't pre-write
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 4 — Bill expense + item lines _(Phase 3)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_bill_create` accepts `expenseLines: [{accountName | accountListId, amount, memo?, className?}]` array.
+- [x] `qb_bill_create` accepts `itemLines: [{itemName | itemListId, quantity, cost, memo?}]` array.
+- [x] At least one of `expenseLines` or `itemLines` is required — header-only bills (and empty arrays for both) are rejected with `isError: true` and a message that names both arg keys.
+- [x] Created bill's `AmountDue` equals sum of all expense + item line amounts. Verified C5 (350), D5 (262.5), E3 (80) — all line-derived.
+- [x] Vendor `Balance` increases accordingly. Verified H1 — `Office Supplies Co` balance moved from 2500 → 2500 + 717.5 (sum of four bills) via Item 18's `adjustPartyBalanceForTxn` integration.
+- [x] AP aging reflects the new bill. Verified I2 — `qb_ap_aging` output mentions `Office Supplies` after activity.
+
+**Regression criteria**:
+- [x] Existing transaction tools still work: `qb_invoice_list { refNumber: "INV-1001" }` returns the seed invoice with `BalanceRemaining = 7500` (verified K1, K2).
+- [x] Existing vendor-required validation still works: `qb_bill_create` without `vendorName`/`vendorListId` returns `isError: true` (verified B1).
+- [x] Bills persist with their lines: subsequent `qb_bill_list` retrieval of `BILL-EXP-1` returns `AmountDue = 350` and the 2-element `ExpenseLineRet` array intact (verified J3, J4).
+
+**Documentation criteria**:
+- [x] README bill table updated: `qb_bill_create` row now describes `expenseLines` / `itemLines` schemas and the `quantity * cost` math; intro paragraph notes that lines are required.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated: `qb_bill_*` line now flags that `qb_bill_create` requires line items and that `AmountDue` is derived from lines.
+- [x] `DECISIONS.md` 2026-04-25 entry added at top: "Drop `amountDue` arg from `qb_bill_create`" — records the schema break and reasoning.
+
+**Implementation notes**:
+- Two zod refinements live alongside the schema definitions in [src/tools/bills.ts](src/tools/bills.ts) so per-line `AccountRef` / `ItemRef` validation fires at the schema boundary, not in the handler. F1 + F2 verify both refinements reject lines that omit the relevant ref.
+- Per-line `Amount = quantity * cost` is computed in the tool handler before `session.addEntity("Bill", data)`. The simulation's line-converter at [src/session/simulation-store.ts:349-368](src/session/simulation-store.ts#L349-L368) only computes `Quantity * Rate` (Bill item lines use `Cost`, not `Rate`), so doing the math in the tool layer is the right boundary — it keeps the converter honest about what real QB derives server-side and what it doesn't.
+- The previously-optional `amountDue` arg was removed entirely. `computeTotals` in the simulation is now the single source of truth for the bill total. Logged in `DECISIONS.md` because zod's default `unknownKeys: "strip"` means a caller passing `amountDue` will silently lose it rather than getting a clear rejection — future agents should not "fix" that by re-adding the arg without rereading the decision entry.
+- `ClassRef` on expense lines (`className` arg → `ClassRef.FullName`) supported for class tracking, matching the acceptance note. Item lines deliberately do NOT take `className` — the acceptance criterion only specified it on expense lines, and Phase 4 item 30 will land a proper `qb_class_list` tool that makes this discoverable across both line types.
+- Verified end-to-end with a 35-check inline script (deleted post-verification per "no test infra yet"): header-only rejection (incl. empty-arrays variant), expense-only with `Memo` preservation, item-only with the `qty * cost` math (12.5 → 62.5 line, 100 → 200 line), mixed bills, per-line ref validation, `accountListId` variant, vendor balance integration with Item 18, AP aging integration, persistence via `qb_bill_list`, invoice regression, and `ClassRef` on expense lines. `npm run build` green.
+
+---
 
 ### Item 2 — Per-subtype Item request types _(Phase 2)_ — done 2026-04-25
 

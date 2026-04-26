@@ -43,10 +43,13 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 | `qb_invoice_delete` | Delete an invoice |
 
 ### Bills (Accounts Payable)
+
+A bill must post to a GL account, so `qb_bill_create` requires at least one of `expenseLines` or `itemLines`. `AmountDue` is the sum of all line amounts.
+
 | Tool | Description |
 |------|-------------|
 | `qb_bill_list` | List/search bills |
-| `qb_bill_create` | Create a new bill |
+| `qb_bill_create` | Create a new bill. Takes `expenseLines: [{accountName, amount, memo?, className?}]` and/or `itemLines: [{itemName, quantity, cost, memo?}]`. Item line `Amount = quantity * cost`. |
 | `qb_bill_delete` | Delete a bill |
 
 ### Items (Products & Services)
