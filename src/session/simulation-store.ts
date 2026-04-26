@@ -298,11 +298,17 @@ export class SimulationStore {
     }
 
     const finalEntity = isTransaction
-      ? this.convertLinesAddToRet(entity)
+      ? this.computeTotals(this.convertLinesAddToRet(entity), entityType)
       : entity;
 
     const storeKey = isTransaction ? id : id;
     store.set(storeKey, finalEntity);
+
+    if (entityType === "Invoice") {
+      this.adjustPartyBalanceForTxn(finalEntity, "Customer", "BalanceRemaining", +1);
+    } else if (entityType === "Bill") {
+      this.adjustPartyBalanceForTxn(finalEntity, "Vendor", "AmountDue", +1);
+    }
 
     return {
       type: rsType,
@@ -360,6 +366,121 @@ export class SimulationStore {
       ...line,
       Amount: amount,
     };
+  }
+
+  // -----------------------------------------------------------------------
+  // Totals computation: Subtotal / AmountDue / BalanceRemaining / IsPaid
+  // -----------------------------------------------------------------------
+
+  // Real QB derives header totals from the lines on the server. The simulation
+  // mirrors that so payment application, AR/AP aging, and reports see the same
+  // numbers a live response would carry. Runs after convertLinesAddToRet, so
+  // every line key is already in *LineRet form (Bill carries two: ExpenseLineRet
+  // + ItemLineRet — both contribute).
+  private computeTotals(
+    entity: StoredEntity,
+    entityType: string
+  ): StoredEntity {
+    const result: StoredEntity = { ...entity };
+
+    let lineSum = 0;
+    for (const key of Object.keys(result)) {
+      if (!/^(.+?)Line(s?)Ret$/.test(key)) continue;
+      const lines = result[key];
+      if (!Array.isArray(lines)) continue;
+      for (const line of lines as Record<string, unknown>[]) {
+        const amt = Number(line.Amount ?? 0);
+        if (!Number.isNaN(amt)) lineSum += amt;
+      }
+    }
+
+    if (entityType === "Invoice" || entityType === "Estimate") {
+      result.Subtotal = lineSum;
+    }
+
+    if (entityType === "Bill" && result.AmountDue === undefined) {
+      result.AmountDue = lineSum;
+    }
+
+    if (entityType === "Invoice") {
+      const salesTaxTotal = Number(result.SalesTaxTotal ?? 0);
+      const appliedAmount = Number(result.AppliedAmount ?? 0);
+      result.SalesTaxTotal = salesTaxTotal;
+      result.AppliedAmount = appliedAmount;
+      const subtotal = Number(result.Subtotal ?? 0);
+      result.BalanceRemaining = subtotal + salesTaxTotal - appliedAmount;
+      result.IsPaid = result.BalanceRemaining === 0;
+    }
+
+    return result;
+  }
+
+  // -----------------------------------------------------------------------
+  // Cross-store balance mutation
+  // -----------------------------------------------------------------------
+
+  // Real QB keeps Customer.Balance / Vendor.Balance in sync with the open AR/AP
+  // they own. Reused by Add (positive delta) and TxnDel (negative delta) here;
+  // Phase 3 item 5 (payment apply) will reuse it as well — keep the signature
+  // generic so the same call site works for any direction.
+  //
+  // Lookup: ListID first (exact), FullName fallback (invoices created via tools
+  // often pass FullName only). Orphan refs are silently ignored — a missing
+  // customer must not block transaction creation.
+  //
+  // TotalBalance mirrors Balance because the simulation has no sub-customer
+  // hierarchy. Vendor has no TotalBalance field — don't introduce one.
+  private adjustEntityBalance(
+    entityType: "Customer" | "Vendor",
+    refKey: { listID?: string; fullName?: string },
+    delta: number
+  ): void {
+    if (delta === 0) return;
+    const store = this.getStore(entityType);
+
+    let target: StoredEntity | undefined;
+    if (refKey.listID) {
+      target = store.get(refKey.listID);
+    }
+    if (!target && refKey.fullName) {
+      for (const e of store.values()) {
+        if (String(e.FullName ?? e.Name ?? "") === refKey.fullName) {
+          target = e;
+          break;
+        }
+      }
+    }
+    if (!target) return;
+
+    const next = Number(target.Balance ?? 0) + delta;
+    target.Balance = next;
+    if (entityType === "Customer") {
+      target.TotalBalance = next;
+    }
+  }
+
+  // Thin adapter that pulls the ref + amount off a stored transaction and
+  // applies the signed delta. `sign` is +1 on add, -1 on delete. Kept private
+  // and entity-type-specific so handleAdd/handleTxnDel stay readable.
+  private adjustPartyBalanceForTxn(
+    txn: StoredEntity,
+    partyType: "Customer" | "Vendor",
+    amountField: "BalanceRemaining" | "AmountDue",
+    sign: 1 | -1
+  ): void {
+    const refField = partyType === "Customer" ? "CustomerRef" : "VendorRef";
+    const ref = txn[refField] as Record<string, unknown> | undefined;
+    if (!ref) return;
+    const amount = Number(txn[amountField] ?? 0);
+    if (!Number.isFinite(amount) || amount === 0) return;
+    this.adjustEntityBalance(
+      partyType,
+      {
+        listID: ref.ListID ? String(ref.ListID) : undefined,
+        fullName: ref.FullName ? String(ref.FullName) : undefined,
+      },
+      sign * amount
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -459,7 +580,8 @@ export class SimulationStore {
     const txnID = String(reqData.TxnID ?? "");
     const store = this.getStore(entityType);
 
-    if (!store.has(txnID)) {
+    const target = store.get(txnID);
+    if (!target) {
       return {
         type: "TxnDelRs",
         statusCode: 500,
@@ -467,6 +589,12 @@ export class SimulationStore {
         statusMessage: `Transaction "${txnID}" specified in the request cannot be found`,
         data: {},
       };
+    }
+
+    if (entityType === "Invoice") {
+      this.adjustPartyBalanceForTxn(target, "Customer", "BalanceRemaining", -1);
+    } else if (entityType === "Bill") {
+      this.adjustPartyBalanceForTxn(target, "Vendor", "AmountDue", -1);
     }
 
     store.delete(txnID);

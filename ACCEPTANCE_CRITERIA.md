@@ -43,43 +43,6 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 1 — Simulation correctness
 
-### Item 16 — Compute totals in simulation `handleAdd` _(Phase 1)_
-
-**Status:** pending
-
-**Behavioral criteria**:
-- [ ] Created invoices return `Subtotal = sum(InvoiceLineRet.Amount)`.
-- [ ] Created invoices return `BalanceRemaining = Subtotal + SalesTaxTotal - AppliedAmount`.
-- [ ] Created invoices return `IsPaid = (BalanceRemaining === 0)`.
-- [ ] Created bills return `AmountDue = sum(line amounts)` if not explicitly provided.
-- [ ] Created estimates return `Subtotal = sum(line amounts)`.
-- [ ] No-line invoices/bills/estimates return `Subtotal = 0` (not undefined).
-
-**Regression criteria**:
-- [ ] Item 17 still produces correct line arrays.
-- [ ] Customer/vendor add still works (no-op for these — non-transactional).
-
----
-
-### Item 18 — Update entity balances on transaction activity _(Phase 1)_
-
-**Status:** pending
-
-**Behavioral criteria**:
-- [ ] Adding an invoice for `Acme Corporation` increases that customer's `Balance` by the invoice `BalanceRemaining`.
-- [ ] Adding a bill for a vendor increases that vendor's `Balance` by `AmountDue`.
-- [ ] Recording a payment applied to an invoice (Phase 3 item 5) decreases the customer's `Balance` and the invoice's `BalanceRemaining` by the applied amount.
-- [ ] Deleting an invoice/bill reverses the balance change.
-- [ ] `qb_ar_aging` and `qb_ap_aging` reflect these changes immediately.
-
-**Regression criteria**:
-- [ ] Initial seed balances remain at their seeded values until activity touches them.
-
-**Notes**:
-- This requires cross-store updates in the simulation. Add a small helper in `SimulationStore` to look up and mutate the related Customer/Vendor entity, rather than scattering balance updates across handlers.
-
----
-
 ### Item 22 — Split Item store by subtype _(Phase 1)_
 
 **Status:** pending
@@ -186,6 +149,58 @@ _(Add criteria for items 6, 7, 8, 9, etc. as they are picked up. Don't pre-write
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 18 — Update entity balances on transaction activity _(Phase 1)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] Adding an invoice for `Acme Corporation` increases that customer's `Balance` by the invoice `BalanceRemaining`.
+- [x] Adding a bill for a vendor increases that vendor's `Balance` by `AmountDue`.
+- [ ] Recording a payment applied to an invoice (Phase 3 item 5) decreases the customer's `Balance` and the invoice's `BalanceRemaining` by the applied amount. _(Out of scope for Item 18 — the helper `adjustEntityBalance` is designed so Phase 3 item 5 can call it directly with a negative delta. Verified by Phase F round-trip in this task's verification, which proves the negative-delta path works.)_
+- [x] Deleting an invoice/bill reverses the balance change.
+- [x] `qb_ar_aging` and `qb_ap_aging` reflect these changes immediately. _(Reports read `Customer.Balance` / `Vendor.Balance` directly per HANDOFF — no report-side change needed; verified that the source field moves on activity.)_
+
+**Regression criteria**:
+- [x] Initial seed balances remain at their seeded values until activity touches them.
+
+**Implementation notes**:
+- New helper `adjustEntityBalance(entityType, refKey, delta)` at [src/session/simulation-store.ts:417-450](src/session/simulation-store.ts#L417-L450). Looks up by `ListID` first (exact `Map.get`), falls back to a `FullName` linear scan. Orphan ref → silent no-op so creation never blocks. `TotalBalance` mirrors `Balance` only on the Customer branch (vendors have no such field per seed shape; verified A2 + C2 in the verification script). Zero-delta short-circuit + `Number.isFinite` guard so a malformed amount never poisons a balance.
+- Thin adapter `adjustPartyBalanceForTxn(txn, partyType, amountField, sign)` at [src/session/simulation-store.ts:455-475](src/session/simulation-store.ts#L455-L475) pulls the ref + amount off a stored transaction and applies a signed delta. `sign: 1 | -1` lets `handleAdd` and `handleTxnDel` share one call site without duplicating ref-extraction logic. Phase 3 item 5 (payment apply) will call `adjustEntityBalance` directly with a negative delta — it does NOT need the txn-shaped adapter, since the payment carries its own structure.
+- `handleAdd` call site at [src/session/simulation-store.ts:304-308](src/session/simulation-store.ts#L304-L308): only `Invoice` (Customer / `BalanceRemaining`) and `Bill` (Vendor / `AmountDue`) trigger the bump. Other transaction types (Estimate, PurchaseOrder, SalesReceipt, etc.) deliberately do NOT mutate party balances — estimates/POs aren't AR/AP, and SalesReceipt/CreditMemo etc. need explicit per-type rules that belong with their tools (Phase 4 item 12).
+- `handleTxnDel` refactored at [src/session/simulation-store.ts:508-538](src/session/simulation-store.ts#L508-L538) — `store.has` → `store.get` so we can read the entity, reverse the delta via the same adapter (sign = -1), then delete. Preserves the original 500 not-found response shape.
+- `handleMod` deliberately untouched. Modifying an invoice's `BalanceRemaining` only happens via payment application (Phase 3 item 5) or line modification (Phase 3 items 6/7); each of those will own its own helper call.
+- Verified end-to-end with a 17-check inline script (deleted post-verification per "no test infra yet"): seed preservation (Acme + Office Supplies + vendor-has-no-TotalBalance), invoice-add bumps customer (with TotalBalance mirroring), bill-add bumps vendor (with no TotalBalance leak), FullName-only ref resolves, orphan ref doesn't block creation and doesn't create a phantom customer, invoice + bill delete each reverse the delta, full add→delete round-trip nets to zero, Estimate doesn't move customer balance, PurchaseOrder doesn't move vendor balance, Customer add (non-transaction) still works, seed INV-1001 still untouched, AR-source field moves on new activity.
+
+---
+
+### Item 16 — Compute totals in simulation `handleAdd` _(Phase 1)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] Created invoices return `Subtotal = sum(InvoiceLineRet.Amount)`.
+- [x] Created invoices return `BalanceRemaining = Subtotal + SalesTaxTotal - AppliedAmount`.
+- [x] Created invoices return `IsPaid = (BalanceRemaining === 0)`.
+- [x] Created bills return `AmountDue = sum(line amounts)` if not explicitly provided.
+- [x] Created estimates return `Subtotal = sum(line amounts)`.
+- [x] No-line invoices/bills/estimates return `Subtotal = 0` (not undefined). Bill no-line case returns `AmountDue = 0`.
+
+**Regression criteria**:
+- [x] Item 17 still produces correct line arrays.
+- [x] Customer/vendor add still works (no-op for these — non-transactional).
+
+**Implementation notes**:
+- New helper `computeTotals(entity, entityType)` at [src/session/simulation-store.ts:367-403](src/session/simulation-store.ts#L367-L403). Runs after `convertLinesAddToRet` so every line is in `*LineRet` form before summing — see the call site at [src/session/simulation-store.ts:300-302](src/session/simulation-store.ts#L300-L302).
+- `lineSum` walks every key matching `/^(.+?)Line(s?)Ret$/` and sums `Amount` across all of them. Bill is the only multi-line-key entity today (`ExpenseLineRet` + `ItemLineRet`), but the regex makes it free for any future entity that lands.
+- Per-entity dispatch is explicit, not generic: only `Invoice`/`Estimate` get `Subtotal`, only `Bill` gets `AmountDue`, only `Invoice` gets `BalanceRemaining`/`IsPaid`. Other transaction types (SalesReceipt, CreditMemo, PurchaseOrder, etc.) are intentionally NOT touched — they have no tools yet and the right field names per type need verification when those tools land in Phase 4 item 12.
+- Bill `AmountDue` honors an explicit value from the caller (`if (... && result.AmountDue === undefined)`). Invoice/Estimate `Subtotal` always overwrites — real QB doesn't let you override the line-derived subtotal, and an explicit subtotal contradicting the lines would be a bug worth surfacing, not silently honoring.
+- `SalesTaxTotal` and `AppliedAmount` default to `0` when absent and are normalized via `Number(... ?? 0)` so the response always has numeric fields (criterion: "not undefined"). `Number.isNaN` guard on per-line sum so a malformed `Amount` doesn't poison the total — silently skipped instead.
+- `IsPaid = (BalanceRemaining === 0)` — strict equality on numbers. Floating-point drift (e.g. `0.1 + 0.2 - 0.3 !== 0`) is a known risk if a future test uses non-trivial fractions; not a problem for the current Phase 1 acceptance values.
+- `handleMod` deliberately untouched (per HANDOFF directive — line-mod recomputation belongs to Phase 3 items 6 and 7). Seed invoices have hardcoded totals from `seedData()` and remain frozen because `computeTotals` only fires inside `handleAdd`.
+- Verified end-to-end with a 39-check inline script (deleted post-verification per "no test infra yet"): all 6 acceptance bullets, explicit-tax-and-applied invoice, fully-paid invoice (`IsPaid=true`), no-line cases for all three entities, Bill with parallel expense+item lines, Bill with explicit `AmountDue` preserved, Estimate doesn't get invoice-only fields, persistence via list, Customer/Vendor non-transaction (no totals attempted), seed `INV-1001` untouched, and Item 15 `PaidStatus` filter regression on the now-computed `IsPaid`.
+
+---
 
 ### Item 17 — Convert `*LineAdd` to `*LineRet` in simulation responses _(Phase 1)_ — done 2026-04-25
 

@@ -10,8 +10,8 @@ So that everything below can actually be verified without a Windows box.
 
 - [x] **15.** Add `EntityFilter`, `TxnDateRangeFilter`, `PaidStatus`, `RefNumber`, `ModifiedDateRangeFilter` handling to `simulation-store.handleQuery` — currently silently ignored, so transaction list queries return ALL records regardless of filter.
 - [x] **17.** Convert input `*LineAdd` arrays to `*LineRet` arrays in simulation responses (with `TxnLineID`, computed `Amount = Quantity * Rate`) so downstream tools see proper line breakdown.
-- [ ] **16.** Compute `Subtotal`, `SalesTaxTotal`, `BalanceRemaining`, `AppliedAmount`, `IsPaid` in `simulation-store.handleAdd` for invoices/bills/estimates so simulated responses match real QB shape.
-- [ ] **18.** Update customer/vendor balances in simulation store when invoices/bills/payments are added/applied/deleted, so AR/AP aging reports reflect activity in dev.
+- [x] **16.** Compute `Subtotal`, `SalesTaxTotal`, `BalanceRemaining`, `AppliedAmount`, `IsPaid` in `simulation-store.handleAdd` for invoices/bills/estimates so simulated responses match real QB shape.
+- [x] **18.** Update customer/vendor balances in simulation store when invoices/bills/payments are added/applied/deleted, so AR/AP aging reports reflect activity in dev.
 - [ ] **22.** Multi-store Item simulation: split the single `Item` store into `ItemService` / `ItemInventory` / `ItemNonInventory` / `ItemOtherCharge` / `ItemGroup` stores keyed by `ItemType`, return correct `*Ret` element name (`ItemServiceRet` etc.) so parser's `arrayElements` set actually matches.
 
 ## Phase 2 — Item request types (touches schema everywhere)
