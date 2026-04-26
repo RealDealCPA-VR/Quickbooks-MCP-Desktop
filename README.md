@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (57 total)
+## Tools (66 total)
 
 ### Customers
 | Tool | Description |
@@ -116,6 +116,37 @@ A `SalesReceipt` is the cash-sale equivalent of an `Invoice` — same line shape
 | `qb_sales_receipt_create` | Create a cash-sale receipt. Takes `lines: [{itemName, quantity, rate, amount?, description?}]` plus optional `paymentMethodName` and `depositToAccountName`. `Subtotal` + `TotalAmount` derive from the line set. |
 | `qb_sales_receipt_update` | Modify an existing receipt. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. `Subtotal` + `TotalAmount` recompute after line mods. |
 | `qb_sales_receipt_delete` | Delete a sales receipt. No AR balance to reverse; the deposit posting against `depositToAccountRef` is rolled back implicitly. |
+
+### Credit Memos
+
+A `CreditMemo` is the AR-negative analog of an `Invoice` — same line shape, but the total credits the customer instead of billing them. On creation `Customer.Balance` moves by `-TotalAmount` (the credit reduces what the customer owes). The credit's open balance is tracked as `RemainingValue = TotalAmount − AppliedAmount`; once `RemainingValue` hits zero the memo is fully consumed (every dollar applied to specific invoices). Pass `appliedTo: [{txnId, amount}]` on create to immediately close part or all of one or more open invoices, or omit it to leave the credit fully unapplied as a customer credit pool.
+
+`qb_credit_memo_apply` re-targets an existing memo against a different set of invoices via `CreditMemoMod` + `AppliedToTxnMod`. Pass `txnId` + `editSequence` (from a prior `qb_credit_memo_list`) plus the replacement `applyTo` array. The new array REPLACES the memo's prior application wholesale: previously-applied invoices are reversed (their `BalanceRemaining` / `AppliedAmount` / `IsPaid` restored) and the new invoices receive the new application atomically (validate-first, then mutate). The customer's overall `Balance` does NOT move on re-apply — the credit pool just shifts between memo `RemainingValue` and invoice `BalanceRemaining`. Pass an empty `applyTo: []` to fully unapply (memo `RemainingValue` returns to `TotalAmount`). `TotalAmount` is immutable on this path. A stale `editSequence` rejects with statusCode 3170.
+
+`qb_credit_memo_update` is for header / line edits, NOT re-application. Passing `lines` REPLACES the memo's `CreditMemoLineRet` wholesale, `Subtotal` + `TotalAmount` + `RemainingValue` all recompute, and customer balance adjusts by `-(newTotalAmount − oldTotalAmount)` so the AR-negative posting stays consistent. Header-only mods leave existing lines untouched. `AppliedAmount` is preserved across updates (it tracks invoice applications, not the line set).
+
+| Tool | Description |
+|------|-------------|
+| `qb_credit_memo_list` | List/search credit memos with customer/date/refNumber filters. |
+| `qb_credit_memo_create` | Create a credit memo. Takes `lines: [{itemName, quantity, rate, amount?, description?}]` plus optional `appliedTo: [{txnId, amount}]` for immediate auto-application. `Subtotal` + `TotalAmount` derive from the line set; customer balance moves by `-TotalAmount`. |
+| `qb_credit_memo_update` | Modify an existing memo's header / line set. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines`. Header-only mods leave existing lines untouched; `Subtotal` / `TotalAmount` / `RemainingValue` recompute after line mods and customer balance adjusts by the delta. |
+| `qb_credit_memo_apply` | Re-apply an existing credit memo to a different set of invoices. Reverses the prior application + applies the new one atomically; customer balance does NOT move (the credit pool just shifts to invoice-level). Pass `applyTo: []` to fully unapply. |
+| `qb_credit_memo_delete` | Delete a credit memo. Reverses the AR-negative posting (`Customer.Balance += TotalAmount`) and restores any applied invoice balances. |
+
+### Purchase Orders
+
+A `PurchaseOrder` is the vendor-side analog of an `Estimate` — a non-posting commitment to buy from a vendor. It does NOT touch `Vendor.Balance` or AP: the vendor balance only moves when items are received against the PO via a bill (or via ItemReceipt, which this server doesn't expose yet). Lines use `Cost` (not `Rate` — that's the AR side); each line's `Amount = Quantity * Cost` is computed at the tool layer. `TotalAmount` aggregates from the line set directly — POs have no separate `Subtotal` header.
+
+`IsManuallyClosed` is a header flag operators can set to mark a PO closed regardless of receipt activity (typical workflow: cancel a PO that won't be received). Real QB exposes it on both Add and Mod; this server surfaces it on `qb_purchase_order_create` and `qb_purchase_order_update`. The simulation stores it on the entity but doesn't drive automation off it (no auto-close when fully received against — that's a future Bill ↔ PO linkage we don't model yet).
+
+`qb_purchase_order_update` mirrors `qb_invoice_update` / `qb_bill_update` for header/line edits. Passing `lines` REPLACES the line set wholesale (matching `txnLineID`s are merged in place, lines you don't list are dropped); `TotalAmount` recomputes after line mods. POs are non-posting so there is no vendor-balance side effect on either header or line changes. Stale `editSequence` rejects with statusCode 3170.
+
+| Tool | Description |
+|------|-------------|
+| `qb_purchase_order_list` | List/search purchase orders with vendor/date/refNumber filters. |
+| `qb_purchase_order_create` | Create a PO. Takes `lines: [{itemName, quantity, cost, description?, memo?}]` (at least one required). `TotalAmount = sum(quantity * cost)`. Optional `dueDate`, `shipToEntity`, `isManuallyClosed`. |
+| `qb_purchase_order_update` | Modify an existing PO. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, cost?, memo?}]`. Header-only mods leave existing lines untouched. `TotalAmount` recomputes after line mods. |
+| `qb_purchase_order_delete` | Delete a PO. Non-posting, so no vendor balance to reverse — pure record removal. |
 
 ### Employees
 

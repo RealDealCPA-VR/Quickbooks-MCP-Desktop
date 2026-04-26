@@ -158,15 +158,25 @@ function serializeBody(
     if (value === undefined || value === null) continue;
 
     if (Array.isArray(value)) {
-      for (const item of value) {
-        if (typeof item === "object" && item !== null) {
-          lines.push(`${indent}<${key}>`);
-          lines.push(
-            ...serializeBody(item as Record<string, unknown>, depth + 1)
-          );
-          lines.push(`${indent}</${key}>`);
-        } else {
-          lines.push(`${indent}<${key}>${escapeXml(String(item))}</${key}>`);
+      if (value.length === 0) {
+        // Empty arrays still need a wire-level marker so the receiver can
+        // distinguish "field present but empty" from "field absent". Without
+        // this, e.g. qb_credit_memo_apply with applyTo: [] would strip
+        // AppliedToTxnMod entirely and the simulation could not tell whether
+        // the caller wanted to fully unapply (apply path) or had no apply
+        // intent at all (update path with header-only changes).
+        lines.push(`${indent}<${key}/>`);
+      } else {
+        for (const item of value) {
+          if (typeof item === "object" && item !== null) {
+            lines.push(`${indent}<${key}>`);
+            lines.push(
+              ...serializeBody(item as Record<string, unknown>, depth + 1)
+            );
+            lines.push(`${indent}</${key}>`);
+          } else {
+            lines.push(`${indent}<${key}>${escapeXml(String(item))}</${key}>`);
+          }
         }
       }
     } else if (typeof value === "object") {

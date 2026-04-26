@@ -325,6 +325,17 @@ export class SimulationStore {
           data: {},
         };
       }
+    } else if (entityType === "CreditMemo") {
+      const applyResult = this.applyCreditMemo(finalEntity);
+      if (!applyResult.ok) {
+        return {
+          type: rsType,
+          statusCode: 500,
+          statusSeverity: "Error",
+          statusMessage: applyResult.error,
+          data: {},
+        };
+      }
     }
 
     const storeKey = isTransaction ? id : id;
@@ -334,6 +345,14 @@ export class SimulationStore {
       this.adjustPartyBalanceForTxn(finalEntity, "Customer", "BalanceRemaining", +1);
     } else if (entityType === "Bill") {
       this.adjustPartyBalanceForTxn(finalEntity, "Vendor", "AmountDue", +1);
+    } else if (entityType === "CreditMemo") {
+      // AR-negative posting: customer Balance moves by -TotalAmount on memo
+      // creation, regardless of whether AppliedToTxnAdd applied any of it to
+      // specific invoices. The applied portion shifts the bookkeeping from
+      // the credit pool (memo.RemainingValue) to invoice-level (Invoice.
+      // BalanceRemaining drops); the customer's overall open balance moves
+      // by the full TotalAmount either way. Reversed in handleTxnDel.
+      this.adjustPartyBalanceForTxn(finalEntity, "Customer", "TotalAmount", -1);
     }
 
     return {
@@ -653,6 +672,186 @@ export class SimulationStore {
   }
 
   // -----------------------------------------------------------------------
+  // CreditMemo application — close out invoices, NO customer-balance move
+  // -----------------------------------------------------------------------
+
+  // CreditMemo is the AR-negative analog of ReceivePayment: it closes out
+  // open invoices via AppliedToTxnAdd / AppliedToTxnMod entries, each
+  // reducing a named invoice's BalanceRemaining. The structural difference
+  // from ReceivePayment is *where customer balance moves*:
+  //
+  //   ReceivePayment: customer.Balance moves by -appliedSum at apply time
+  //                   (only the applied portion of the payment hits AR; the
+  //                   rest sits as UnusedPayment / customer credit).
+  //   CreditMemo:     customer.Balance moves by -TotalAmount at MEMO-ADD
+  //                   time (regardless of whether any of it is applied to
+  //                   specific invoices). Application then shifts the
+  //                   bookkeeping from the memo's RemainingValue to the
+  //                   invoice's BalanceRemaining without further customer
+  //                   balance movement.
+  //
+  // So applyCreditMemo:
+  //   1. Reads AppliedToTxnAdd off the memo, deletes it.
+  //   2. Validates each TxnID (orphan in line N must NOT leave 1..N-1 mutated).
+  //   3. Validates sum(applied) ≤ TotalAmount (overapplication guard).
+  //   4. For each application: invoice.BalanceRemaining -= amount,
+  //      invoice.AppliedAmount += amount, IsPaid = (BalanceRemaining === 0).
+  //   5. Sets memo.AppliedToTxnRet = [...], memo.AppliedAmount = appliedSum,
+  //      memo.RemainingValue = TotalAmount - appliedSum.
+  //   6. Does NOT move customer.Balance — that already happened (or will
+  //      happen) at the handleAdd customer-balance branch using TotalAmount.
+  //
+  // CreditMemo's AppliedToTxn shape uses PaymentAmount (matches the QBXML
+  // schema — yes, even on a credit memo). DiscountAmount is not exposed by
+  // qb_credit_memo_create / _apply (uncommon use case for credit memos);
+  // the simulation ignores any DiscountAmount that slips through.
+  private applyCreditMemo(
+    memo: StoredEntity
+  ): { ok: true } | { ok: false; error: string } {
+    const raw = memo.AppliedToTxnAdd;
+    delete memo.AppliedToTxnAdd;
+    const lines = !raw
+      ? []
+      : Array.isArray(raw)
+        ? (raw as Record<string, unknown>[])
+        : [raw as Record<string, unknown>];
+
+    return this.applyCreditMemoApplications(memo, lines);
+  }
+
+  // Pure validation pass for credit memo AppliedToTxn lines. Splitting
+  // validation from mutation lets the qb_credit_memo_apply path validate
+  // the new application set BEFORE reversing the existing one — so a doomed
+  // mod (orphan TxnID, overapplication) bails out cleanly without disturbing
+  // the memo state.
+  private validateCreditMemoApplications(
+    lines: Record<string, unknown>[],
+    totalAmount: number
+  ): { ok: true } | { ok: false; error: string } {
+    if (lines.length === 0) return { ok: true };
+
+    const invoiceStore = this.getStore("Invoice");
+    for (const line of lines) {
+      const txnId = String(line.TxnID ?? "");
+      if (!txnId) {
+        return { ok: false, error: "AppliedToTxn requires TxnID" };
+      }
+      if (!invoiceStore.has(txnId)) {
+        return {
+          ok: false,
+          error: `Invoice "${txnId}" specified in AppliedToTxn cannot be found`,
+        };
+      }
+    }
+
+    const proposedSum = lines.reduce(
+      (acc, l) => acc + Number(l.PaymentAmount ?? 0),
+      0
+    );
+    if (proposedSum > totalAmount + 1e-9) {
+      return {
+        ok: false,
+        error: `sum(AppliedToTxn.PaymentAmount) = ${proposedSum} exceeds credit memo TotalAmount = ${totalAmount}`,
+      };
+    }
+
+    return { ok: true };
+  }
+
+  // Shared application engine used by the Add path (applyCreditMemo) and the
+  // Mod path (handleCreditMemoApplyMod via qb_credit_memo_apply). Two-pass:
+  // validate every TxnID + overapplication first (atomicity — orphan in line
+  // N must NOT leave 1..N-1 mutated), then apply mutations + build *Ret entries
+  // + recompute AppliedAmount/RemainingValue. NO customer-balance move (that
+  // happens at memo-add/delete level, not at apply time).
+  //
+  // Caller is responsible for reversing any prior application before calling
+  // this on the mod path — see reverseCreditMemoApplication.
+  private applyCreditMemoApplications(
+    memo: StoredEntity,
+    lines: Record<string, unknown>[]
+  ): { ok: true } | { ok: false; error: string } {
+    const totalAmount = Number(memo.TotalAmount ?? 0);
+
+    const validation = this.validateCreditMemoApplications(lines, totalAmount);
+    if (!validation.ok) return validation;
+
+    if (lines.length === 0) {
+      memo.AppliedToTxnRet = [];
+      memo.AppliedAmount = 0;
+      memo.RemainingValue = totalAmount;
+      return { ok: true };
+    }
+
+    const invoiceStore = this.getStore("Invoice");
+
+    let appliedSum = 0;
+    const appliedRet: Record<string, unknown>[] = [];
+    for (const line of lines) {
+      const txnId = String(line.TxnID);
+      const paymentAmount = Number(line.PaymentAmount ?? 0);
+
+      const invoice = invoiceStore.get(txnId)!;
+      const balance = Number(invoice.BalanceRemaining ?? 0);
+      const applied = Number(invoice.AppliedAmount ?? 0);
+      invoice.BalanceRemaining = balance - paymentAmount;
+      invoice.AppliedAmount = applied + paymentAmount;
+      invoice.IsPaid = invoice.BalanceRemaining === 0;
+
+      appliedSum += paymentAmount;
+
+      appliedRet.push({
+        TxnLineID: this.nextId(),
+        TxnID: txnId,
+        PaymentAmount: paymentAmount,
+      });
+    }
+
+    memo.AppliedToTxnRet = appliedRet;
+    memo.AppliedAmount = appliedSum;
+    memo.RemainingValue = totalAmount - appliedSum;
+
+    return { ok: true };
+  }
+
+  // Reverse a credit memo's existing application: undo every per-invoice
+  // bump (restore BalanceRemaining / AppliedAmount / IsPaid). Used by the
+  // qb_credit_memo_apply path (handleCreditMemoApplyMod) before applying a
+  // new application set, and by handleTxnDel when deleting a memo that had
+  // applications. Does NOT move customer balance — that's reversed at the
+  // memo level (handleTxnDel uses adjustPartyBalanceForTxn with TotalAmount).
+  //
+  // Tolerates orphan TxnIDs (silently skipped) — an invoice deleted between
+  // the original application and this reversal shouldn't block the operator
+  // from re-applying the credit elsewhere.
+  private reverseCreditMemoApplication(memo: StoredEntity): void {
+    const raw = memo.AppliedToTxnRet;
+    if (!raw) return;
+    const entries = (Array.isArray(raw) ? raw : [raw]) as Record<string, unknown>[];
+    if (entries.length === 0) return;
+
+    const invoiceStore = this.getStore("Invoice");
+
+    for (const entry of entries) {
+      const txnId = String(entry.TxnID ?? "");
+      const paymentAmount = Number(entry.PaymentAmount ?? 0);
+
+      const invoice = invoiceStore.get(txnId);
+      if (!invoice) continue;
+
+      invoice.BalanceRemaining =
+        Number(invoice.BalanceRemaining ?? 0) + paymentAmount;
+      invoice.AppliedAmount =
+        Number(invoice.AppliedAmount ?? 0) - paymentAmount;
+      invoice.IsPaid = invoice.BalanceRemaining === 0;
+    }
+
+    memo.AppliedToTxnRet = [];
+    memo.AppliedAmount = 0;
+    memo.RemainingValue = Number(memo.TotalAmount ?? 0);
+  }
+
+  // -----------------------------------------------------------------------
   // Line conversion: *LineAdd → *LineRet
   // -----------------------------------------------------------------------
 
@@ -730,7 +929,8 @@ export class SimulationStore {
     if (
       entityType === "Invoice" ||
       entityType === "Estimate" ||
-      entityType === "SalesReceipt"
+      entityType === "SalesReceipt" ||
+      entityType === "CreditMemo"
     ) {
       result.Subtotal = lineSum;
     }
@@ -763,6 +963,36 @@ export class SimulationStore {
       result.SalesTaxTotal = salesTaxTotal;
       const subtotal = Number(result.Subtotal ?? 0);
       result.TotalAmount = subtotal + salesTaxTotal;
+    }
+
+    // CreditMemo is the AR-negative analog of Invoice. TotalAmount = Subtotal +
+    // SalesTaxTotal is the credit's face value; AppliedAmount tracks how much
+    // of that credit has been applied to invoices (via AppliedToTxnAdd at
+    // create time, or AppliedToTxnMod via qb_credit_memo_apply); RemainingValue
+    // = TotalAmount - AppliedAmount is the unapplied credit pool. Customer-
+    // balance bookkeeping happens at handleAdd / handleTxnDel / handleMod
+    // (line-mod path) — NOT here. computeTotals only derives the header
+    // numbers. AppliedAmount is preserved across line mods (it's not derived
+    // from the line set; it tracks accumulated invoice applications and
+    // applyCreditMemo / handleCreditMemoApplyMod own that field).
+    if (entityType === "CreditMemo") {
+      const salesTaxTotal = Number(result.SalesTaxTotal ?? 0);
+      result.SalesTaxTotal = salesTaxTotal;
+      const subtotal = Number(result.Subtotal ?? 0);
+      const totalAmount = subtotal + salesTaxTotal;
+      result.TotalAmount = totalAmount;
+      const appliedAmount = Number(result.AppliedAmount ?? 0);
+      result.AppliedAmount = appliedAmount;
+      result.RemainingValue = totalAmount - appliedAmount;
+    }
+
+    // PurchaseOrder is non-posting (no AP balance until received against). The
+    // line set aggregates straight to TotalAmount — real QB POs don't expose a
+    // separate Subtotal header field. No SalesTaxTotal, no Applied/Remaining
+    // bookkeeping. IsManuallyClosed (write-once flag set at create + update)
+    // lives on the entity itself; this method doesn't touch it.
+    if (entityType === "PurchaseOrder") {
+      result.TotalAmount = lineSum;
     }
 
     return result;
@@ -815,10 +1045,12 @@ export class SimulationStore {
   // Thin adapter that pulls the ref + amount off a stored transaction and
   // applies the signed delta. `sign` is +1 on add, -1 on delete. Kept private
   // and entity-type-specific so handleAdd/handleTxnDel stay readable.
+  // CreditMemo passes amountField: "TotalAmount" with sign: -1 on add (the
+  // credit reduces customer balance) and sign: +1 on delete (reverse).
   private adjustPartyBalanceForTxn(
     txn: StoredEntity,
     partyType: "Customer" | "Vendor",
-    amountField: "BalanceRemaining" | "AmountDue",
+    amountField: "BalanceRemaining" | "AmountDue" | "TotalAmount",
     sign: 1 | -1
   ): void {
     const refField = partyType === "Customer" ? "CustomerRef" : "VendorRef";
@@ -908,21 +1140,38 @@ export class SimulationStore {
       );
     }
 
-    // Apply *LineMod arrays (Bill and Invoice exercise this path).
-    // The mod's line array becomes the entity's new line array, with
-    // merge-by-TxnLineID semantics so a partial mod ("change just memo on
-    // line L1") doesn't force the operator to reconstruct the whole line.
+    // CreditMemo with AppliedToTxnMod (qb_credit_memo_apply path) is the
+    // AR-negative analog of qb_payment_apply: re-target an existing memo to
+    // a different invoice set without touching the line set or TotalAmount.
+    // Falls through to the standard line-mod path when AppliedToTxnMod is
+    // not present (qb_credit_memo_update — header / line changes that DO
+    // recompute TotalAmount and DO move customer balance by the delta).
+    if (entityType === "CreditMemo" && modData.AppliedToTxnMod !== undefined) {
+      return this.handleCreditMemoApplyMod(
+        rsType, retName, store, id, existing, modData
+      );
+    }
+
+    // Apply *LineMod arrays (Bill, Invoice, Estimate, SalesReceipt, CreditMemo
+    // exercise this path). The mod's line array becomes the entity's new line
+    // array, with merge-by-TxnLineID semantics so a partial mod ("change just
+    // memo on line L1") doesn't force the operator to reconstruct the whole
+    // line.
     //
     // Capture the pre-mod amount that maps to the party's open balance —
     // Bill uses AmountDue (vendor side), Invoice uses BalanceRemaining
-    // (customer side). Read off `existing` so we get the value BEFORE
-    // applyLineMods produces a new line set.
+    // (customer side), CreditMemo uses TotalAmount (customer side, but
+    // sign-inverted: TotalAmount growing means customer balance dropping).
+    // Read off `existing` so we get the value BEFORE applyLineMods produces
+    // a new line set.
     const oldPartyAmount =
       entityType === "Bill"
         ? Number(existing.AmountDue ?? 0)
         : entityType === "Invoice"
           ? Number(existing.BalanceRemaining ?? 0)
-          : 0;
+          : entityType === "CreditMemo"
+            ? Number(existing.TotalAmount ?? 0)
+            : 0;
     const lineModResult = this.applyLineMods(existing, modData);
 
     const strippedModData = lineModResult.lineModKeys.size > 0
@@ -947,15 +1196,24 @@ export class SimulationStore {
     // Estimate: Subtotal only — estimates have no AmountDue/AppliedAmount/IsPaid
     // (they're a quote, not posted to AR/AP). SalesReceipt: Subtotal +
     // TotalAmount — cash sale, instantly closed, no AR balance to track.
-    // For Invoice / Estimate / SalesReceipt, computeTotals always overwrites
-    // Subtotal so no pre-delete is needed; Bill needs AmountDue cleared
-    // because computeTotals only sets it when undefined (preserves explicit overrides).
+    // CreditMemo: Subtotal + TotalAmount + RemainingValue (= TotalAmount −
+    // AppliedAmount). AppliedAmount is preserved (it's not derived from lines;
+    // it tracks invoice applications and applyCreditMemo / handleCreditMemo-
+    // ApplyMod own that field). Customer balance moves by -(newTotalAmount −
+    // oldTotalAmount) below. PurchaseOrder: TotalAmount only — non-posting,
+    // so no balance bookkeeping below either.
+    // For Invoice / Estimate / SalesReceipt / CreditMemo / PurchaseOrder,
+    // computeTotals always overwrites the derived header field so no pre-delete
+    // is needed; Bill needs AmountDue cleared because computeTotals only sets
+    // it when undefined (preserves explicit overrides).
     if (
       lineModResult.lineModKeys.size > 0 &&
       (entityType === "Bill" ||
         entityType === "Invoice" ||
         entityType === "Estimate" ||
-        entityType === "SalesReceipt")
+        entityType === "SalesReceipt" ||
+        entityType === "CreditMemo" ||
+        entityType === "PurchaseOrder")
     ) {
       if (entityType === "Bill") {
         delete updated.AmountDue;
@@ -976,6 +1234,14 @@ export class SimulationStore {
       this.adjustPartyBalanceForTxnMod(
         "Customer", "CustomerRef", "BalanceRemaining",
         existing, updated, oldPartyAmount
+      );
+    } else if (entityType === "CreditMemo") {
+      // Sign-inverted: TotalAmount growing means customer balance dropping.
+      // sign: -1 flips both branches of adjustPartyBalanceForTxnMod (same-
+      // party delta and reverse-then-apply for ref changes).
+      this.adjustPartyBalanceForTxnMod(
+        "Customer", "CustomerRef", "TotalAmount",
+        existing, updated, oldPartyAmount, -1
       );
     }
 
@@ -1064,6 +1330,99 @@ export class SimulationStore {
       "AppliedToTxnRet",
       "AppliedAmount",
       "UnusedPayment",
+      "TotalAmount",
+      "TxnID",
+      "EditSequence",
+    ]);
+    const headerMod = this.omitKeys(modData, reservedKeys);
+
+    const updated: StoredEntity = {
+      ...existing,
+      ...headerMod,
+      TimeModified: new Date().toISOString(),
+      EditSequence: this.nextEditSequence(),
+    };
+
+    store.set(id, updated);
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { [retName]: updated },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // CreditMemo apply-mod handler (qb_credit_memo_apply path)
+  // -----------------------------------------------------------------------
+
+  // CreditMemoMod with AppliedToTxnMod blocks re-applies a memo to a
+  // (possibly different) set of invoices. Structurally identical to
+  // handleReceivePaymentMod (validate → reverse → apply, atomically) with
+  // two differences:
+  //
+  //   1. The application engine is applyCreditMemoApplications (no discount
+  //      handling, no UnusedPayment field — replaced by RemainingValue).
+  //   2. Customer balance is NOT moved here — that already happened at memo-
+  //      add time using the FULL TotalAmount, and re-application just shifts
+  //      bookkeeping between the credit pool and invoice-level balances
+  //      without changing the customer's overall open balance.
+  //
+  // TotalAmount is intentionally NOT re-derived from the application — the
+  // memo's face value is immutable on this path. Changing the credit's face
+  // value goes through qb_credit_memo_update (with a new line set), which
+  // recomputes TotalAmount and moves customer balance via the standard
+  // adjustPartyBalanceForTxnMod call site.
+  private handleCreditMemoApplyMod(
+    rsType: string,
+    retName: string,
+    store: EntityStore,
+    id: string,
+    existing: StoredEntity,
+    modData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const rawMod = modData.AppliedToTxnMod;
+    const newLines = !rawMod
+      ? []
+      : Array.isArray(rawMod)
+        ? (rawMod as Record<string, unknown>[])
+        : [rawMod as Record<string, unknown>];
+
+    const totalAmount = Number(existing.TotalAmount ?? 0);
+    const validation = this.validateCreditMemoApplications(newLines, totalAmount);
+    if (!validation.ok) {
+      return {
+        type: rsType,
+        statusCode: 500,
+        statusSeverity: "Error",
+        statusMessage: validation.error,
+        data: {},
+      };
+    }
+
+    this.reverseCreditMemoApplication(existing);
+    const applyResult = this.applyCreditMemoApplications(existing, newLines);
+    if (!applyResult.ok) {
+      // Defensive — validate passed, so apply should too.
+      return {
+        type: rsType,
+        statusCode: 500,
+        statusSeverity: "Error",
+        statusMessage: applyResult.error,
+        data: {},
+      };
+    }
+
+    // Merge header fields. AppliedToTxnMod is consumed; AppliedToTxnRet /
+    // AppliedAmount / RemainingValue / TotalAmount are derived state that
+    // the mod must not overwrite (TotalAmount is immutable on this path).
+    const reservedKeys = new Set([
+      "AppliedToTxnMod",
+      "AppliedToTxnRet",
+      "AppliedAmount",
+      "RemainingValue",
       "TotalAmount",
       "TxnID",
       "EditSequence",
@@ -1183,13 +1542,17 @@ export class SimulationStore {
   // AmountDue, Invoice uses BalanceRemaining (which can go negative when a
   // line mod drops the subtotal below the already-applied amount; the negative
   // is intentional — it represents over-application as a customer credit).
+  // CreditMemo uses TotalAmount with `sign: -1` because a memo growing means
+  // the customer's open balance shrinks (more credit issued); the sign flips
+  // the directionality through both same-party and reverse-then-apply paths.
   private adjustPartyBalanceForTxnMod(
     partyType: "Customer" | "Vendor",
     refField: "CustomerRef" | "VendorRef",
-    amountField: "AmountDue" | "BalanceRemaining",
+    amountField: "AmountDue" | "BalanceRemaining" | "TotalAmount",
     beforeTxn: StoredEntity,
     afterTxn: StoredEntity,
-    oldAmount: number
+    oldAmount: number,
+    sign: 1 | -1 = 1
   ): void {
     const newAmount = Number(afterTxn[amountField] ?? 0);
     const oldRef = beforeTxn[refField] as Record<string, unknown> | undefined;
@@ -1207,7 +1570,7 @@ export class SimulationStore {
     })();
 
     if (sameParty && newRef) {
-      const delta = newAmount - oldAmount;
+      const delta = (newAmount - oldAmount) * sign;
       if (delta !== 0) {
         this.adjustEntityBalance(
           partyType,
@@ -1228,7 +1591,7 @@ export class SimulationStore {
           listID: oldRef.ListID ? String(oldRef.ListID) : undefined,
           fullName: oldRef.FullName ? String(oldRef.FullName) : undefined,
         },
-        -oldAmount
+        -oldAmount * sign
       );
     }
     if (newRef && newAmount !== 0) {
@@ -1238,7 +1601,7 @@ export class SimulationStore {
           listID: newRef.ListID ? String(newRef.ListID) : undefined,
           fullName: newRef.FullName ? String(newRef.FullName) : undefined,
         },
-        newAmount
+        newAmount * sign
       );
     }
   }
@@ -1293,6 +1656,13 @@ export class SimulationStore {
       this.adjustPartyBalanceForTxn(target, "Customer", "BalanceRemaining", -1);
     } else if (entityType === "Bill") {
       this.adjustPartyBalanceForTxn(target, "Vendor", "AmountDue", -1);
+    } else if (entityType === "CreditMemo") {
+      // Reverse the AR-negative posting: customer Balance moves by +TotalAmount
+      // (was -TotalAmount on add). Also restore each previously-applied
+      // invoice's BalanceRemaining (orphan invoices are silently skipped —
+      // a deleted invoice shouldn't block memo deletion).
+      this.reverseCreditMemoApplication(target);
+      this.adjustPartyBalanceForTxn(target, "Customer", "TotalAmount", +1);
     }
 
     store.delete(txnID);

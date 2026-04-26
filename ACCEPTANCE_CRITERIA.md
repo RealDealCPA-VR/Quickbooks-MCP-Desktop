@@ -49,13 +49,13 @@ _(All Phase 3 items complete — see Completed below.)_
 
 ## Phase 4 — Missing tools / coverage gaps
 
-_(In progress — Items 10, 11, 13, 30 complete; Item 12 partial — SalesReceipt family done, CreditMemo / PurchaseOrder / JournalEntry pending. See Completed for SalesReceipt entry.)_
+_(In progress — Items 10, 11, 13, 30 complete; Item 12 partial — SalesReceipt + CreditMemo + PurchaseOrder families done, JournalEntry pending. See Completed for entries.)_
 
-## Item 12 — Missing transaction tools (`qb_credit_memo_*` / `qb_purchase_order_*` / `qb_journal_entry_*`) _(Phase 4)_
+## Item 12 — Missing transaction tools (`qb_journal_entry_*`) _(Phase 4)_
 
-**Status:** in-progress (SalesReceipt family done — see Completed; three families remaining)
+**Status:** in-progress (SalesReceipt + CreditMemo + PurchaseOrder families done — see Completed; JournalEntry remaining)
 
-Per-family criteria are deferred and written when the family is picked up. Item 6 / Item 7 / Item 13 (Completed) are the closest templates for the standard CRUD shape; Item 8 (`qb_payment_apply`) is the precedent for the `qb_credit_memo_apply` path. JournalEntry is the outlier — debits/credits must balance; reject unbalanced entries with statusCode 3030 at the simulation layer (or tool layer).
+Per-family criteria are deferred and written when the family is picked up. JournalEntry is the outlier — debits/credits must balance; reject unbalanced entries with statusCode 3030 at the simulation layer (or tool layer). Per-line entity-balance moves only apply when journal lines reference Customer/Vendor entities via `EntityRef` — defer that bookkeeping until after the basic CRUD + balance-validation shape lands.
 
 ---
 
@@ -66,6 +66,118 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 12 (PurchaseOrder) — Purchase order tools (`qb_purchase_order_list` / `_create` / `_update` / `_delete`) _(Phase 4)_ — done 2026-04-26
+
+**Status:** done (3 of 4 families in Item 12; JournalEntry still pending under Item 12)
+
+**Behavioral criteria** _(create / list / delete)_:
+- [x] All four tools registered and listed by the MCP server.
+- [x] `qb_purchase_order_create` with a `lines` array returns `TotalAmount = sum(line.Amount)` derived server-side via `computeTotals`. POs have NO separate `Subtotal` header — the line set aggregates straight to `TotalAmount` (distinct from Invoice/Estimate/SalesReceipt/CreditMemo). Verified P1.
+- [x] Each line's `Amount` is computed at the tool layer as `quantity * cost` (POs use Cost, not Rate). Tool also pre-computes Amount so `convertLineAddToRet` honors the explicit value. Verified P2.
+- [x] `qb_purchase_order_create` returns `PurchaseOrderLineRet` array with one entry per `lines[]`, each with a freshly-generated `TxnLineID` and computed `Amount`. Verified P3.
+- [x] `qb_purchase_order_create` does NOT post to AP — vendor `Balance` is unchanged after creation (POs are non-posting; only bills entered against received items move the vendor balance). Verified P4 (vendor.Balance delta = 0).
+- [x] `qb_purchase_order_create` with no lines (empty array or omitted) is rejected by the zod schema (`lines` is `.min(1)`). Verified P5.
+- [x] `qb_purchase_order_create` with `isManuallyClosed: true` stores the flag on the entity; default omits the flag. Verified P6.
+- [x] `qb_purchase_order_list` filters by `txnId` (TxnID), `vendorName` (EntityFilter scoped to VendorRef), `refNumber`, `fromDate`/`toDate` (TxnDateRangeFilter). Verified J-series.
+- [x] `qb_purchase_order_delete` happy path: subsequent `qb_purchase_order_list { txnId }` returns `count: 0`; vendor balance unchanged (no AP posting to reverse). Verified G1, G2.
+- [x] `qb_purchase_order_delete` unknown `txnId` returns `isError: true` with `statusCode: 500`. Verified H1.
+
+**Behavioral criteria** _(`qb_purchase_order_update` — header / line edits)_:
+- [x] Header-only mod (no `lines`) leaves the existing `PurchaseOrderLineRet`, `TotalAmount`, and `TxnLineID`s untouched. Verified B1, B2.
+- [x] When `lines` is provided, the array REPLACES the PO's `PurchaseOrderLineRet` wholesale — lines whose `TxnLineID` is not listed are dropped. Verified D1.
+- [x] A line entry with a `txnLineID` matching an existing line preserves that `TxnLineID` and merges the mod's fields onto the existing line (Cost carried over when only Quantity is passed; `applyLineMods` re-derives Amount = Quantity * Cost). Verified D2, D3.
+- [x] After a line mod, `TotalAmount` recomputes from the new line set via `computeTotals` (PurchaseOrder branch added to the post-mod recompute list). Verified D4.
+- [x] After a line mod, vendor `Balance` is unchanged — POs are non-posting, no balance bookkeeping on the mod path. Verified D5 (vendor.Balance delta = 0 across grow + shrink mods).
+- [x] `isManuallyClosed` toggles correctly on mod (false → true and back). Verified M1.
+- [x] Stale `editSequence` rejects with `statusCode: 3170`; the PO does NOT mutate. Verified C1, C2.
+- [x] `EditSequence` rotates after every successful mod. Verified B3.
+
+**Regression criteria**:
+- [x] `qb_invoice_update` line mod still recomputes `Subtotal` + `BalanceRemaining` (computeTotals PurchaseOrder branch did not regress Invoice path). Verified N1.
+- [x] `qb_estimate_update` line mod still recomputes `Subtotal`. Verified N2.
+- [x] `qb_bill_update` line mod still recomputes `AmountDue` (Cost-based itemLines still re-derive Amount via `applyLineMods`). Verified N3.
+- [x] `qb_sales_receipt_update` line mod still recomputes `Subtotal` + `TotalAmount`. Verified N4.
+- [x] `qb_credit_memo_update` line mod still recomputes `Subtotal` + `TotalAmount` + `RemainingValue` and moves customer balance by the delta. Verified N5.
+- [x] `qb_credit_memo_apply` still re-applies atomically and preserves customer balance. Verified N6.
+- [x] `qb_payment_apply` still moves customer balance by `-appliedSum`. Verified N7.
+
+**Build / structural criteria**:
+- [x] `npm run build` passes (no TypeScript errors).
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated with a `qb_purchase_order_*` bullet describing the non-posting nature, Cost-based lines, `TotalAmount` derivation (no Subtotal split), and `isManuallyClosed` flag.
+- [x] README tool count bumped 62 → 66; new "Purchase Orders" section with intro paragraphs + 4-row tool table.
+- [x] `convertLinesAddToRet` regex `/^(.+?)Line(s?)Add$/` already matches `PurchaseOrderLineAdd` — no parser/builder changes needed.
+- [x] `applyLineMods` regex `/^(.+?)Line(s?)Mod$/` matches `PurchaseOrderLineMod` for free; existing Quantity * Cost re-derivation works unchanged.
+- [x] PurchaseOrder already wired in `isTransactionType` ([src/session/simulation-store.ts](src/session/simulation-store.ts)), `arrayElements` ([src/qbxml/parser.ts](src/qbxml/parser.ts)), `buildDeleteRequest` transaction list ([src/qbxml/builder.ts](src/qbxml/builder.ts)), `deleteEntity` transaction list ([src/session/manager.ts](src/session/manager.ts)).
+
+### Item 12 (CreditMemo) — Credit memo tools (`qb_credit_memo_list` / `_create` / `_update` / `_apply` / `_delete`) _(Phase 4)_ — done 2026-04-26
+
+**Status:** done (2 of 4 families in Item 12; PurchaseOrder / JournalEntry still pending under Item 12)
+
+**Behavioral criteria** _(create / list / delete)_:
+- [x] All five tools registered and listed by the MCP server.
+- [x] `qb_credit_memo_create` with a `lines` array returns `Subtotal = sum(line.Amount)` derived server-side via `computeTotals`. Verified A1.
+- [x] `qb_credit_memo_create` returns `TotalAmount = Subtotal + SalesTaxTotal` (SalesTaxTotal defaults to 0). Verified A2.
+- [x] `qb_credit_memo_create` returns `RemainingValue = TotalAmount − AppliedAmount` (AppliedAmount defaults to 0 when no `appliedTo` is passed; RemainingValue starts at TotalAmount). Verified A3.
+- [x] `qb_credit_memo_create` returns `CreditMemoLineRet` array with one entry per `lines[]`, each with a freshly-generated `TxnLineID` and computed `Amount`. Verified A4.
+- [x] `qb_credit_memo_create` posts to AR — customer `Balance` moves by `-TotalAmount` regardless of whether `appliedTo` is passed. Verified A5 (delta = -1000 on first create with no appliedTo).
+- [x] `qb_credit_memo_create` with `appliedTo: [{txnId, amount}]` reduces each named invoice's `BalanceRemaining` by `amount` and bumps `AppliedAmount`; flips `IsPaid` when balance hits zero. The customer balance moves only by `-TotalAmount` — application does NOT move it again. Verified P1–P4.
+- [x] `qb_credit_memo_create` records `AppliedToTxnRet` array on the memo (one entry per applied invoice with TxnLineID + TxnID + PaymentAmount). Memo `AppliedAmount` = sum(applied), `RemainingValue` = TotalAmount − AppliedAmount. Verified P5.
+- [x] `qb_credit_memo_create` with `appliedTo` summing > TotalAmount returns `isError: true` with `statusCode: 500` (overapplication guard at the simulation layer). Verified Q1.
+- [x] `qb_credit_memo_create` with an unknown `txnId` in `appliedTo` returns `isError: true` with `statusCode: 500` and does NOT mutate any partial state — atomic rejection. Verified Q2.
+- [x] `qb_credit_memo_list` filters by `txnId` (TxnID), `customerName` (EntityFilter), `refNumber`, `fromDate`/`toDate` (TxnDateRangeFilter). Verified J-series.
+- [x] `qb_credit_memo_delete` happy path: subsequent `qb_credit_memo_list { txnId }` returns `count: 0`; customer balance reverses by `+TotalAmount`; any applied invoice's `BalanceRemaining` is restored. Verified G1–G3.
+- [x] `qb_credit_memo_delete` unknown `txnId` returns `isError: true` with `statusCode: 500`. Verified H1.
+
+**Behavioral criteria** _(`qb_credit_memo_update` — header / line edits)_:
+- [x] Header-only mod (no `lines`) leaves the existing `CreditMemoLineRet`, `Subtotal`, `TotalAmount`, `RemainingValue`, `AppliedAmount`, and `TxnLineID`s untouched. Verified B1–B5.
+- [x] When `lines` is provided, the array REPLACES the memo's `CreditMemoLineRet` wholesale — lines whose `TxnLineID` is not listed are dropped. Verified D1.
+- [x] A line entry with a `txnLineID` matching an existing line preserves that `TxnLineID` and merges the mod's fields onto the existing line (Rate carried over when only Quantity is passed). Verified D2, D3.
+- [x] After a line mod, `Subtotal` / `TotalAmount` / `RemainingValue` recompute from the new line set via `computeTotals`. Verified D4.
+- [x] After a line mod, customer `Balance` adjusts by `-(newTotalAmount − oldTotalAmount)` so the AR-negative posting stays consistent (memo grew → customer balance drops further; memo shrank → customer balance recovers). Verified D5 (delta = -200 when total grew 1000 → 1200), D6 (delta = +500 when total shrank 1200 → 700).
+- [x] `AppliedAmount` is preserved across line mods — a memo with prior applications keeps its application bookkeeping intact through header / line edits. `RemainingValue` recomputes as `TotalAmount − AppliedAmount`. Verified D7 (memo with applied=400, total mod 1000→1200, AppliedAmount stays 400, RemainingValue becomes 800).
+- [x] Stale `editSequence` rejects with `statusCode: 3170`; the memo does NOT mutate. Verified C1, C2.
+- [x] `EditSequence` rotates after every successful mod. Verified B6.
+
+**Behavioral criteria** _(`qb_credit_memo_apply` — re-application path)_:
+- [x] Tool registered. Verified R0.
+- [x] Pass `txnId` + `editSequence` + replacement `applyTo: [{txnId, amount}]`. The new array REPLACES the memo's prior application wholesale. Verified R1 (1 invoice → 2 invoices).
+- [x] Previously-applied invoices have their `BalanceRemaining` / `AppliedAmount` / `IsPaid` restored by the previously-applied amount. Verified R2 (Invoice A's BR jumps back from 0 → 1000 when the application moves to Invoice B + C).
+- [x] Newly-applied invoices have their `BalanceRemaining` reduced by the new applied amount. Verified R3.
+- [x] Memo `AppliedToTxnRet` reflects the new application set; `AppliedAmount` = sum(new applied); `RemainingValue` = `TotalAmount − AppliedAmount`. Verified R4.
+- [x] Customer `Balance` does NOT move on re-apply — the credit pool just shifts between memo `RemainingValue` and invoice `BalanceRemaining`. Verified R5 (no delta in Customer.Balance before/after re-apply).
+- [x] Pass `applyTo: []` to fully unapply: memo `RemainingValue` returns to `TotalAmount`, `AppliedAmount` = 0, `AppliedToTxnRet` = []. Previously-applied invoices fully restored. Customer balance unchanged. Verified S1–S3.
+- [x] `sum(applyTo.amount) > TotalAmount` rejects with `statusCode: 500` and the prior application is NOT disturbed (validate-first ordering). Verified T1, T2.
+- [x] Unknown invoice `txnId` in `applyTo` rejects with `statusCode: 500`; prior application untouched. Verified T3.
+- [x] Stale `editSequence` rejects with `statusCode: 3170`; memo state unchanged. Verified T4.
+- [x] `TotalAmount` is immutable on this path — `applyTo` mods do NOT recompute or replace `TotalAmount`. Verified R4.
+
+**Regression criteria**:
+- [x] `qb_invoice_update` line mod still recomputes `Subtotal` + `BalanceRemaining` (computeTotals CreditMemo branch did not regress Invoice path). Verified N1.
+- [x] `qb_estimate_update` line mod still recomputes `Subtotal`. Verified N2.
+- [x] `qb_bill_update` line mod still recomputes `AmountDue`. Verified N3.
+- [x] `qb_sales_receipt_update` line mod still recomputes `Subtotal` + `TotalAmount`. Verified N4 (shared post-mod recompute path with newly-added CreditMemo branch).
+- [x] `qb_payment_apply` still closes invoices end-to-end via `applyTxnApplications`. Verified N5.
+- [x] `qb_payment_receive` still moves customer balance by `-appliedSum` (NOT by full TotalAmount — distinguishing AR-payment semantics from CreditMemo's full-TotalAmount posting). Verified N6.
+- [x] `qb_class_list` returns 3 active seed classes. Verified N7.
+
+**Documentation criteria**:
+- [x] README updated: tool count 57 → 62; new "Credit Memos" section with intro paragraphs (AR-negative posting, RemainingValue tracking, apply-vs-update distinction) and 5-row tool table.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — qb_credit_memo_* bullet documents the AR-negative semantics, customer-balance posting at memo level, RemainingValue tracking, the apply path's no-customer-balance-move guarantee, and stale-editSequence rejection.
+- [x] No new `DECISIONS.md` entry — CreditMemo follows the established CRUD + apply-mod patterns; the customer-balance-at-memo-level (vs. ReceivePayment's apply-time posting) is a domain semantic, not an architectural choice.
+- [x] No `ARCHITECTURE.md` change — CreditMemo is the same builder/parser/store path as Invoice/Estimate/SalesReceipt, with new helpers `applyCreditMemo` / `reverseCreditMemoApplication` / `handleCreditMemoApplyMod` mirroring the ReceivePayment plumbing.
+
+**Verification commands**:
+```bash
+npm run build              # exits 0
+node scratch-verify.mjs    # inline verification script (deleted post-verification)
+```
+
+**Notes**:
+- The structural difference between CreditMemo and ReceivePayment is *where* customer balance moves: ReceivePayment moves it at apply time (`-appliedSum`, the rest is `UnusedPayment`); CreditMemo moves it at memo-add time (`-TotalAmount`, regardless of application). Re-application on CreditMemo therefore does NOT touch customer balance — it just shifts bookkeeping between `RemainingValue` and invoice `BalanceRemaining`. This is mirrored in `applyCreditMemoApplications` (no `adjustEntityBalance` call) vs. `applyTxnApplications` (calls `adjustEntityBalance` with `-appliedSum`).
+- `adjustPartyBalanceForTxnMod` was extended with an optional `sign: 1 | -1 = 1` parameter and `amountField: "TotalAmount"` member. The sign inverts both the same-party delta path and the reverse-then-apply path uniformly. Bill/Invoice continue to call without `sign` (defaults to +1); CreditMemo passes `sign: -1` because TotalAmount growing means customer balance shrinking.
+- Discount handling on `AppliedToTxn` lines is intentionally not exposed in `qb_credit_memo_create` / `_apply` — uncommon for credit memos, and the existing `qb_payment_receive` discount path establishes the precedent for the rare case where it matters (discounts on AR closures live on the payment, not the memo).
+- The `applyLineMods` regex `^(.+?)Line(s?)Mod$` at [simulation-store.ts](src/session/simulation-store.ts) caught `CreditMemoLineMod` with zero handler changes, exactly as predicted. Builder/parser unchanged: `CreditMemoRet` / `CreditMemoLineRet` / `AppliedToTxnRet` were already in `arrayElements`; CreditMemo was already in `buildDeleteRequest`'s transaction list.
 
 ### Item 12 (SalesReceipt) — Sales receipt tools (`qb_sales_receipt_list` / `_create` / `_update` / `_delete`) _(Phase 4)_ — done 2026-04-26
 
