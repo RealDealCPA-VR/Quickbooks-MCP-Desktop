@@ -640,9 +640,40 @@ export class SimulationStore {
       };
     }
 
-    const updated: StoredEntity = {
-      ...existing,
-      ...modData,
+    // Strict EditSequence check — real QB rejects with 3170 when the caller's
+    // EditSequence doesn't match the current one (someone else modified the
+    // record since the caller queried it). Mirroring this in the simulation
+    // catches a class of "passed in dev, rejected in live" bugs at zero
+    // per-tool cost since every existing *_update tool already passes
+    // EditSequence. See DECISIONS.md 2026-04-25 entry.
+    if (
+      modData.EditSequence !== undefined &&
+      String(modData.EditSequence) !== String(existing.EditSequence)
+    ) {
+      return {
+        type: rsType,
+        statusCode: 3170,
+        statusSeverity: "Error",
+        statusMessage:
+          "The given object's EditSequence does not match the EditSequence in QuickBooks; the object has likely been modified since it was last retrieved",
+        data: {},
+      };
+    }
+
+    // Apply *LineMod arrays (currently only Bill exercises this path).
+    // The mod's line array becomes the entity's new line array, with
+    // merge-by-TxnLineID semantics so a partial mod ("change just memo on
+    // line L1") doesn't force the operator to reconstruct the whole line.
+    const oldAmountDue = Number(existing.AmountDue ?? 0);
+    const lineModResult = this.applyLineMods(existing, modData);
+
+    const strippedModData = lineModResult.lineModKeys.size > 0
+      ? this.omitKeys(modData, lineModResult.lineModKeys)
+      : modData;
+
+    let updated: StoredEntity = {
+      ...lineModResult.entityWithLines,
+      ...strippedModData,
       TimeModified: new Date().toISOString(),
       EditSequence: new Date().toISOString(),
     };
@@ -651,7 +682,22 @@ export class SimulationStore {
       updated.FullName = String(modData.Name);
     }
 
+    // After lines change, AmountDue must be re-derived from the new line
+    // ledger or the header total drifts. Bill is the only entity with line
+    // mods today; Item 6 will extend this to Invoice (Subtotal +
+    // BalanceRemaining recompute).
+    if (entityType === "Bill" && lineModResult.lineModKeys.size > 0) {
+      delete updated.AmountDue;
+      updated = this.computeTotals(updated, entityType);
+    }
+
     store.set(id, updated);
+
+    // Vendor balance bookkeeping for a Bill mod: signed delta if the same
+    // vendor, full reverse-then-apply if VendorRef itself changed.
+    if (entityType === "Bill") {
+      this.adjustVendorBalanceForBillMod(existing, updated, oldAmountDue);
+    }
 
     return {
       type: rsType,
@@ -660,6 +706,150 @@ export class SimulationStore {
       statusMessage: "Status OK",
       data: { [retName]: updated },
     };
+  }
+
+  // -----------------------------------------------------------------------
+  // Line-mod application
+  // -----------------------------------------------------------------------
+
+  // Real QB's *LineMod blocks support per-line modify-or-add (TxnLineID="-1"
+  // means new). The simulation matches that semantic with a wholesale-replace
+  // of the *LineRet array, merging fields onto the matching existing line
+  // when TxnLineID is provided. Lines whose TxnLineID is absent or "-1" get
+  // a freshly-generated TxnLineID. Lines NOT mentioned in the mod's array
+  // are dropped (matches QB: you supply the post-mod line set).
+  private applyLineMods(
+    existing: StoredEntity,
+    modData: Record<string, unknown>
+  ): { entityWithLines: StoredEntity; lineModKeys: Set<string> } {
+    const result: StoredEntity = { ...existing };
+    const lineModKeys = new Set<string>();
+
+    for (const key of Object.keys(modData)) {
+      const match = key.match(/^(.+?)Line(s?)Mod$/);
+      if (!match) continue;
+      const [, prefix, plural] = match;
+      lineModKeys.add(key);
+      const retKey = `${prefix}Line${plural}Ret`;
+
+      const raw = modData[key];
+      const modLines = Array.isArray(raw)
+        ? (raw as Record<string, unknown>[])
+        : raw && typeof raw === "object"
+          ? [raw as Record<string, unknown>]
+          : [];
+
+      const existingLines = Array.isArray(result[retKey])
+        ? (result[retKey] as Record<string, unknown>[])
+        : [];
+
+      const newLines = modLines.map((modLine) => {
+        const txnLineID = modLine.TxnLineID;
+        const isNew = !txnLineID || String(txnLineID) === "-1";
+
+        let baseLine: Record<string, unknown> = {};
+        if (!isNew) {
+          const found = existingLines.find(
+            (l) => String(l.TxnLineID ?? "") === String(txnLineID)
+          );
+          if (found) baseLine = { ...found };
+        }
+
+        const merged: Record<string, unknown> = { ...baseLine, ...modLine };
+        merged.TxnLineID = isNew ? this.nextId() : String(txnLineID);
+
+        // Re-derive Amount when both sides of the math are present in the
+        // merged line. Quantity*Rate (Invoice/Estimate) takes precedence
+        // over Quantity*Cost (Bill ItemLine). For ExpenseLineMod (no qty,
+        // no rate, no cost) this is a no-op — Amount carries from the merge.
+        const qty = merged.Quantity;
+        const rate = merged.Rate;
+        const cost = merged.Cost;
+        if (qty !== undefined && qty !== null && rate !== undefined && rate !== null) {
+          merged.Amount = Number(qty) * Number(rate);
+        } else if (qty !== undefined && qty !== null && cost !== undefined && cost !== null) {
+          merged.Amount = Number(qty) * Number(cost);
+        }
+
+        return merged;
+      });
+
+      result[retKey] = newLines;
+    }
+
+    return { entityWithLines: result, lineModKeys };
+  }
+
+  private omitKeys(
+    data: Record<string, unknown>,
+    keys: Set<string>
+  ): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (!keys.has(k)) out[k] = v;
+    }
+    return out;
+  }
+
+  // Adjusts vendor balance(s) after a Bill mod. Same vendor → signed delta
+  // on the (possibly new) AmountDue. Vendor changed → reverse the old
+  // vendor's bump, apply the new vendor's. Mirrors real QB's behavior
+  // when re-pointing a bill at a different vendor.
+  private adjustVendorBalanceForBillMod(
+    beforeBill: StoredEntity,
+    afterBill: StoredEntity,
+    oldAmountDue: number
+  ): void {
+    const newAmountDue = Number(afterBill.AmountDue ?? 0);
+    const oldRef = beforeBill.VendorRef as Record<string, unknown> | undefined;
+    const newRef = afterBill.VendorRef as Record<string, unknown> | undefined;
+
+    const sameVendor = (() => {
+      if (!oldRef || !newRef) return oldRef === newRef;
+      const oldId = oldRef.ListID ? String(oldRef.ListID) : "";
+      const newId = newRef.ListID ? String(newRef.ListID) : "";
+      if (oldId && newId) return oldId === newId;
+      const oldName = oldRef.FullName ? String(oldRef.FullName) : "";
+      const newName = newRef.FullName ? String(newRef.FullName) : "";
+      if (oldName && newName) return oldName === newName;
+      return false;
+    })();
+
+    if (sameVendor && newRef) {
+      const delta = newAmountDue - oldAmountDue;
+      if (delta !== 0) {
+        this.adjustEntityBalance(
+          "Vendor",
+          {
+            listID: newRef.ListID ? String(newRef.ListID) : undefined,
+            fullName: newRef.FullName ? String(newRef.FullName) : undefined,
+          },
+          delta
+        );
+      }
+      return;
+    }
+
+    if (oldRef && oldAmountDue !== 0) {
+      this.adjustEntityBalance(
+        "Vendor",
+        {
+          listID: oldRef.ListID ? String(oldRef.ListID) : undefined,
+          fullName: oldRef.FullName ? String(oldRef.FullName) : undefined,
+        },
+        -oldAmountDue
+      );
+    }
+    if (newRef && newAmountDue !== 0) {
+      this.adjustEntityBalance(
+        "Vendor",
+        {
+          listID: newRef.ListID ? String(newRef.ListID) : undefined,
+          fullName: newRef.FullName ? String(newRef.FullName) : undefined,
+        },
+        newAmountDue
+      );
+    }
   }
 
   // -----------------------------------------------------------------------

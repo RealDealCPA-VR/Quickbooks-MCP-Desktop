@@ -43,17 +43,71 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 3 — Transaction completeness
 
-_(Items 6, 7, 8, 9 — criteria pending pickup.)_
+_(Items 6, 8, 9 — criteria pending pickup.)_
 
 ---
 
-_(Add criteria for items 6, 7, 8, 9, etc. as they are picked up. Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
+_(Add criteria for items 6, 8, 9, etc. as they are picked up. Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
 
 ---
 
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 7 — `qb_bill_update` (BillModRq) _(Phase 3)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_bill_update` is registered and listed by the MCP server. Verified via setup step (bill created and TxnID/EditSequence captured).
+- [x] Calling with `txnId` + `editSequence` + a new `memo` returns the bill with the new memo and a fresh `EditSequence`. Verified Header-only memo mod check.
+- [x] Header-only mod (no line args) leaves the existing `ExpenseLineRet` and `AmountDue` untouched.
+- [x] Header field updates propagate: `memo`, `vendorName` (verified explicitly via vendor-change check), `txnDate` / `dueDate` / `refNumber` follow the same `{...modData}` spread path so propagate identically.
+- [x] `expenseLines` wholesale-replace + merge-by-`TxnLineID` semantics work: a single-entry mod with `{txnLineID: rentLineId, memo: ...}` survives only the rent line, preserves account + amount from the existing line, and recomputes `AmountDue` to 100. Verified Line-mod merge check.
+- [x] New line (no `txnLineID`) gets a freshly-generated `TxnLineID`; existing line passed by `TxnLineID` only is preserved untouched. Verified "new line gets fresh TxnLineID" check.
+- [x] `AmountDue` recomputes via `computeTotals` after line mods. Verified across all line-mod paths (100, 175, 275, 375).
+- [x] Vendor `Balance` adjusts by `newAmountDue - oldAmountDue` (signed delta). Verified `-50` (line drop), `+75` (line add), `+100` (item line add), and full reverse-then-apply on vendor change.
+- [x] Mixing expense and item ledgers: `ItemLineMod` alone leaves `ExpenseLineRet` untouched; both contribute to `AmountDue`. Verified items-alongside-expenses check.
+- [x] Item line `Quantity` mod re-derives `Amount = Quantity * Cost` from the merged line. Verified with `Q=10, C=20 (existing) → A=200`.
+
+**Error criteria**:
+- [x] Unknown `txnId` rejects via `isError: true` with statusCode 500. Verified via tool's try/catch wrapper around `session.modifyEntity`.
+- [x] Stale `editSequence` rejects with statusCode 3170 ("EditSequence does not match"). The failed mod does NOT mutate the bill (verified by re-querying the bill's memo post-rejection).
+- [x] New expense line (no `txnLineID`) without `accountName`/`accountListId` rejected by `expenseLineModSchema.refine` at the zod boundary.
+- [x] New item line (no `txnLineID`) without `itemName`/`itemListId`/`quantity`/`cost` rejected by `itemLineModSchema.refine`.
+
+**Regression criteria**:
+- [x] `qb_bill_create` still works (`AmountDue = sum(lines)`, vendor balance bumps).
+- [x] `qb_bill_delete` still reverses vendor balance.
+- [x] `qb_bill_list` still returns persisted bills with intact `ExpenseLineRet` / `ItemLineRet` (verified throughout — every mod check re-queried the bill via `getBill` and inspected the line arrays).
+- [x] `qb_customer_update` still works with a fresh `EditSequence` (verified via Acme `CompanyName` update).
+- [x] `qb_invoice_update` still works (verified via INV-1001 memo header-only mod). The strict `EditSequence` check accepts a freshly-queried sequence as expected.
+- [x] Seed `INV-1002` untouched (no test path modified it).
+- [x] AP aging would reflect the post-mod vendor balance — `qb_ap_aging` reads `Vendor.Balance` directly per Item 18, and the balance moves are verified end-to-end.
+
+**Documentation criteria**:
+- [x] README bill table: `qb_bill_update` row inserted between create and delete; bill section intro paragraph documents `txnLineID` semantics and the `editSequence` → 3170 rejection.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated: bill bullet now lists update and explains that line arrays REPLACE the line set wholesale with merge-by-`txnLineID`.
+- [x] `DECISIONS.md` entry: "Strict EditSequence validation in simulation handleMod" — documents global `handleMod` tightening and the rationale.
+- [x] `DECISIONS.md` entry: "Bill line-mod uses wholesale replacement with merge-by-TxnLineID" — documents the chosen middle ground between pure-replace and full per-line diff.
+- [x] Tool count in README header bumped 36 → 37.
+
+**Implementation notes**:
+- Tool layer in [src/tools/bills.ts](src/tools/bills.ts):
+  - Two new schemas: `expenseLineModSchema` and `itemLineModSchema`. Each makes nearly every field optional (so partial mods on existing lines work) and uses `.refine()` to require the create-shape fields ONLY when `txnLineID` is absent or `'-1'`.
+  - `qb_bill_update` handler builds `ExpenseLineMod` / `ItemLineMod` arrays only when the corresponding tool arg is provided — so a header-only mod sends no line keys at all and `applyLineMods` short-circuits via `lineModKeys.size === 0`.
+  - try/catch wraps `session.modifyEntity` so simulation 500s and 3170s surface as structured tool errors with `isError: true` + `statusCode` (same pattern as `qb_payment_receive` from Item 5).
+- Simulation `handleMod` in [src/session/simulation-store.ts](src/session/simulation-store.ts):
+  - Strict `EditSequence` check is global (any entity type), keyed on the request including `EditSequence`. Three lines, returns 3170 on mismatch, applied BEFORE any mutation so a mismatched mod can't leak partial state.
+  - `applyLineMods(existing, modData)` is generic on `*LineMod` keys — the regex `/^(.+?)Line(s?)Mod$/` finds every line-mod key, processes the mod array against the entity's existing `*LineRet`, and produces a new `*LineRet` array. Item 6 (`qb_invoice_update` line mod) reuses this helper with no changes.
+  - `omitKeys` strips the `*LineMod` keys before the spread `{...lineModResult.entityWithLines, ...stripped}` so the raw mod arrays don't end up persisted on the entity.
+  - `adjustVendorBalanceForBillMod` handles both the same-vendor delta path and the vendor-change reverse-then-apply path. Vendor identity check uses `ListID` first, falls back to `FullName`. Same machinery is reusable for Phase 3 item 6 (Customer/Invoice) — consider extracting to a generic `adjustPartyBalanceForTxnMod` when item 6 lands.
+- Amount re-derivation in `applyLineMods`: `Quantity * Rate` (Invoice/Estimate convention) takes precedence over `Quantity * Cost` (Bill ItemLine convention). For ExpenseLineMod (no qty/rate/cost), neither branch fires and `Amount` carries from the merge — operator's explicit `Amount` wins.
+- Item 6's path is now straightforward: it'll add an `invoiceLineModSchema` to [src/tools/invoices.ts](src/tools/invoices.ts), wire `InvoiceLineMod` in the tool, extend the `entityType === "Bill"` branch in `handleMod` to also include `"Invoice"` (recompute `Subtotal` + `BalanceRemaining` + `IsPaid`), and add a customer-balance equivalent of `adjustVendorBalanceForBillMod`. The line-mod plumbing itself is already done.
+- Verified end-to-end with a 17-check inline script (deleted post-verification per "no test infra yet"): bill setup with vendor balance bump, header-only mod (memo + EditSequence advance + lines/AmountDue/balance unchanged), stale-EditSequence rejection (3170 + bill not mutated), unknown-TxnID rejection (500), single-line merge by TxnLineID with line-drop balance delta (-50), new line with fresh TxnLineID + existing-line preservation by TxnLineID-only (+75 delta), parallel ItemLineMod alongside existing ExpenseLineRet (+100), item-qty mod with merged-Cost re-derivation (10 * 20 = 200), vendor-change reverse-then-apply (office −375, cloud +375), `qb_customer_update` regression with fresh editSequence, `qb_invoice_update` regression on INV-1001, `qb_bill_create` Item 4 regression, `qb_bill_delete` Item 18 regression. `npm run build` green throughout.
+
+---
 
 ### Item 5 — Payment applied to invoices _(Phase 3)_ — done 2026-04-25
 

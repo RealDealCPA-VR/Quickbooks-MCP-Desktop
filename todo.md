@@ -23,7 +23,7 @@ So that everything below can actually be verified without a Windows box.
 
 - [x] **4.** Add `ExpenseLineAdd` and `ItemLineAdd` support to `qb_bill_create` — accept `lines: [{accountName, amount, memo}]` and `lines: [{itemName, quantity, cost}]`, so bills actually post to GL accounts.
 - [x] **5.** Add `AppliedToTxnAdd` support to `qb_payment_receive` — accept `appliedTo: [{txnId, amount, discountAmount?}]` so payments actually close out invoices and reduce customer balances.
-- [ ] **7.** Implement `qb_bill_update` tool (`BillModRq`) — header fields plus `ExpenseLineMod` / `ItemLineMod` support, register in [index.ts](src/index.ts).
+- [x] **7.** Implement `qb_bill_update` tool (`BillModRq`) — header fields plus `ExpenseLineMod` / `ItemLineMod` support, register in [index.ts](src/index.ts).
 - [ ] **6.** Add `InvoiceLineMod` support to `qb_invoice_update` — accept `lines` arg with optional `txnLineID` (existing line) or `'-1'` (new line) and build `InvoiceLineMod` blocks.
 - [ ] **8.** Add `qb_payment_apply` tool — apply an existing unapplied `ReceivePayment` to specific invoices via `ReceivePaymentMod` + `AppliedToTxnMod`.
 - [ ] **9.** Add `qb_bill_pay` tool — record `BillPaymentCheck` or `BillPaymentCreditCard` against existing bills (currently no way to mark a bill as paid).
