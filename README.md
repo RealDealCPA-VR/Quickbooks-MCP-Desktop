@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (44 total)
+## Tools (50 total)
 
 ### Customers
 | Tool | Description |
@@ -107,6 +107,21 @@ QuickBooks has no generic "Item" — every item belongs to one of five subtypes.
 | `qb_employee_update` | Update employee details (firstName / lastName / phone / email / isActive) |
 | `qb_employee_make_inactive` | Deactivate an employee by ListID + EditSequence (sets IsActive: false). Reversible via `qb_employee_update { isActive: true }`. |
 | `qb_employee_delete` | Hard-delete an employee by ListID. Fails for employees with paycheck/timesheet history — use `qb_employee_make_inactive` instead. |
+
+### Reference Lists
+
+Read-only lookups for the supporting types that transactions reference by `FullName` or `Name`. Operators need these to discover valid values to pass into invoice/bill/payment creation (the Class on a line, the Terms on an invoice header, the PaymentMethod on a receive-payment, etc.). New entries are defined in QuickBooks itself, not via this server.
+
+`qb_terms_list` is the only one that fans out: real QB splits the underlying type into `StandardTerms` (e.g. "Net 30" — fixed days from invoice date) and `DateDrivenTerms` (e.g. "Due on 15th" — fixed calendar day). The default call queries both stores and merges, attaching a `TermsType: "StandardTerms" | "DateDrivenTerms"` discriminator to each row. Pass `termsType: "Standard" | "DateDriven"` to scope.
+
+| Tool | Description |
+|------|-------------|
+| `qb_class_list` | List Classes (department / location / cost-center labels). |
+| `qb_terms_list` | List payment Terms. Default fans across StandardTerms + DateDrivenTerms; pass `termsType` to scope. |
+| `qb_payment_method_list` | List Payment Methods (Check, Cash, Visa, etc.). |
+| `qb_sales_rep_list` | List Sales Reps (keyed by Initial). |
+| `qb_customer_type_list` | List Customer Types (Commercial, Residential, Government, etc.). |
+| `qb_vendor_type_list` | List Vendor Types (Supplier, Subcontractor, etc.). |
 
 ### Reports & Queries
 | Tool | Description |

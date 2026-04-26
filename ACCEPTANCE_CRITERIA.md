@@ -49,7 +49,7 @@ _(All Phase 3 items complete — see Completed below.)_
 
 ## Phase 4 — Missing tools / coverage gaps
 
-_(In progress — Items 10, 11 complete, see Completed below.)_
+_(In progress — Items 10, 11, 30 complete, see Completed below.)_
 
 ---
 
@@ -60,6 +60,50 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 30 — Reference list tools (Class / Terms / PaymentMethod / SalesRep / CustomerType / VendorType) _(Phase 4)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] Six new tools registered and listed by the MCP server: `qb_class_list`, `qb_terms_list`, `qb_payment_method_list`, `qb_sales_rep_list`, `qb_customer_type_list`, `qb_vendor_type_list`. Verified A1–A6.
+- [x] Each tool returns a non-empty array when seed data exists for the entity type. Counts: Class=3, StandardTerms=3, DateDrivenTerms=2, PaymentMethod=4, SalesRep=2, CustomerType=3, VendorType=3. Verified B1–B6.
+- [x] Each tool returns `{ count: 0, ... : [] }` (graceful empty) when the underlying store has no entities matching the filter. Verified C1.
+- [x] `nameFilter`, `activeOnly`, `listId`, `maxReturned` pass through to the simulation's `handleQuery` and behave the same way as in `qb_account_list` / `qb_employee_list`:
+  - [x] `nameFilter` is a Contains match against `Name` / `FullName`. Verified D1 (qb_terms_list `nameFilter: "Net"` returns only Net 15 / Net 30 / 2% 10 Net 30).
+  - [x] `activeOnly` defaults to true; explicit `activeOnly: false` includes inactive entries. Verified D2 (added an inactive class, default list excludes it, `activeOnly: false` includes it).
+  - [x] `listId` fetches a single specific entity. Verified D3.
+  - [x] `maxReturned` caps the result count. Verified D4.
+- [x] `qb_terms_list` fans across `StandardTerms` + `DateDrivenTerms` by default and merges; result count = StandardTerms count + DateDrivenTerms count. Each row carries a `TermsType` discriminator field set to `"StandardTerms"` or `"DateDrivenTerms"`. Verified E1.
+- [x] `qb_terms_list { termsType: "Standard" }` returns only `StandardTerms` rows; `{ termsType: "DateDriven" }` returns only `DateDrivenTerms` rows. Verified E2/E3.
+- [x] `qb_sales_rep_list` does NOT accept `nameFilter` (sales reps are keyed by Initial, not Name) — schema-enforced. Confirmed by reading the tool's schema.
+
+**Error criteria**:
+- [x] Tools follow existing list-tool conventions (qb_account_list / qb_employee_list / qb_customer_list) which do NOT wrap session errors in try/catch. Reference list queries are read-only and the only meaningful error path is the underlying transport — no need for the structured-error pattern that mutating tools (Items 5/7/8/9/10/11) use.
+
+**Regression criteria**:
+- [x] `qb_account_list` defaults still return seed accounts (10). Verified F1.
+- [x] `qb_employee_list` defaults still return seed employees. Verified F2.
+- [x] `qb_customer_list` defaults still return seed customers (3). Verified F3.
+- [x] Item 10 smoke — `qb_account_make_inactive` still works. Verified F4.
+- [x] Item 11 smoke — `qb_employee_make_inactive` still works. Verified F5.
+- [x] Phase 3 Item 9 smoke — `qb_bill_pay` still closes bills. Verified F6.
+
+**Documentation criteria**:
+- [x] README header tool count bumped 44 → 50.
+- [x] New "Reference Lists" section between Employees and Reports & Queries explains the read-only nature, the StandardTerms/DateDrivenTerms split for `qb_terms_list`, and lists tool table rows for all six.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — new bullet enumerates all six tools and explains the `qb_terms_list` fan-out.
+- [x] `ACCEPTANCE_CRITERIA.md` entry moved to Completed (this entry).
+- [x] No new `DECISIONS.md` entry — fan-out for `qb_terms_list` follows the established `qb_bill_payment_list` pattern (Item 9). Tool-only-no-add/update/delete is the established pattern for read-only reference data (operators define new classes/terms/etc. in QB itself).
+
+**Implementation notes**:
+- Tool layer in [src/tools/lists.ts](src/tools/lists.ts) (new file): six tools, all thin wrappers around `session.queryEntity(<type>, filters)`. `qb_terms_list` is the one outlier — fans across `StandardTerms` + `DateDrivenTerms` via `Promise.all`, attaching a `TermsType` discriminator to each row before merging (mirrors the `qb_bill_payment_list` pattern). `qb_sales_rep_list` omits `nameFilter` because real QB SalesRep records are keyed by `Initial`, not by a Name field — `nameFilter` would silently no-op against `e.Name ?? e.FullName` since neither is set.
+- Parser in [src/qbxml/parser.ts](src/qbxml/parser.ts): six new `*Ret` entries added to `arrayElements` so multi-element responses come back as arrays even when a single entity exists — `StandardTermsRet`, `DateDrivenTermsRet`, `PaymentMethodRet`, `SalesRepRet`, `CustomerTypeRet`, `VendorTypeRet` (`ClassRet` was already registered).
+- Simulation in [src/session/simulation-store.ts](src/session/simulation-store.ts): seed data added at the end of `seedData()` for all seven stores (Class, StandardTerms, DateDrivenTerms, PaymentMethod, SalesRep, CustomerType, VendorType). No request-handler changes needed — the generic `handleQuery` path with `getStore(entityType)` works as-is for any list entity, exactly as the prior Item 11 handoff predicted.
+- Builder in [src/qbxml/builder.ts](src/qbxml/builder.ts): no changes — `buildQueryRequest` is generic (`${entityType}QueryRq`) so Class / StandardTerms / DateDrivenTerms / PaymentMethod / SalesRep / CustomerType / VendorType all flow through the existing path.
+- Verified end-to-end with a 25-check inline script (deleted post-verification): A1–A6 tool registration; B1–B6 seed-data presence per type; C1 graceful empty; D1–D4 filter pass-through (nameFilter / activeOnly / listId / maxReturned); E1–E3 termsType fan-out; F1–F6 regressions. `npm run build` green throughout.
+
+---
 
 ### Item 11 — `qb_employee_make_inactive` + `qb_employee_delete` _(Phase 4)_ — done 2026-04-26
 

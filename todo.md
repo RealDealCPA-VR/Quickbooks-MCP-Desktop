@@ -34,7 +34,7 @@ So that everything below can actually be verified without a Windows box.
 - [x] **11.** Add `qb_employee_delete` / `make_inactive` (currently only list/add/update).
 - [ ] **12.** Add missing transaction tools: `qb_sales_receipt_*`, `qb_credit_memo_*`, `qb_purchase_order_*`, `qb_journal_entry_*` (parser already declares `Ret` arrays for these, but no tool exposes them).
 - [ ] **13.** Add `qb_estimate_update`, `qb_estimate_delete`, `qb_estimate_convert_to_invoice` tools — currently only list/create.
-- [ ] **30.** Add `Class`, `Terms`, `PaymentMethod`, `SalesRep`, `CustomerType`, `VendorType` list tools — needed because invoice/bill creation references these by `FullName` but there's no way to list/discover them.
+- [x] **30.** Add `Class`, `Terms`, `PaymentMethod`, `SalesRep`, `CustomerType`, `VendorType` list tools — needed because invoice/bill creation references these by `FullName` but there's no way to list/discover them.
 
 ## Phase 5 — Reporting (currently mostly fake)
 

@@ -1503,6 +1503,59 @@ export class SimulationStore {
       invoices.set(inv.TxnID as string, inv);
     }
 
+    // Reference lists — supporting types referenced by transactions (Class on
+    // invoice/bill lines, Terms on invoice/bill headers, PaymentMethod on
+    // ReceivePayment, SalesRep on invoice/sales receipt, CustomerType /
+    // VendorType for segmentation). Seed a handful per type so the list tools
+    // (qb_class_list, qb_terms_list, etc.) return non-trivial results in dev.
+    const classes: StoredEntity[] = [
+      { ListID: "C0000001", Name: "East", FullName: "East", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "C0000002", Name: "West", FullName: "West", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "C0000003", Name: "Overhead", FullName: "Overhead", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const c of classes) this.getStore("Class").set(c.ListID as string, c);
+
+    const standardTerms: StoredEntity[] = [
+      { ListID: "ST0000001", Name: "Net 15", IsActive: true, StdDueDays: 15, StdDiscountDays: 0, DiscountPct: 0, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "ST0000002", Name: "Net 30", IsActive: true, StdDueDays: 30, StdDiscountDays: 0, DiscountPct: 0, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "ST0000003", Name: "2% 10 Net 30", IsActive: true, StdDueDays: 30, StdDiscountDays: 10, DiscountPct: 2, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const t of standardTerms) this.getStore("StandardTerms").set(t.ListID as string, t);
+
+    const dateDrivenTerms: StoredEntity[] = [
+      { ListID: "DT0000001", Name: "Due on 15th", IsActive: true, DayOfMonthDue: 15, DueNextMonthDays: 5, DiscountDayOfMonth: 0, DiscountPct: 0, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "DT0000002", Name: "Due on 1st", IsActive: true, DayOfMonthDue: 1, DueNextMonthDays: 5, DiscountDayOfMonth: 0, DiscountPct: 0, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const t of dateDrivenTerms) this.getStore("DateDrivenTerms").set(t.ListID as string, t);
+
+    const paymentMethods: StoredEntity[] = [
+      { ListID: "PM0000001", Name: "Check", IsActive: true, PaymentMethodType: "Check", EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "PM0000002", Name: "Cash", IsActive: true, PaymentMethodType: "Cash", EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "PM0000003", Name: "Visa", IsActive: true, PaymentMethodType: "CreditCard", EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "PM0000004", Name: "MasterCard", IsActive: true, PaymentMethodType: "CreditCard", EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const p of paymentMethods) this.getStore("PaymentMethod").set(p.ListID as string, p);
+
+    const salesReps: StoredEntity[] = [
+      { ListID: "SR0000001", Initial: "JS", IsActive: true, SalesRepEntityRef: { FullName: "John Smith" }, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "SR0000002", Initial: "AJ", IsActive: true, SalesRepEntityRef: { FullName: "Alex Johnson" }, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const s of salesReps) this.getStore("SalesRep").set(s.ListID as string, s);
+
+    const customerTypes: StoredEntity[] = [
+      { ListID: "CT0000001", Name: "Commercial", FullName: "Commercial", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "CT0000002", Name: "Residential", FullName: "Residential", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "CT0000003", Name: "Government", FullName: "Government", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const c of customerTypes) this.getStore("CustomerType").set(c.ListID as string, c);
+
+    const vendorTypes: StoredEntity[] = [
+      { ListID: "VT0000001", Name: "Supplier", FullName: "Supplier", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "VT0000002", Name: "Subcontractor", FullName: "Subcontractor", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "VT0000003", Name: "Service Provider", FullName: "Service Provider", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const v of vendorTypes) this.getStore("VendorType").set(v.ListID as string, v);
+
     // Set ID counter beyond seed data
     this.idCounter = 10000;
   }
