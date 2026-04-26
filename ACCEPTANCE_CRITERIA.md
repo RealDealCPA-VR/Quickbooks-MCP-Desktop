@@ -49,7 +49,7 @@ _(All Phase 3 items complete — see Completed below.)_
 
 ## Phase 4 — Missing tools / coverage gaps
 
-_(In progress — Items 10, 11, 30 complete, see Completed below.)_
+_(In progress — Items 10, 11, 13, 30 complete, see Completed below.)_
 
 ---
 
@@ -60,6 +60,76 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 13 — Estimate tools (`qb_estimate_update` / `qb_estimate_delete` / `qb_estimate_convert_to_invoice`) _(Phase 4)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria** _(`qb_estimate_update`)_:
+- [x] Tool registered and listed by the MCP server. Verified F1 (IsAccepted update via tool path).
+- [x] Header-only mod (no `lines`) leaves the existing `EstimateLineRet`, `Subtotal`, and `TxnLineID`s untouched. Verified B1–B6.
+- [x] When `lines` is provided, the array REPLACES the estimate's `EstimateLineRet` wholesale — lines whose `TxnLineID` is not listed are dropped. Verified D1 (2 → 1).
+- [x] A line entry with a `txnLineID` matching an existing line preserves that `TxnLineID` and merges the mod's fields onto the existing line. Verified D2 (TxnLineID preserved), D3 (Rate carried from existing).
+- [x] A line entry with `txnLineID: '-1'` (or omitted) gets a freshly-generated `TxnLineID` and is treated as a new line. Verified E2 (new TxnLineID ≠ existing or '-1').
+- [x] After a line mod, `Subtotal` recomputes from the new line set via `computeTotals` (extended to fire for Estimate). Verified D5 (1200), E4 (1325).
+- [x] `Amount` re-derives from the merged line: `Quantity * Rate` when both are present (changing only `quantity` on an existing line picks up the existing `rate`); explicit `amount` wins when provided. Verified D4 (12 * 100 = 1200 from merge), E3 (5 * 25 = 125).
+- [x] Estimates don't post to AR — `qb_estimate_update` (header or line mod) does NOT touch customer `Balance`. Verified A7, B6, D6.
+- [x] `isAccepted: true` flag flips the stored `IsAccepted` field. Verified F1.
+
+**Behavioral criteria** _(`qb_estimate_delete`)_:
+- [x] Tool registered. Verified G1 (delete returned a result object).
+- [x] Successful delete removes the estimate from the store. Verified G2 (post-delete query returns empty).
+- [x] Estimate delete does NOT touch customer `Balance` (estimates are non-posting). Verified G3.
+- [x] Delete is wrapped in try/catch and surfaces `isError: true` + `statusCode` for unknown TxnIDs. Verified H1/H2 (statusCode 500).
+
+**Behavioral criteria** _(`qb_estimate_convert_to_invoice`)_:
+- [x] Tool registered. Verified J1 (returns invoice object).
+- [x] Invoice CustomerRef matches the source estimate. Verified J2.
+- [x] Invoice's `InvoiceLineRet` count matches the estimate's `EstimateLineRet` count; each line carries ItemRef, Desc, Quantity, Rate, Amount. Verified J3, J6, J7.
+- [x] Invoice TxnLineIDs are freshly generated (not carried from estimate). Verified J8.
+- [x] Invoice Subtotal matches estimate Subtotal (1300). Verified J4.
+- [x] Invoice posts to AR — customer `Balance` bumps by Subtotal. Verified J13 (delta = +1300).
+- [x] Invoice RefNumber defaults to estimate's RefNumber when not overridden. Verified J9.
+- [x] Invoice Memo defaults to `"Converted from estimate <ref>"` when not overridden. Verified J10.
+- [x] Operator-supplied `invoiceTxnDate` / `invoiceDueDate` / `invoiceRefNumber` / `invoiceMemo` override defaults. Verified M1–M4.
+- [x] Default `markAccepted=true` flips estimate `IsAccepted: true` after invoice creation. Verified J11 + J12.
+- [x] `markAccepted: false` leaves estimate `IsAccepted` unchanged. Verified K2 + K3.
+- [x] Convert non-existent estimate returns `isError: true` (tool layer) — verified at the tool-handler level by inspection (the `if (!estimate)` short-circuit returns the structured error before any side effects).
+
+**Error criteria**:
+- [x] `qb_estimate_update` unknown `txnId` rejects via `isError: true` with statusCode 500. Verified I1/I2 via `session.modifyEntity` rejection (the tool's try/catch surfaces this).
+- [x] `qb_estimate_update` stale `editSequence` rejects with statusCode 3170. The failed mod does NOT mutate the estimate. Verified C1/C2/C3.
+- [x] `qb_estimate_update` new line (no `txnLineID` / `'-1'`) without `itemName`/`itemListId` rejected by `estimateLineModSchema.refine` at the zod boundary. (Schema-only, mirrors invoiceLineModSchema in tools/invoices.ts.)
+- [x] `qb_estimate_update` new line without `amount` AND without (`quantity` AND `rate`) rejected by the same refine — Amount must be derivable. (Same.)
+- [x] `qb_estimate_delete` unknown `txnId` rejects via `isError: true` with statusCode 500. Verified H1/H2.
+- [x] `qb_estimate_convert_to_invoice` source estimate not found returns structured error before any invoice creation. (Tool-layer pre-check — inspection-verified.)
+
+**Regression criteria**:
+- [x] `qb_estimate_list` still returns persisted estimates. Verified N5.
+- [x] `qb_estimate_create` (now with `lines` support) still creates estimates with the line set converted to `EstimateLineRet`. Verified A1–A6 + J0.
+- [x] `qb_invoice_update` (Item 6) still computes Subtotal/BalanceRemaining via the shared `applyLineMods` + `computeTotals` path. Verified N1a–N1c (line mod 5*100 → 10*100 → Subtotal=1000, BalanceRemaining=1000).
+- [x] `qb_bill_update` (Item 7) still recomputes AmountDue. Verified N2 (mod from 100 → 250).
+- [x] `qb_class_list` (Item 30) still returns 3 active classes. Verified N3.
+- [x] `qb_payment_apply` (Item 8) still closes invoices via `ReceivePaymentMod` + `AppliedToTxnMod`. Verified N4 (BalanceRemaining=0 after apply).
+
+**Documentation criteria**:
+- [x] README header tool count bumped 50 → 53. Estimate section expanded from 2-tool to 5-tool with intro paragraphs documenting the line-mod semantics, customer-balance non-effect, and the convert flow's carry-over fields + `markAccepted` flag + post-create mark order.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — estimate bullet now enumerates list/create/update/delete/convert_to_invoice, documents the `lines` argument on create, the wholesale-replace + Subtotal-recompute on update, and the convert tool's mark-after-create order + `markAccepted: false` opt-out.
+- [x] `todo.md` Item 13 marked `[x]`.
+- [x] `ACCEPTANCE_CRITERIA.md` entry moved to Completed (this entry).
+- [x] No new `DECISIONS.md` entry — Option A (tool-layer composition for convert) is just chained primitives. The single architectural touch (extending `handleMod`'s post-mod recompute branch to include Estimate) is a one-line rule extension that mirrors the existing Invoice/Bill semantic for the same line-mod regex; not a tradeoff worth a separate entry.
+
+**Implementation notes**:
+- New tool module [src/tools/estimates.ts](src/tools/estimates.ts) hosts all five estimate tools. Estimates were previously co-located with payments in [src/tools/payments.ts](src/tools/payments.ts) — extracted now to follow the "one file per entity domain" convention from CLAUDE.md, since the estimate section was about to balloon from 2 tools to 5. The file header in payments.ts updated accordingly.
+- `qb_estimate_create` gained a `lines` arg (same shape as `qb_invoice_create`) — out of strict scope for Item 13 but necessary for `qb_estimate_convert_to_invoice` to be useful end-to-end through the tool surface (without it, the operator can't seed estimates with lines via this MCP and the convert tool has nothing to convert).
+- `estimateLineModSchema` mirrors `invoiceLineModSchema` exactly: every field optional, refine requires the create-shape fields ONLY when `txnLineID` is absent or `'-1'`. New lines need `itemName`/`itemListId` AND a way to derive Amount (explicit `amount`, or `quantity` + `rate`).
+- `qb_estimate_update` builds the `EstimateLineMod` array only when `args.lines` is provided — header-only mods send no line key and `applyLineMods` short-circuits via `lineModKeys.size === 0`. Try/catch wraps `session.modifyEntity` so simulation 500s and 3170s surface as structured tool errors with `isError: true` + `statusCode` (same pattern as Item 6/7). `isAccepted` is a header field passed through unchanged.
+- `qb_estimate_delete` wraps `session.deleteEntity("Estimate", txnId)`. Estimate is in the transaction list at [src/qbxml/builder.ts:115-131](src/qbxml/builder.ts#L115-L131) and routes to `TxnDelRq`. Wrapped in try/catch for the unknown-TxnID case (matches Item 11's structured-error pattern). No customer-balance reversal needed because estimates don't post to AR — the `handleTxnDel` path's adjust call only fires for Invoice/Bill.
+- `qb_estimate_convert_to_invoice` is Option A from the prior handoff — pure tool-layer composition. Flow: `queryEntity("Estimate", { TxnID })` → `addEntity("Invoice", { CustomerRef, [carry-over header fields], InvoiceLineAdd: mapped })` → `modifyEntity("Estimate", { IsAccepted: true })`. The mark step runs LAST so a successful invoice is preserved even if the mark fails (surfaced as `markAcceptedError` in the response, distinct from `success: false`). Carries `ClassRef` / `TermsRef` / `SalesRepRef` / `PORefNumber` from the estimate header when present (these can exist on real-QB estimates even though `qb_estimate_create` doesn't accept them yet — the convert tool reads from any estimate, not just MCP-created ones).
+- Simulation-store change: extended `handleMod`'s post-mod recompute branch in [src/session/simulation-store.ts](src/session/simulation-store.ts) to fire for Estimate too. Estimate has only `Subtotal` to re-derive (no `AmountDue`, no `BalanceRemaining`, no `IsPaid` — estimates aren't posted to any ledger), and `computeTotals` already handled `Estimate` for the Subtotal case (added in Phase 1 Item 16). The pre-delete that fires for Bill (`delete updated.AmountDue`) is correctly Bill-only — Estimate has no field that needs clearing because `computeTotals` always overwrites Subtotal.
+- Verified end-to-end with a 62-check inline script (deleted post-verification): A-series (estimate create with lines + Subtotal derivation + AR-untouched), B-series (header-only mod preservation), C-series (stale EditSequence rejection), D-series (wholesale line replace with merge-by-TxnLineID + Subtotal recompute + AR-untouched), E-series (new-line addition with fresh TxnLineID + Subtotal recompute), F-series (IsAccepted via update), G/H-series (delete happy path + AR-untouched + unknown-TxnID error), I-series (update unknown TxnID error), J-series (default convert with all 13 sub-checks for invoice shape, line carry-over, refnum/memo defaults, mark-accepted, customer balance bump), K-series (markAccepted=false skip), M-series (operator field overrides), N-series regressions for invoice_update / bill_update / class_list / payment_apply / estimate_list. `npm run build` green throughout.
+
+---
 
 ### Item 30 — Reference list tools (Class / Terms / PaymentMethod / SalesRep / CustomerType / VendorType) _(Phase 4)_ — done 2026-04-26
 

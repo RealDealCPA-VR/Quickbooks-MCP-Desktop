@@ -927,13 +927,17 @@ export class SimulationStore {
     // After lines change, the line-derived header totals must be re-derived
     // or they drift. Bill: AmountDue. Invoice: Subtotal, BalanceRemaining,
     // IsPaid (AppliedAmount is preserved — it's not derived from lines, it
-    // tracks what payments have already closed against the invoice). For
-    // Invoice, computeTotals always overwrites Subtotal / BalanceRemaining /
-    // IsPaid so no pre-delete is needed; Bill needs AmountDue cleared because
-    // computeTotals only sets it when undefined (preserves explicit overrides).
+    // tracks what payments have already closed against the invoice).
+    // Estimate: Subtotal only — estimates have no AmountDue/AppliedAmount/IsPaid
+    // (they're a quote, not posted to AR/AP). For Invoice and Estimate,
+    // computeTotals always overwrites Subtotal so no pre-delete is needed;
+    // Bill needs AmountDue cleared because computeTotals only sets it when
+    // undefined (preserves explicit overrides).
     if (
       lineModResult.lineModKeys.size > 0 &&
-      (entityType === "Bill" || entityType === "Invoice")
+      (entityType === "Bill" ||
+        entityType === "Invoice" ||
+        entityType === "Estimate")
     ) {
       if (entityType === "Bill") {
         delete updated.AmountDue;

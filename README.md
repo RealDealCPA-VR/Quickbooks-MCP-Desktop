@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (50 total)
+## Tools (53 total)
 
 ### Customers
 | Tool | Description |
@@ -91,10 +91,18 @@ QuickBooks has no generic "Item" — every item belongs to one of five subtypes.
 | `qb_payment_list` | List received payments |
 
 ### Estimates
+
+`qb_estimate_create` accepts a `lines` array (same shape as `qb_invoice_create`) and the simulation derives `Subtotal` from the line set server-side. `qb_estimate_update` mirrors `qb_invoice_update` — pass `txnId` + `editSequence` (from a prior list) plus any header fields and/or replacement `lines`; passing `lines` REPLACES the line set wholesale, lines with a matching `txnLineID` are merged in place, and `Subtotal` recomputes. Estimates aren't posted to AR — there's no customer-balance side effect (unlike `qb_invoice_update`). A stale `editSequence` rejects with statusCode 3170.
+
+`qb_estimate_convert_to_invoice` is the meaty one. Real QB has no single "convert" RPC; this tool reads the source estimate, submits an `InvoiceAddRq` with `CustomerRef` + `EstimateLineRet` carried over (each line mapped to `InvoiceLineAdd`, with optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PORefNumber` carry-over from the estimate header when present), and (default) marks the source estimate `IsAccepted: true`. The mark-accepted step runs AFTER the invoice is successfully created, so the new invoice is preserved even if the flip fails (rare — surfaced via `markAcceptedError` in the response). Pass `markAccepted: false` to leave the estimate unmarked (e.g. for partial conversions). The new invoice posts to AR and bumps the customer's `Balance` by its `BalanceRemaining` exactly like a regular `qb_invoice_create`.
+
 | Tool | Description |
 |------|-------------|
-| `qb_estimate_list` | List estimates/quotes |
-| `qb_estimate_create` | Create a new estimate |
+| `qb_estimate_list` | List/search estimates with customer/date/refNumber filters. |
+| `qb_estimate_create` | Create a new estimate. Takes `lines: [{itemName, quantity, rate, amount?, description?}]`; `Subtotal` derived from the line set. |
+| `qb_estimate_update` | Modify an existing estimate. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. `Subtotal` recomputes after line mods. Pass `isAccepted: true` to mark accepted manually. |
+| `qb_estimate_delete` | Delete an estimate. Estimates aren't posted to AR so there's no balance to reverse. |
+| `qb_estimate_convert_to_invoice` | Convert an estimate to an invoice. Carries `CustomerRef` + lines (and optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PORefNumber`). Operator-supplied `invoiceTxnDate` / `invoiceDueDate` / `invoiceRefNumber` / `invoiceMemo` override the carried values. Default flips the estimate `IsAccepted: true` after the invoice is created — pass `markAccepted: false` to skip. |
 
 ### Employees
 
