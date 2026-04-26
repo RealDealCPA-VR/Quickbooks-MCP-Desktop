@@ -41,6 +41,20 @@ const xmlParser = new XMLParser({
 // ---------------------------------------------------------------------------
 
 export class SimulationStore {
+  // Real QB has no generic `Item` entity — every item is one of these five
+  // subtypes, each with its own *QueryRq / *AddRq / *ModRq request type and
+  // its own *Ret response element. The store mirrors that by keeping a
+  // separate Map per subtype. The generic `ItemQueryRq` shim in handleQuery
+  // merges across these so the legacy `qb_item_list` tool keeps working until
+  // Phase 2 item 2 rewrites it to issue per-subtype queries.
+  private static readonly ITEM_SUBTYPES = [
+    "ItemService",
+    "ItemInventory",
+    "ItemNonInventory",
+    "ItemOtherCharge",
+    "ItemGroup",
+  ] as const;
+
   private stores: Map<string, EntityStore> = new Map();
   private idCounter = 1000;
 
@@ -111,9 +125,19 @@ export class SimulationStore {
     const entityType = reqType.replace("QueryRq", "");
     const rsType = reqType.replace("Rq", "Rs");
     const retName = `${entityType}Ret`;
-    const store = this.getStore(entityType);
 
-    let results = Array.from(store.values());
+    // Transitional shim: real QB has no `ItemQueryRq` (each subtype has its
+    // own request type), but the legacy `qb_item_list` tool still uses it.
+    // Merge across all five subtype stores so the tool keeps working until
+    // Phase 2 item 2 rewrites it. Removable in one delete when item 2 lands.
+    let results: StoredEntity[];
+    if (entityType === "Item") {
+      results = SimulationStore.ITEM_SUBTYPES.flatMap((sub) =>
+        Array.from(this.getStore(sub).values())
+      );
+    } else {
+      results = Array.from(this.getStore(entityType).values());
+    }
 
     // Apply filters
     if (reqData.ListID) {
@@ -641,7 +665,6 @@ export class SimulationStore {
     const customers = this.getStore("Customer");
     const vendors = this.getStore("Vendor");
     const accounts = this.getStore("Account");
-    const items = this.getStore("Item");
     const invoices = this.getStore("Invoice");
 
     // Sample customers
@@ -773,8 +796,12 @@ export class SimulationStore {
       { ListID: "I0000003", Name: "Widget A", FullName: "Widget A", IsActive: true, ItemType: "Inventory", Description: "Standard widget", Price: 25.00, Cost: 12.00, EditSequence: now, TimeCreated: "2024-02-01T10:00:00", TimeModified: now },
     ];
 
+    // Route each seed item into its per-subtype store. ItemType is the
+    // discriminator real QB uses (Service / Inventory / NonInventory /
+    // OtherCharge / Group) and maps 1:1 to the entity-type strings the
+    // request-handling code derives from `Item<Subtype>QueryRq`.
     for (const i of sampleItems) {
-      items.set(i.ListID as string, i);
+      this.getStore(`Item${i.ItemType}`).set(i.ListID as string, i);
     }
 
     // Sample invoices
