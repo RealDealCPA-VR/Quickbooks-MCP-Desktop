@@ -15,6 +15,36 @@ const invoiceLineSchema = z.object({
   amount: z.number().optional().describe("Line amount (overrides qty * rate)"),
 });
 
+// Mod variant — every field optional so a partial mod (e.g. just description
+// on an existing line) doesn't force the operator to reconstruct the line.
+// The simulation merges the mod fields onto the matching existing line by
+// TxnLineID. New lines (no txnLineID, or txnLineID === '-1') still require
+// itemName/itemListId AND a way to derive Amount (explicit amount, or
+// quantity + rate) — enforced by per-line refinement below.
+const invoiceLineModSchema = z
+  .object({
+    txnLineID: z.string().optional()
+      .describe("TxnLineID of the existing line to modify; omit (or pass '-1') to add a new line"),
+    itemName: z.string().optional().describe("Item full name"),
+    itemListId: z.string().optional().describe("Item ListID"),
+    description: z.string().optional().describe("Line description"),
+    quantity: z.number().optional().describe("Quantity — paired with rate to derive Amount"),
+    rate: z.number().optional().describe("Rate per unit — paired with quantity to derive Amount"),
+    amount: z.number().optional().describe("Line amount (overrides qty * rate)"),
+  })
+  .refine(
+    (line) => {
+      const isNew = !line.txnLineID || line.txnLineID === "-1";
+      if (!isNew) return true;
+      const hasItem = Boolean(line.itemName || line.itemListId);
+      const hasAmountSource =
+        line.amount !== undefined ||
+        (line.quantity !== undefined && line.rate !== undefined);
+      return hasItem && hasAmountSource;
+    },
+    { message: "New invoice lines (no txnLineID) require itemName/itemListId and either amount or (quantity + rate)" }
+  );
+
 export function registerInvoiceTools(
   server: McpServer,
   getSession: () => QBSessionManager
@@ -133,16 +163,18 @@ export function registerInvoiceTools(
 
   server.tool(
     "qb_invoice_update",
-    "Update an existing invoice in QuickBooks Desktop.",
+    "Update an existing invoice in QuickBooks Desktop. Pass txnId + editSequence (from a prior qb_invoice_list) plus any header fields and/or a replacement `lines` array. When `lines` is provided it REPLACES the invoice's existing line set wholesale — list every line you want the invoice to keep. A line with a txnLineID matching an existing line preserves that TxnLineID and merges any fields you pass over the existing values; a line without txnLineID (or with '-1') is added as new. Subtotal / BalanceRemaining / IsPaid recompute automatically; AppliedAmount is preserved (paid portions don't disappear when lines change). If a line mod drops Subtotal below AppliedAmount, BalanceRemaining goes negative — that's the over-applied state and matches real QB. Customer balance moves by the change in BalanceRemaining (not Subtotal).",
     {
       txnId: z.string().describe("TxnID of the invoice to update"),
-      editSequence: z.string().describe("EditSequence for optimistic locking"),
-      customerName: z.string().optional().describe("New customer full name"),
+      editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
+      customerName: z.string().optional().describe("New customer full name (re-points the invoice at a different customer)"),
       customerListId: z.string().optional().describe("New customer ListID"),
       txnDate: z.string().optional().describe("New invoice date"),
       dueDate: z.string().optional().describe("New due date"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New memo"),
+      lines: z.array(invoiceLineModSchema).optional()
+        .describe("Replacement line set. Existing lines whose TxnLineID is not listed will be dropped."),
     },
     async (args) => {
       const session = getSession();
@@ -161,13 +193,42 @@ export function registerInvoiceTools(
       if (args.refNumber) data.RefNumber = args.refNumber;
       if (args.memo) data.Memo = args.memo;
 
-      const result = await session.modifyEntity("Invoice", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, invoice: result }, null, 2),
-        }],
-      };
+      if (args.lines) {
+        data.InvoiceLineMod = args.lines.map((line) => {
+          const lineData: Record<string, unknown> = {};
+          if (line.txnLineID) lineData.TxnLineID = line.txnLineID;
+          if (line.itemListId) {
+            lineData.ItemRef = { ListID: line.itemListId };
+          } else if (line.itemName) {
+            lineData.ItemRef = { FullName: line.itemName };
+          }
+          if (line.description) lineData.Desc = line.description;
+          if (line.quantity !== undefined) lineData.Quantity = line.quantity;
+          if (line.rate !== undefined) lineData.Rate = line.rate;
+          if (line.amount !== undefined) lineData.Amount = line.amount;
+          return lineData;
+        });
+      }
+
+      try {
+        const result = await session.modifyEntity("Invoice", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, invoice: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: message, statusCode }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 

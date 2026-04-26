@@ -285,7 +285,7 @@ export class SimulationStore {
     const entity: StoredEntity = {
       ...addData,
       ...(isTransaction ? { TxnID: id } : { ListID: id }),
-      EditSequence: now,
+      EditSequence: this.nextEditSequence(),
       TimeCreated: now,
       TimeModified: now,
       IsActive: true,
@@ -660,11 +660,21 @@ export class SimulationStore {
       };
     }
 
-    // Apply *LineMod arrays (currently only Bill exercises this path).
+    // Apply *LineMod arrays (Bill and Invoice exercise this path).
     // The mod's line array becomes the entity's new line array, with
     // merge-by-TxnLineID semantics so a partial mod ("change just memo on
     // line L1") doesn't force the operator to reconstruct the whole line.
-    const oldAmountDue = Number(existing.AmountDue ?? 0);
+    //
+    // Capture the pre-mod amount that maps to the party's open balance —
+    // Bill uses AmountDue (vendor side), Invoice uses BalanceRemaining
+    // (customer side). Read off `existing` so we get the value BEFORE
+    // applyLineMods produces a new line set.
+    const oldPartyAmount =
+      entityType === "Bill"
+        ? Number(existing.AmountDue ?? 0)
+        : entityType === "Invoice"
+          ? Number(existing.BalanceRemaining ?? 0)
+          : 0;
     const lineModResult = this.applyLineMods(existing, modData);
 
     const strippedModData = lineModResult.lineModKeys.size > 0
@@ -675,28 +685,44 @@ export class SimulationStore {
       ...lineModResult.entityWithLines,
       ...strippedModData,
       TimeModified: new Date().toISOString(),
-      EditSequence: new Date().toISOString(),
+      EditSequence: this.nextEditSequence(),
     };
 
     if (modData.Name && !modData.FullName) {
       updated.FullName = String(modData.Name);
     }
 
-    // After lines change, AmountDue must be re-derived from the new line
-    // ledger or the header total drifts. Bill is the only entity with line
-    // mods today; Item 6 will extend this to Invoice (Subtotal +
-    // BalanceRemaining recompute).
-    if (entityType === "Bill" && lineModResult.lineModKeys.size > 0) {
-      delete updated.AmountDue;
+    // After lines change, the line-derived header totals must be re-derived
+    // or they drift. Bill: AmountDue. Invoice: Subtotal, BalanceRemaining,
+    // IsPaid (AppliedAmount is preserved — it's not derived from lines, it
+    // tracks what payments have already closed against the invoice). For
+    // Invoice, computeTotals always overwrites Subtotal / BalanceRemaining /
+    // IsPaid so no pre-delete is needed; Bill needs AmountDue cleared because
+    // computeTotals only sets it when undefined (preserves explicit overrides).
+    if (
+      lineModResult.lineModKeys.size > 0 &&
+      (entityType === "Bill" || entityType === "Invoice")
+    ) {
+      if (entityType === "Bill") {
+        delete updated.AmountDue;
+      }
       updated = this.computeTotals(updated, entityType);
     }
 
     store.set(id, updated);
 
-    // Vendor balance bookkeeping for a Bill mod: signed delta if the same
-    // vendor, full reverse-then-apply if VendorRef itself changed.
+    // Party-balance bookkeeping for a transaction mod: signed delta if the
+    // same party, full reverse-then-apply if the ref itself changed.
     if (entityType === "Bill") {
-      this.adjustVendorBalanceForBillMod(existing, updated, oldAmountDue);
+      this.adjustPartyBalanceForTxnMod(
+        "Vendor", "VendorRef", "AmountDue",
+        existing, updated, oldPartyAmount
+      );
+    } else if (entityType === "Invoice") {
+      this.adjustPartyBalanceForTxnMod(
+        "Customer", "CustomerRef", "BalanceRemaining",
+        existing, updated, oldPartyAmount
+      );
     }
 
     return {
@@ -791,20 +817,31 @@ export class SimulationStore {
     return out;
   }
 
-  // Adjusts vendor balance(s) after a Bill mod. Same vendor → signed delta
-  // on the (possibly new) AmountDue. Vendor changed → reverse the old
-  // vendor's bump, apply the new vendor's. Mirrors real QB's behavior
-  // when re-pointing a bill at a different vendor.
-  private adjustVendorBalanceForBillMod(
-    beforeBill: StoredEntity,
-    afterBill: StoredEntity,
-    oldAmountDue: number
+  // Adjusts party (Customer or Vendor) balance(s) after a transaction mod.
+  // Same party → signed delta on the (possibly new) amount field.
+  // Party changed → reverse the old party's bump, apply the new party's.
+  // Mirrors real QB's behavior when re-pointing a transaction at a different
+  // customer/vendor.
+  //
+  // `partyType` selects Customer or Vendor; `refField` the corresponding ref
+  // field on the stored entity (CustomerRef / VendorRef); `amountField` the
+  // signed dollar field that maps to the party's open balance — Bill uses
+  // AmountDue, Invoice uses BalanceRemaining (which can go negative when a
+  // line mod drops the subtotal below the already-applied amount; the negative
+  // is intentional — it represents over-application as a customer credit).
+  private adjustPartyBalanceForTxnMod(
+    partyType: "Customer" | "Vendor",
+    refField: "CustomerRef" | "VendorRef",
+    amountField: "AmountDue" | "BalanceRemaining",
+    beforeTxn: StoredEntity,
+    afterTxn: StoredEntity,
+    oldAmount: number
   ): void {
-    const newAmountDue = Number(afterBill.AmountDue ?? 0);
-    const oldRef = beforeBill.VendorRef as Record<string, unknown> | undefined;
-    const newRef = afterBill.VendorRef as Record<string, unknown> | undefined;
+    const newAmount = Number(afterTxn[amountField] ?? 0);
+    const oldRef = beforeTxn[refField] as Record<string, unknown> | undefined;
+    const newRef = afterTxn[refField] as Record<string, unknown> | undefined;
 
-    const sameVendor = (() => {
+    const sameParty = (() => {
       if (!oldRef || !newRef) return oldRef === newRef;
       const oldId = oldRef.ListID ? String(oldRef.ListID) : "";
       const newId = newRef.ListID ? String(newRef.ListID) : "";
@@ -815,11 +852,11 @@ export class SimulationStore {
       return false;
     })();
 
-    if (sameVendor && newRef) {
-      const delta = newAmountDue - oldAmountDue;
+    if (sameParty && newRef) {
+      const delta = newAmount - oldAmount;
       if (delta !== 0) {
         this.adjustEntityBalance(
-          "Vendor",
+          partyType,
           {
             listID: newRef.ListID ? String(newRef.ListID) : undefined,
             fullName: newRef.FullName ? String(newRef.FullName) : undefined,
@@ -830,24 +867,24 @@ export class SimulationStore {
       return;
     }
 
-    if (oldRef && oldAmountDue !== 0) {
+    if (oldRef && oldAmount !== 0) {
       this.adjustEntityBalance(
-        "Vendor",
+        partyType,
         {
           listID: oldRef.ListID ? String(oldRef.ListID) : undefined,
           fullName: oldRef.FullName ? String(oldRef.FullName) : undefined,
         },
-        -oldAmountDue
+        -oldAmount
       );
     }
-    if (newRef && newAmountDue !== 0) {
+    if (newRef && newAmount !== 0) {
       this.adjustEntityBalance(
-        "Vendor",
+        partyType,
         {
           listID: newRef.ListID ? String(newRef.ListID) : undefined,
           fullName: newRef.FullName ? String(newRef.FullName) : undefined,
         },
-        newAmountDue
+        newAmount
       );
     }
   }
@@ -928,6 +965,15 @@ export class SimulationStore {
 
   private nextId(): string {
     return `${this.idCounter++}-${Date.now().toString(36)}`;
+  }
+
+  // ISO timestamp plus a monotonic counter. The counter guarantees a fresh
+  // value when create+mod (or back-to-back mods) land in the same millisecond
+  // — without it, `EditSequence: new Date().toISOString()` collides on fast
+  // hardware and stale-EditSequence rejection (statusCode 3170) silently
+  // breaks because the caller's "old" sequence still matches the stored one.
+  private nextEditSequence(): string {
+    return `${new Date().toISOString()}-${this.idCounter++}`;
   }
 
   private isTransactionType(entityType: string): boolean {

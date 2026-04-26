@@ -35,11 +35,14 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 | `qb_account_update` | Update account details |
 
 ### Invoices
+
+`qb_invoice_update` accepts an optional `lines` array with the same shape as `qb_invoice_create` plus an optional `txnLineID` per entry — when provided and matching an existing line, the line is merged in place; otherwise it's added new. Line arrays passed to `qb_invoice_update` REPLACE the existing line set wholesale (any line you don't list is dropped). `Subtotal`, `BalanceRemaining`, and `IsPaid` recompute automatically; `AppliedAmount` is preserved. If a line mod drops `Subtotal` below `AppliedAmount`, `BalanceRemaining` goes negative — that's the over-applied state and matches real QB. Customer balance moves by the change in `BalanceRemaining`. A stale `editSequence` rejects with statusCode 3170.
+
 | Tool | Description |
 |------|-------------|
 | `qb_invoice_list` | List/search invoices with date/status filters |
 | `qb_invoice_create` | Create an invoice with line items |
-| `qb_invoice_update` | Update invoice details |
+| `qb_invoice_update` | Modify an existing invoice. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. Customer balance adjusts by `newBalanceRemaining - oldBalanceRemaining` (or full reverse-then-apply if `customerName` / `customerListId` re-points the invoice). |
 | `qb_invoice_delete` | Delete an invoice |
 
 ### Bills (Accounts Payable)

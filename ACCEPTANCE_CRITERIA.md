@@ -43,7 +43,7 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 3 — Transaction completeness
 
-_(Items 6, 8, 9 — criteria pending pickup.)_
+_(Items 8, 9 — criteria pending pickup.)_
 
 ---
 
@@ -54,6 +54,57 @@ _(Add criteria for items 6, 8, 9, etc. as they are picked up. Don't pre-write cr
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 6 — `qb_invoice_update` line mod (`InvoiceLineMod`) _(Phase 3)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_invoice_update` accepts an optional `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]` arg. Verified A1 setup + B/D/E/F/G mods.
+- [x] Header-only mod (no `lines`) leaves the existing `InvoiceLineRet` array, `Subtotal`, `BalanceRemaining`, `IsPaid`, and `AppliedAmount` untouched. Memo propagates. Verified B1–B9.
+- [x] When `lines` is provided, the array REPLACES the invoice's `InvoiceLineRet` wholesale — lines whose `TxnLineID` is not listed are dropped. Verified D1 (2 → 1) and F1 (2 → 1 again with different existing line).
+- [x] A line entry with a `txnLineID` matching an existing line preserves that `TxnLineID` and merges the mod's fields onto the existing line. Verified D2 (TxnLineID preserved), D3 (rate carried), D5 (Desc merged), F3 (rate carried via partial merge).
+- [x] A line entry without `txnLineID` (or with `'-1'`) gets a freshly-generated `TxnLineID` and is treated as a new line. Verified E3 (new TxnLineID ≠ either prior ID).
+- [x] After a line mod, `Subtotal` recomputes from the new line set; `BalanceRemaining = Subtotal + SalesTaxTotal - AppliedAmount` recomputes; `IsPaid = (BalanceRemaining === 0)` recomputes. Verified D6/D7/D8, E5, F5/F6, G3/G5/G6.
+- [x] `AppliedAmount` is preserved across line mods (paid portions don't disappear when lines change). Verified D9 (=0 preserved), G4 (=600 preserved across over-apply mod).
+- [x] If a line mod drops `Subtotal` below `AppliedAmount`, `BalanceRemaining` goes negative (over-application state) and `IsPaid` becomes false. No clamping. Verified G5 (BR=-300) and G6 (IsPaid=false on negative).
+- [x] Customer `Balance` adjusts by `newBalanceRemaining - oldBalanceRemaining` (signed delta). Verified D10 (-50), E6 (+75), F (transitive), G7 (-700 on over-apply), and reverse-then-apply on customer change H3 (-500) + H4 (+500).
+- [x] An `Amount` re-derives from the merged line: `Quantity * Rate` when both are present (changing only `quantity` on an existing line picks up the existing `rate`); explicit `amount` wins when provided; otherwise carries from the merge. Verified F4 (`5 * 100 = 500` from existing rate), E4 (explicit `Amount: 75` honored), D4 (`2 * 100 = 200` from preserved fields).
+
+**Error criteria**:
+- [x] Unknown `txnId` rejects via `isError: true` with statusCode 500. Verified I1/I2 via tool's try/catch wrapper around `session.modifyEntity`.
+- [x] Stale `editSequence` rejects with statusCode 3170. The failed mod does NOT mutate the invoice. Verified C1/C2/C3.
+- [x] New line (no `txnLineID` / `'-1'`) without `itemName`/`itemListId` rejected by `invoiceLineModSchema.refine` at the zod boundary. (Schema-only, not exercised in the QBSessionManager-level script.)
+- [x] New line without `amount` AND without (`quantity` AND `rate`) rejected by the same refine — Amount must be derivable. (Same.)
+
+**Regression criteria**:
+- [x] `qb_invoice_create` still creates with `Subtotal = sum(lines)` and customer balance bump. Verified M1/M2.
+- [x] `qb_invoice_delete` still reverses customer balance. Verified N1.
+- [x] `qb_invoice_list` still returns persisted invoices with intact `InvoiceLineRet` (verified throughout — every mod check re-queried via getInvoice).
+- [x] `qb_bill_update` still works (Item 7 path) — same `applyLineMods`, same `EditSequence` enforcement, same generalized party-balance helper. Verified K1 (create=100), K2 (mod=250), K3 (vendor balance moved by +150).
+- [x] `qb_payment_receive` (Item 5) still applies and updates invoice `BalanceRemaining` / `AppliedAmount`. Verified G1 (AppliedAmount=600), G2 (BalanceRemaining=400) — payment side worked end-to-end before the line-mod.
+- [x] `qb_customer_update` with fresh `EditSequence` still succeeds. Verified L1.
+- [x] AR aging reflects post-mod customer balance — reads `Customer.Balance` directly per Item 18; balance moves are end-to-end-verified.
+
+**Documentation criteria**:
+- [x] README invoice section: intro paragraph documents `lines` semantics, BalanceRemaining recompute, AppliedAmount preservation, negative-on-overapply, customer-balance delta, and the 3170 rejection. Tool table row updated with `lines` shape and customer-balance delta description.
+- [x] `instructions` block in [src/index.ts](src/index.ts) invoice bullet expanded with mod semantics, `AppliedAmount` preservation, over-apply behavior, and 3170 rejection.
+- [x] `ACCEPTANCE_CRITERIA.md` entry moved to Completed (this entry).
+- [x] No new `DECISIONS.md` entry — Item 7's "Bill line-mod uses wholesale replacement with merge-by-TxnLineID" already documents the generic line-mod approach. The negative-`BalanceRemaining` policy (accept, no clamp) follows directly from `BalanceRemaining = Subtotal + SalesTaxTotal - AppliedAmount` and matches real QB; not a tradeoff worth a separate entry.
+
+**Implementation notes**:
+- Tool layer in [src/tools/invoices.ts](src/tools/invoices.ts):
+  - `invoiceLineModSchema` mirrors Item 7's pattern: every field optional so a partial mod (e.g. just `description` on an existing line) works; refine requires the create-shape fields ONLY when `txnLineID` is absent or `'-1'`. New lines need `itemName`/`itemListId` AND a way to derive Amount (explicit `amount`, or `quantity` + `rate`).
+  - `qb_invoice_update` builds the `InvoiceLineMod` array only when `args.lines` is provided — header-only mods send no line key and `applyLineMods` short-circuits via `lineModKeys.size === 0`.
+  - Try/catch wraps `session.modifyEntity` so simulation 500s and 3170s surface as structured tool errors with `isError: true` + `statusCode` (same pattern as Item 5/7).
+- Simulation `handleMod` in [src/session/simulation-store.ts](src/session/simulation-store.ts):
+  - Generalized `adjustVendorBalanceForBillMod` → `adjustPartyBalanceForTxnMod(partyType, refField, amountField, before, after, oldAmount)`. Bill and Invoice share the same machinery; the only per-entity choices are which ref field to read and which amount field maps to the party's open balance.
+  - `oldPartyAmount` capture branches on `entityType`: Bill reads `existing.AmountDue`, Invoice reads `existing.BalanceRemaining`. Captured BEFORE `applyLineMods` so the pre-mod value is preserved.
+  - Recompute branch fires for both Bill and Invoice when `lineModKeys.size > 0`. For Bill, `delete updated.AmountDue` first (because `computeTotals` only sets `AmountDue` when undefined — preserves explicit overrides). For Invoice, no pre-delete needed because `computeTotals` always overwrites `Subtotal` / `BalanceRemaining` / `IsPaid`. `AppliedAmount` is read from `result.AppliedAmount ?? 0` and preserved.
+  - `applyLineMods` itself is unchanged — the `/^(.+?)Line(s?)Mod$/` regex matched `InvoiceLineMod` for free.
+- Verified end-to-end with a 61-check inline script (deleted post-verification per "no test infra yet"): invoice setup with line totals + customer balance bump (A1–A7), header-only mod with full preservation (B1–B9), stale-EditSequence rejection (C1–C3), wholesale line drop with field merge + balance delta (D1–D10), new line addition with fresh TxnLineID + balance delta (E1–E6), quantity-only mod re-deriving Amount via existing rate (F1–F6), over-application from line drop on partially-paid invoice with negative BalanceRemaining + customer balance delta (G1–G7), customer-change reverse-then-apply (H1–H4), unknown-TxnID rejection (I1/I2), and full regressions for `qb_bill_update` (K1–K3), `qb_customer_update` (L1), `qb_invoice_create` (M1/M2), `qb_invoice_delete` (N1). One verification-script bug surfaced and fixed: the script was holding object references from `queryEntity` and reading `.Balance` later, which returned the latest mutated value rather than a snapshot — `getCustomerBalance(name)` helper now captures the value as a Number at query time. Implementation was correct throughout. `npm run build` green.
+
+---
 
 ### Item 7 — `qb_bill_update` (BillModRq) _(Phase 3)_ — done 2026-04-25
 
