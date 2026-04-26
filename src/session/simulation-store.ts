@@ -300,6 +300,19 @@ export class SimulationStore {
       ? this.computeTotals(this.convertLinesAddToRet(entity), entityType)
       : entity;
 
+    if (entityType === "ReceivePayment") {
+      const applyResult = this.applyReceivePayment(finalEntity);
+      if (!applyResult.ok) {
+        return {
+          type: rsType,
+          statusCode: 500,
+          statusSeverity: "Error",
+          statusMessage: applyResult.error,
+          data: {},
+        };
+      }
+    }
+
     const storeKey = isTransaction ? id : id;
     store.set(storeKey, finalEntity);
 
@@ -316,6 +329,111 @@ export class SimulationStore {
       statusMessage: "Status OK",
       data: { [retName]: finalEntity },
     };
+  }
+
+  // -----------------------------------------------------------------------
+  // ReceivePayment application — close out invoices, move customer balance
+  // -----------------------------------------------------------------------
+
+  // Real QB derives all payment-application bookkeeping server-side: each
+  // AppliedToTxnAdd block reduces the named invoice's BalanceRemaining,
+  // bumps its AppliedAmount, flips IsPaid when the balance hits zero, and
+  // moves the customer's Balance by the *applied* portion only (unapplied
+  // payment becomes a customer credit). Mirroring that here keeps every
+  // downstream view (qb_invoice_list, qb_ar_aging, qb_customer_list)
+  // consistent regardless of mode.
+  //
+  // Strict on missing TxnIDs (returns 500) — the operator explicitly named
+  // a target, so silently dropping an orphan ref would let payments record
+  // against ghosts. See DECISIONS.md 2026-04-25 entry.
+  //
+  // Phase 3 item 8 (qb_payment_apply, ReceivePaymentMod path) will reuse the
+  // same per-line bookkeeping in handleMod by calling a shared helper — for
+  // now this stays inline because there's only one call site.
+  private applyReceivePayment(
+    payment: StoredEntity
+  ): { ok: true } | { ok: false; error: string } {
+    const totalAmount = Number(payment.TotalAmount ?? 0);
+    const raw = payment.AppliedToTxnAdd;
+    delete payment.AppliedToTxnAdd;
+
+    if (!raw || (Array.isArray(raw) && raw.length === 0)) {
+      payment.AppliedAmount = 0;
+      payment.UnusedPayment = totalAmount;
+      return { ok: true };
+    }
+
+    const lines = (Array.isArray(raw) ? raw : [raw]) as Record<string, unknown>[];
+    const invoiceStore = this.getStore("Invoice");
+
+    // First pass: validate every TxnID before mutating any invoice state.
+    // Real QB transactions are atomic — if any application fails, none apply.
+    for (const line of lines) {
+      const txnId = String(line.TxnID ?? "");
+      if (!txnId) {
+        return { ok: false, error: "AppliedToTxnAdd requires TxnID" };
+      }
+      if (!invoiceStore.has(txnId)) {
+        return {
+          ok: false,
+          error: `Invoice "${txnId}" specified in AppliedToTxnAdd cannot be found`,
+        };
+      }
+    }
+
+    // Second pass: apply mutations and build *Ret entries.
+    let appliedSum = 0;
+    const appliedRet: Record<string, unknown>[] = [];
+    for (const line of lines) {
+      const txnId = String(line.TxnID);
+      const paymentAmount = Number(line.PaymentAmount ?? 0);
+      const discountAmount = Number(line.DiscountAmount ?? 0);
+
+      const invoice = invoiceStore.get(txnId)!;
+      const balance = Number(invoice.BalanceRemaining ?? 0);
+      const applied = Number(invoice.AppliedAmount ?? 0);
+      // Discount closes the invoice alongside the payment but does NOT
+      // reduce customer A/R (the customer didn't pay it — they got it).
+      invoice.BalanceRemaining = balance - paymentAmount - discountAmount;
+      invoice.AppliedAmount = applied + paymentAmount;
+      invoice.IsPaid = invoice.BalanceRemaining === 0;
+
+      appliedSum += paymentAmount;
+
+      const ret: Record<string, unknown> = {
+        TxnLineID: this.nextId(),
+        TxnID: txnId,
+        PaymentAmount: paymentAmount,
+      };
+      if (discountAmount > 0) {
+        ret.DiscountAmount = discountAmount;
+        if (line.DiscountAccountRef) ret.DiscountAccountRef = line.DiscountAccountRef;
+      }
+      appliedRet.push(ret);
+    }
+
+    // Customer.Balance moves by the applied sum, not the gross payment.
+    // Unapplied amount is implicitly tracked by UnusedPayment on the
+    // payment record — it's a credit, not a reduction in current AR.
+    if (appliedSum > 0) {
+      const customerRef = payment.CustomerRef as Record<string, unknown> | undefined;
+      if (customerRef) {
+        this.adjustEntityBalance(
+          "Customer",
+          {
+            listID: customerRef.ListID ? String(customerRef.ListID) : undefined,
+            fullName: customerRef.FullName ? String(customerRef.FullName) : undefined,
+          },
+          -appliedSum
+        );
+      }
+    }
+
+    payment.AppliedToTxnRet = appliedRet;
+    payment.AppliedAmount = appliedSum;
+    payment.UnusedPayment = totalAmount - appliedSum;
+
+    return { ok: true };
   }
 
   // -----------------------------------------------------------------------

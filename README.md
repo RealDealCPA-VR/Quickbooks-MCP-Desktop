@@ -64,9 +64,12 @@ QuickBooks has no generic "Item" — every item belongs to one of five subtypes.
 | `qb_item_delete` | Delete an item. `itemType` is required so the correct `ListDelType` is sent. |
 
 ### Payments
+
+`qb_payment_receive` accepts an optional `appliedTo: [{txnId, amount, discountAmount?, discountAccountName?}]` array. Each entry closes out part or all of an invoice's `BalanceRemaining` and decrements the customer's `Balance` by the applied amount. The unapplied portion (`UnusedPayment = totalAmount - sum(appliedTo.amount)`) sits on the payment record as a customer credit. Calling without `appliedTo` records the payment as fully unapplied — legitimate for prepayments. Invoice `TxnID`s are validated strictly: an unknown `txnId` rejects the whole payment.
+
 | Tool | Description |
 |------|-------------|
-| `qb_payment_receive` | Record a received payment |
+| `qb_payment_receive` | Record a received payment. Optional `appliedTo` closes out specific invoices and reduces customer balance by the applied sum. |
 | `qb_payment_list` | List received payments |
 
 ### Estimates

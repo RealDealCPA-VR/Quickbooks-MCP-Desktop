@@ -41,6 +41,8 @@ const arrayElements = new Set([
   "ExpenseLineRet",
   "ItemLineRet",
   "PaymentRet",
+  "ReceivePaymentRet",
+  "AppliedToTxnRet",
   "EstimateRet",
   "EstimateLineRet",
   "EmployeeRet",

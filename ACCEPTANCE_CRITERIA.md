@@ -43,25 +43,7 @@ npm run dev   # in another terminal: exercise the tool through an MCP client
 
 ## Phase 3 — Transaction completeness
 
-### Item 5 — Payment applied to invoices _(Phase 3)_
-
-**Status:** pending
-
-**Behavioral criteria**:
-- [ ] `qb_payment_receive` accepts `appliedTo: [{txnId, amount, discountAmount?, discountAccountName?}]` array.
-- [ ] Each applied invoice's `BalanceRemaining` decreases by the applied amount.
-- [ ] When `BalanceRemaining` reaches 0, the invoice's `IsPaid` flips to true.
-- [ ] Customer `Balance` decreases by the total applied amount (not the gross payment).
-- [ ] Unapplied amount (if `TotalAmount > sum(appliedTo.amount)`) remains as customer credit — clearly returned in the response payload.
-- [ ] Calling `qb_payment_receive` without `appliedTo` records the payment as fully unapplied (legitimate for prepayments).
-
-**Regression criteria**:
-- [ ] `qb_payment_list` shows the new payment.
-- [ ] `qb_invoice_list` reflects updated `BalanceRemaining` and `IsPaid` on the affected invoices.
-- [ ] AR aging recomputes correctly.
-
-**Notes**:
-- Real QBXML structure: `ReceivePaymentAdd` contains zero or more `AppliedToTxnAdd` blocks, each with `TxnID`, `PaymentAmount`, optional `DiscountAmount` + `DiscountAccountRef`.
+_(Items 6, 7, 8, 9 — criteria pending pickup.)_
 
 ---
 
@@ -72,6 +54,44 @@ _(Add criteria for items 6, 7, 8, 9, etc. as they are picked up. Don't pre-write
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 5 — Payment applied to invoices _(Phase 3)_ — done 2026-04-25
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_payment_receive` accepts `appliedTo: [{txnId, amount, discountAmount?, discountAccountName?}]` array. Verified C1, F1, G1.
+- [x] Each applied invoice's `BalanceRemaining` decreases by the applied amount. Verified C5 (7500→4500), D3 (4500→0), E3 (1000→0), F5/F6, G2.
+- [x] When `BalanceRemaining` reaches 0, the invoice's `IsPaid` flips to true. Verified D4, E4, F5/F6, G3. Partial closeout leaves `IsPaid=false` (C7).
+- [x] Customer `Balance` decreases by the total applied amount (not the gross payment). Verified C8 (-3000), E5 (only -1000 of $1500 gross), F7 (-500), G5 (-950 of $950 + $50 discount).
+- [x] Unapplied amount (`TotalAmount > sum(appliedTo.amount)`) remains as customer credit and is returned as `UnusedPayment` on the payment payload. Verified B3 (500), E2 (500), F4/G6 (0).
+- [x] Calling `qb_payment_receive` without `appliedTo` records the payment as fully unapplied. Verified B1–B5: AppliedAmount=0, UnusedPayment=totalAmount, no AppliedToTxnRet, no customer balance change.
+
+**Regression criteria**:
+- [x] `qb_payment_list` shows the new payment with `AppliedAmount` and `AppliedToTxnRet` intact across query round-trip. Verified K1–K3.
+- [x] `qb_invoice_list` reflects updated `BalanceRemaining` and `IsPaid` on the affected invoices (verified throughout C/D/E/F/G via direct query lookups by RefNumber).
+- [x] AR aging still runs after payment activity (L1). Report reads `Customer.Balance` directly per Item 18, so the moved balance flows through automatically.
+
+**Edge / error criteria** (added during implementation):
+- [x] Strict TxnID validation: an unknown `txnId` returns `isError: true` with statusCode 500 and the bad TxnID in the error message; no invoice is mutated. Verified H1–H3. See DECISIONS.md 2026-04-25 entry.
+- [x] Overapplication (sum(appliedTo.amount) > totalAmount) rejected at the tool-layer schema-after-coercion check. Verified I1–I2. Floating-point tolerance: `+1e-9`.
+- [x] Pre-existing customer-required validation still works (J1).
+- [x] Discount handling: `discountAmount` closes invoice alongside `amount` but is NOT counted toward `AppliedAmount` on the invoice and does NOT reduce the customer balance — matches real QB semantics. Verified G2/G4/G5/G6 with `DiscountAccountRef` on the response payload.
+
+**Documentation criteria**:
+- [x] README payment section updated: intro paragraph describes `appliedTo` semantics + strict TxnID rule + UnusedPayment formula; tool table row mentions `appliedTo`.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated: `qb_payment_*` line flags `appliedTo` and the prepayment-without-appliedTo path.
+- [x] `DECISIONS.md` 2026-04-25 entry added: "Strict TxnID validation in `qb_payment_receive` AppliedToTxnAdd."
+
+**Implementation notes**:
+- Tool-layer schema in [src/tools/payments.ts:7-14](src/tools/payments.ts#L7-L14): `appliedToSchema` requires `txnId` + `amount`; `discountAmount` and `discountAccountName` are optional. Per-line refinement intentionally NOT used — `txnId` and `amount` are required directly via `z.string()` / `z.number()`, so the schema rejects missing fields without a `.refine()` predicate.
+- Tool-layer overapplication check at [src/tools/payments.ts:50-63](src/tools/payments.ts#L50-L63): runs before the request is built, returns `isError: true` with the computed sum and the totalAmount. Floating-point slack: `+1e-9`. Rejects at the tool layer rather than the simulation so live mode also gets the friendly error message instead of a cryptic QB rejection.
+- Tool-layer try/catch at [src/tools/payments.ts:96-106](src/tools/payments.ts#L96-L106) wraps `session.addEntity` so a 500 from the simulation (orphan TxnID) surfaces as a structured tool error instead of a raw exception. Pattern is candidate for replication on other tools when Phase 6 item 25 lands.
+- Side-effect logic centralized in `applyReceivePayment` at [src/session/simulation-store.ts:332-432](src/session/simulation-store.ts#L332-L432). Two-pass design: pass 1 validates every TxnID (atomicity — orphan in line 5 of 5 must NOT leave lines 1-4 mutated); pass 2 applies invoice mutations and customer-balance delta. Phase 3 item 8 (`qb_payment_apply` via `ReceivePaymentMod`) will reuse this exact helper from `handleMod` — currently inline because there's only one call site.
+- `AppliedToTxnRet` carries `TxnLineID` (from `nextId()`), `TxnID`, `PaymentAmount`, and conditionally `DiscountAmount` + `DiscountAccountRef`. Added to parser's `arrayElements` set at [src/qbxml/parser.ts:46](src/qbxml/parser.ts#L46) so live mode parses single-applied-invoice responses as a 1-element array, matching multi-application shape.
+- Customer balance moves via the existing `adjustEntityBalance` helper from Item 18 with a negative delta, exactly as the previous handoff predicted. Skipped when `appliedSum === 0` so prepayments don't accidentally bump customer balance.
+- Order in `handleAdd`: `applyReceivePayment` runs AFTER `convertLinesAddToRet` + `computeTotals` (both are no-ops for ReceivePayment) and BEFORE `store.set`, so an orphan-TxnID rejection short-circuits without leaving a phantom payment in the store.
+- Verified end-to-end with a 51-check inline script (deleted post-verification per "no test infra yet"): seed sanity, prepayment without appliedTo, single-invoice partial application, full closeout with `IsPaid` flip, unapplied-portion-as-credit (1500 paid / 1000 applied / 500 unused), multi-invoice application, discount handling with proper customer-balance and AppliedAmount semantics, strict TxnID validation, overapplication rejection, missing-customer regression, persistence via `qb_payment_list`, and AR aging smoke. `npm run build` green.
 
 ### Item 4 — Bill expense + item lines _(Phase 3)_ — done 2026-04-25
 
