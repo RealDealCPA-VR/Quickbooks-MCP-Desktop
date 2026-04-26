@@ -17,40 +17,42 @@ export function registerReportTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_company_info",
-    "Get company information from the QuickBooks company file, including name, address, fiscal year, and connection status.",
+    "Get company information from the QuickBooks company file (CompanyQueryRq) — name, legal name, address, fiscal year start, tax form, EIN, etc. — plus session/connection state.",
     {},
     async () => {
       const session = getSession();
-      const isConnected = session.isConnected();
-      const sessionData = session.getSession();
-      const isSimulation = session.isSimulation();
+      try {
+        const records = await session.queryEntity("Company", {});
+        const companyInfo = records[0] ?? null;
+        const sessionData = session.getSession();
 
-      // In a real implementation, we'd query CompanyQuery
-      const info = {
-        connected: isConnected,
-        simulationMode: isSimulation,
-        companyFile: sessionData?.companyFile ?? "N/A",
-        sessionTicket: sessionData?.ticket ?? "N/A",
-        openedAt: sessionData?.openedAt?.toISOString() ?? "N/A",
-        serverInfo: {
-          name: "QuickBooks Desktop MCP Server",
-          version: "1.0.0",
-          qbxmlVersion: "16.0",
-          capabilities: [
-            "Customer CRUD", "Vendor CRUD", "Account management",
-            "Invoice management", "Bill management", "Item management",
-            "Payment recording", "Estimate management", "Employee management",
-            "Reporting & queries", "QBXML raw access",
-          ],
-        },
-      };
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify(info, null, 2),
-        }],
-      };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              connected: session.isConnected(),
+              simulationMode: session.isSimulation(),
+              companyFile: sessionData?.companyFile ?? null,
+              sessionTicket: sessionData?.ticket ?? null,
+              openedAt: sessionData?.openedAt?.toISOString() ?? null,
+              companyInfo,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "CompanyQueryRq failed",
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 

@@ -53,6 +53,12 @@ _(All Phase 4 in-scope items complete — Items 10, 11, 12, 13, 30. See Complete
 
 ---
 
+## Phase 5 — Reporting
+
+_(Item 14 done — see Completed below. Items 19, 20, 21 still open per `todo.md`.)_
+
+---
+
 _(Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
 
 ---
@@ -60,6 +66,38 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 14 — Real `CompanyQueryRq` in `qb_company_info` _(Phase 5)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] `qb_company_info` (no args) returns a structured payload with a `companyInfo` object containing `CompanyName`, `LegalCompanyName`, `Address` (Addr1/City/State/PostalCode/Country block), `LegalAddress`, `Phone`, `Email`, `CompanyType`, `EIN`, `FirstMonthInFiscalYear`, `FirstMonthInIncomeTaxYear`, `TaxForm`, `IsSampleCompany`, `SubscriberID`, `CompanyFilePath`.
+- [x] The payload still surfaces session state for operator transparency: `connected`, `simulationMode`, `companyFile`, `sessionTicket`, `openedAt`. The hardcoded `serverInfo` block is gone (it was stale and never updated as tools were added).
+- [x] In simulation mode the seeded company comes back: `CompanyName: "Demo Co"`, fiscal year `January`, `TaxForm: "Form1120"`, `IsSampleCompany: true`.
+- [x] Calling `qb_company_info` BEFORE any explicit `qb_session_connect` still works — the tool auto-connects via `session.queryEntity` (which routes through `sendRequest` → `openSession`), so the operator can call it as a first move.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `qb_balance_summary` still returns the 10 seeded accounts grouped by AccountType (no overlap with the new Company seed/store).
+- [x] `qb_account_list` / `qb_customer_list` / `qb_vendor_list` etc. unaffected — adding a new `Company` store does not bleed into other entity lookups.
+- [x] `qb_session_connect` / `qb_session_disconnect` still work; sessionTicket and openedAt still surface through the new payload.
+
+**Documentation criteria**:
+- [x] README "Reports" tool table description for `qb_company_info` updated to reflect the real query.
+- [x] `instructions` block in [src/index.ts](src/index.ts) — left as `"Connection & company info"` (still accurate; the granular field list lives in the tool's description).
+- [x] No DECISIONS.md entry needed (no tradeoff — straightforward implementation of an obvious gap).
+- [x] No ARCHITECTURE.md change (Company is just another entity routed through the standard query path; no new subsystem).
+
+**Verification commands**:
+```bash
+npm run build
+# Then via verification harness:
+#   qb_company_info -> assert companyInfo.CompanyName === "Demo Co", IsSampleCompany === true
+#   qb_balance_summary -> assert totalAccounts === 10 (regression)
+#   prior-handoff regression suite (account/invoice/JE/bill paths) all green
+```
+
+**Notes**: Company is a singleton in real QB — exactly one record per company file. Stored as a single-entry Map keyed by sentinel `"COMPANY"` so the existing `getStore`/`handleQuery` flow needs no special-case branch (the generic path returns `[companySeed]`, applies no filters since the request has none, and wraps as `{ CompanyRet: [companySeed] }`). `CompanyRet` deliberately stays out of the parser's `arrayElements` set (spec is singular); `flattenEntityArray` handles both single-object and array shapes so the consumer is uniform either way. Read-only — no `CompanyMod`, no nested address validation. If the operator ever needs to edit company info that's a separate item.
 
 ### Item 12 (JournalEntry) — Journal entry tools (`qb_journal_entry_list` / `_create` / `_update` / `_delete`) _(Phase 4)_ — done 2026-04-26
 

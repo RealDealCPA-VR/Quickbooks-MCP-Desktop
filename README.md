@@ -193,7 +193,7 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 ### Reports & Queries
 | Tool | Description |
 |------|-------------|
-| `qb_company_info` | Get company/connection info |
+| `qb_company_info` | Run `CompanyQueryRq` for company name/legal name/address/fiscal year/tax form/EIN, plus session state (connected/simulationMode/sessionTicket/openedAt). Auto-connects on first call. |
 | `qb_balance_summary` | Account balance overview |
 | `qb_ar_aging` | Accounts receivable aging |
 | `qb_ap_aging` | Accounts payable aging |

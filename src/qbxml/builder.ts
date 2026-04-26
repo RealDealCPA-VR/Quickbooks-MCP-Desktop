@@ -6,7 +6,7 @@
  * with QuickBooks Desktop via the SDK's session manager.
  */
 
-import type { QBXMLRequest, QBXMLRequestBody } from "../types/qbxml.js";
+import type { QBXMLRequest } from "../types/qbxml.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,7 +63,7 @@ export function buildQBXMLRequest(request: QBXMLRequest): string {
 /**
  * Build a single QBXML request body (convenience wrapper).
  */
-export function buildSingleRequest(
+function buildSingleRequest(
   type: string,
   body: Record<string, unknown>,
   version?: string

@@ -38,7 +38,7 @@ So that everything below can actually be verified without a Windows box.
 
 ## Phase 5 — Reporting (currently mostly fake)
 
-- [ ] **14.** Implement real `CompanyQueryRq` in `qb_company_info` — return company name, legal name, address, fiscal year start, tax form, etc., not just session state.
+- [x] **14.** Implement real `CompanyQueryRq` in `qb_company_info` — return company name, legal name, address, fiscal year start, tax form, etc., not just session state.
 - [ ] **19.** Implement `asOfDate` filtering in `qb_ar_aging` and `qb_ap_aging` — currently the param is decorative; should filter open transactions by date and bucket by 0-30 / 31-60 / 61-90 / 90+ days.
 - [ ] **20.** Add proper P&L and Balance Sheet report tools (`GeneralSummaryReportQueryRq` with `ReportType=ProfitAndLossStandard` / `BalanceSheetStandard`) — current "reports" are just account-balance rollups.
 - [ ] **21.** Add date-range support to `qb_balance_summary`, and group by `AccountType` in canonical QB order (Bank, AccountsReceivable, OtherCurrentAsset, ... Equity, Income, COGS, Expense).
@@ -46,7 +46,7 @@ So that everything below can actually be verified without a Windows box.
 ## Phase 6 — Plumbing, validation, ergonomics
 
 - [ ] **23.** Fix `QB_SIMULATION` env semantics in [session/manager.ts:51-53](src/session/manager.ts#L51-L53) — currently `QB_SIMULATION=false` on Windows still simulates unless `QB_LIVE=1` is also set; either honor `QB_SIMULATION=false` alone or document the actual rule and align README.
-- [ ] **24.** Remove dead code: `parseQBXMLResponse` import in [session/manager.ts:27](src/session/manager.ts#L27), `buildSingleRequest` export in [qbxml/builder.ts:66](src/qbxml/builder.ts#L66), `QBXMLRequestBody` import in [qbxml/builder.ts:9](src/qbxml/builder.ts#L9), and the useless ternary `isTransaction ? id : id` at [simulation-store.ts:214](src/session/simulation-store.ts#L214).
+- [x] **24.** Remove dead code: `parseQBXMLResponse` import in [session/manager.ts:27](src/session/manager.ts#L27), `buildSingleRequest` export in [qbxml/builder.ts:66](src/qbxml/builder.ts#L66), `QBXMLRequestBody` import in [qbxml/builder.ts:9](src/qbxml/builder.ts#L9), and the useless ternary `isTransaction ? id : id` at [simulation-store.ts:214](src/session/simulation-store.ts#L214).
 - [ ] **25.** Wrap `session.queryEntity` / `addEntity` / `modifyEntity` / `deleteEntity` calls in tool handlers with try/catch — translate `QBXMLResponseError` into structured tool error responses (`isError: true` with `statusCode` + `statusMessage`) instead of letting them propagate as raw exceptions.
 - [ ] **26.** Add status code mapping table for common QB errors (3120 missing field, 3170 modify failed, 3260 insufficient permission, 500 not found, etc.) so tool errors are user-readable.
 - [ ] **27.** Add `IteratorID` / `IteratorRemainingCount` support to large queries (Customer, Invoice, Item) — real QB caps at ~500 rows and returns an iterator handle for pagination.

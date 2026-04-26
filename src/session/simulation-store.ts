@@ -351,8 +351,7 @@ export class SimulationStore {
       }
     }
 
-    const storeKey = isTransaction ? id : id;
-    store.set(storeKey, finalEntity);
+    store.set(id, finalEntity);
 
     if (entityType === "Invoice") {
       this.adjustPartyBalanceForTxn(finalEntity, "Customer", "BalanceRemaining", +1);
@@ -2034,6 +2033,43 @@ export class SimulationStore {
       { ListID: "VT0000003", Name: "Service Provider", FullName: "Service Provider", IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
     ];
     for (const v of vendorTypes) this.getStore("VendorType").set(v.ListID as string, v);
+
+    // Company — singleton (real QB has exactly one Company record per file).
+    // Stored in a one-entry Map under the "COMPANY" sentinel key so the
+    // generic getStore/handleQuery flow handles it without a special-case
+    // branch; CompanyQueryRq has no filter inputs in practice (FullName/ListID
+    // would be meaningless on a singleton), so the default code path returns
+    // [companySeed] verbatim.
+    const companySeed: StoredEntity = {
+      CompanyName: "Demo Co",
+      LegalCompanyName: "Demo Co LLC",
+      Address: {
+        Addr1: "100 Demo Way",
+        City: "Springfield",
+        State: "IL",
+        PostalCode: "62701",
+        Country: "US",
+      },
+      LegalAddress: {
+        Addr1: "100 Demo Way",
+        City: "Springfield",
+        State: "IL",
+        PostalCode: "62701",
+        Country: "US",
+      },
+      Phone: "555-0000",
+      Fax: "555-0001",
+      Email: "books@demo.co",
+      CompanyType: "Corporation",
+      EIN: "12-3456789",
+      FirstMonthInFiscalYear: "January",
+      FirstMonthInIncomeTaxYear: "January",
+      TaxForm: "Form1120",
+      IsSampleCompany: true,
+      SubscriberID: "SIM-SUBSCRIBER-0001",
+      CompanyFilePath: "C:\\Users\\Public\\Documents\\Intuit\\QuickBooks\\Sample Company.qbw",
+    };
+    this.getStore("Company").set("COMPANY", companySeed);
 
     // Set ID counter beyond seed data
     this.idCounter = 10000;
