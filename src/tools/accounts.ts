@@ -112,4 +112,69 @@ export function registerAccountTools(
       };
     }
   );
+
+  server.tool(
+    "qb_account_make_inactive",
+    "Deactivate an account in the QuickBooks chart of accounts (sets IsActive: false). Preferred over qb_account_delete because real QB rejects hard deletion of accounts with transaction history. Inactive accounts no longer appear in the default qb_account_list view but are preserved (so historical reports still resolve their references). Reversible via qb_account_update { isActive: true }. Requires listId + editSequence (from a prior qb_account_list).",
+    {
+      listId: z.string().describe("ListID of the account to deactivate"),
+      editSequence: z.string().describe("EditSequence for optimistic locking (from a prior qb_account_list)"),
+    },
+    async ({ listId, editSequence }) => {
+      const session = getSession();
+      try {
+        const result = await session.modifyEntity("Account", {
+          ListID: listId,
+          EditSequence: editSequence,
+          IsActive: false,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, account: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: message, statusCode }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.tool(
+    "qb_account_delete",
+    "Hard-delete an account from the QuickBooks chart of accounts. WARNING: real QB rejects deletion of accounts that have any transaction history (returns statusCode 3260) or are referenced by other records (3170). Prefer qb_account_make_inactive for accounts with history — it hides the account from the default list view but preserves the record so historical reports still resolve. Use this tool only for empty accounts created in error.",
+    {
+      listId: z.string().describe("ListID of the account to delete"),
+    },
+    async ({ listId }) => {
+      const session = getSession();
+      try {
+        const result = await session.deleteEntity("Account", listId);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, deleted: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: message, statusCode }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
 }

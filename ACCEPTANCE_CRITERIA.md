@@ -47,6 +47,12 @@ _(All Phase 3 items complete — see Completed below.)_
 
 ---
 
+## Phase 4 — Missing tools / coverage gaps
+
+_(In progress — Item 10 complete, see Completed below.)_
+
+---
+
 _(Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
 
 ---
@@ -54,6 +60,51 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 10 — `qb_account_delete` + `qb_account_make_inactive` _(Phase 4)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria**:
+- [x] `qb_account_make_inactive` is registered and listed by the MCP server. Accepts `listId` + `editSequence` only (bare-minimum schema). Verified A1.
+- [x] Calling `qb_account_make_inactive` with a valid `listId` + matching `editSequence` returns the modified account with `IsActive: false` and a fresh `EditSequence`. Verified A4/A5.
+- [x] After deactivation, the account does NOT appear in `qb_account_list { activeOnly: true }`. Verified A6.
+- [x] After deactivation, the account DOES appear in `qb_account_list { activeOnly: false }` — record preserved, just hidden. Verified A7.
+- [x] Reversible via `qb_account_update { isActive: true }`. Verified A8/A9.
+- [x] `qb_account_delete` is registered and listed. Accepts `listId` only. Verified C1.
+- [x] `qb_account_delete` removes the account from the store (subsequent list queries don't contain it). Verified C4.
+- [x] `qb_account_delete` returns `{ success: true, deleted: { ListDelType: "Account", ListID: <id> } }` on success. Verified C2/C3.
+
+**Error criteria**:
+- [x] `qb_account_make_inactive` with stale `editSequence` returns `isError: true` + `statusCode: 3170`. Verified B1/B2; account stays active after rejection (B3).
+- [x] `qb_account_make_inactive` with unknown `listId` returns `isError: true` + `statusCode: 500`. Verified B4/B5.
+- [x] `qb_account_delete` with unknown `listId` returns `isError: true` + `statusCode: 500`. Verified D1/D2.
+- [x] Both tools wrap session calls in try/catch (same pattern as Items 5/7/8/9) — simulation errors surface as structured `isError: true` + `statusCode`, not raw exceptions.
+- [x] `qb_account_delete` tool description warns about the inactive-vs-delete tradeoff (real QB returns 3260/3170 for accounts with history).
+
+**Regression criteria**:
+- [x] `qb_account_list` (existing) still returns the seed accounts. Verified E1/E2 (Checking + Utilities seed accounts present).
+- [x] `qb_account_add` (existing) still creates accounts with `IsActive: true`. Verified E3/E4.
+- [x] `qb_account_update` (existing) still updates non-IsActive fields (Description). Verified E5/E6.
+- [x] Shared `handleListDel` plumbing intact — Customer delete still works. Verified E7.
+- [x] Phase 3 Item 9 (`qb_bill_pay`) smoke — bill_pay closure + IsPaid flip + payment TotalAmount. Verified F1–F3.
+
+**Documentation criteria**:
+- [x] README account section: explains `qb_account_make_inactive` (preferred for accounts with history) vs `qb_account_delete` (hard delete) tradeoff. Tool table rows added for both.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — account bullet now mentions delete + make_inactive with the inactive-vs-delete tradeoff.
+- [x] Tool count in README header bumped 40 → 42.
+- [x] `ACCEPTANCE_CRITERIA.md` entry moved to Completed (this entry).
+- [x] No new `DECISIONS.md` entry — two-separate-tools (vs discriminated) was the recommended choice in the prior handoff and matches the existing pattern (e.g. `qb_invoice_delete` is its own tool, not a mode of `qb_invoice_update`).
+
+**Implementation notes**:
+- Tool layer in [src/tools/accounts.ts](src/tools/accounts.ts):
+  - `qb_account_make_inactive` is a thin wrapper around `session.modifyEntity("Account", { ListID, EditSequence, IsActive: false })`. Bare-minimum schema (just `listId` + `editSequence`) — operators wanting to mutate Name / AccountNumber / Description should still use `qb_account_update`.
+  - `qb_account_delete` wraps `session.deleteEntity("Account", listId)`. Tool description explicitly warns about real QB's 3260/3170 rejection for accounts with history and recommends `make_inactive` as the safer default.
+  - Both tools use the established try/catch pattern from Items 5/7/8/9 — `session.*Entity` errors surface as `isError: true` + structured `error` + `statusCode`.
+- Simulation in [src/session/simulation-store.ts](src/session/simulation-store.ts) — no changes needed. `handleMod`'s generic `{...modData}` spread already supports `IsActive` mutation; `handleListDel` already supports `Account` (the entityType is read from `ListDelType` and the per-entity store is generic).
+- Verified end-to-end with a 30-check inline script (deleted post-verification): A1–A9 make_inactive happy path including reversibility via `qb_account_update`; B1–B5 stale-EditSequence and unknown-listId error paths; C1–C4 delete happy path; D1/D2 delete error path; E1–E7 regressions for `qb_account_list` defaults, `qb_account_add` IsActive, `qb_account_update` non-IsActive fields, and shared `handleListDel` plumbing via Customer; F1–F3 Phase 3 Item 9 smoke. `npm run build` green throughout.
+
+---
 
 ### Item 9 — `qb_bill_pay` + `qb_bill_payment_list` _(Phase 3)_ — done 2026-04-26
 

@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (40 total)
+## Tools (42 total)
 
 ### Customers
 | Tool | Description |
@@ -28,11 +28,16 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 | `qb_vendor_delete` | Delete a vendor |
 
 ### Chart of Accounts
+
+`qb_account_make_inactive` is the preferred way to retire an account — it flips `IsActive: false` so the account hides from the default `qb_account_list` view but stays referenceable by historical transactions. `qb_account_delete` is a hard delete that real QB rejects (statusCode 3260/3170) for accounts with any transaction history; use it only for empty accounts created in error. Both wrap structured tool errors via `isError: true` + `statusCode` so stale `editSequence` (3170) and unknown `listId` (500) surface cleanly.
+
 | Tool | Description |
 |------|-------------|
-| `qb_account_list` | List accounts (filterable by type) |
+| `qb_account_list` | List accounts (filterable by type, defaults to active-only) |
 | `qb_account_add` | Create a new account |
-| `qb_account_update` | Update account details |
+| `qb_account_update` | Update account details (name / number / description / isActive) |
+| `qb_account_make_inactive` | Deactivate an account by ListID + EditSequence (sets IsActive: false). Reversible via `qb_account_update { isActive: true }`. |
+| `qb_account_delete` | Hard-delete an account by ListID. Fails for accounts with transaction history — use `qb_account_make_inactive` instead. |
 
 ### Invoices
 

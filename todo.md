@@ -30,7 +30,7 @@ So that everything below can actually be verified without a Windows box.
 
 ## Phase 4 — Missing tools / coverage gaps
 
-- [ ] **10.** Add `qb_account_delete` / `qb_account_make_inactive` — currently only list/add/update; needed to deactivate unused accounts (QB usually disallows hard delete if transactions exist, so `make_inactive` is the correct primary).
+- [x] **10.** Add `qb_account_delete` / `qb_account_make_inactive` — currently only list/add/update; needed to deactivate unused accounts (QB usually disallows hard delete if transactions exist, so `make_inactive` is the correct primary).
 - [ ] **11.** Add `qb_employee_delete` / `make_inactive` (currently only list/add/update).
 - [ ] **12.** Add missing transaction tools: `qb_sales_receipt_*`, `qb_credit_memo_*`, `qb_purchase_order_*`, `qb_journal_entry_*` (parser already declares `Ret` arrays for these, but no tool exposes them).
 - [ ] **13.** Add `qb_estimate_update`, `qb_estimate_delete`, `qb_estimate_convert_to_invoice` tools — currently only list/create.
