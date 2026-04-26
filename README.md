@@ -195,8 +195,8 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 |------|-------------|
 | `qb_company_info` | Run `CompanyQueryRq` for company name/legal name/address/fiscal year/tax form/EIN, plus session state (connected/simulationMode/sessionTicket/openedAt). Auto-connects on first call. |
 | `qb_balance_summary` | Balance summary across all accounts, grouped by AccountType in canonical QB order (Assets → Liabilities → Equity → Income → Expenses → NonPosting) with category subtotals (assets/liabilities/equity/income/expenses/netIncome). Optional `fromDate` / `toDate` (YYYY-MM-DD) — advisory in simulation mode (current snapshot only; surfaces an `asOfNote`). |
-| `qb_ar_aging` | Accounts receivable aging |
-| `qb_ap_aging` | Accounts payable aging |
+| `qb_ar_aging` | Accounts receivable aging — walks open invoices (`IsPaid !== true`, `BalanceRemaining > 0`), ages each by `(asOfDate − DueDate ?? TxnDate)`, buckets into `0-30` / `31-60` / `61-90` / `90+` days. Returns per-customer aging with bucket breakdown plus top-level `bucketTotals`. Optional `asOfDate` (YYYY-MM-DD, defaults to today). Single invoice = single bucket. |
+| `qb_ap_aging` | Accounts payable aging — walks open bills (`IsPaid !== true`, `AmountDue > 0`), ages each by `(asOfDate − DueDate ?? TxnDate)`, buckets into `0-30` / `31-60` / `61-90` / `90+` days. Returns per-vendor aging with bucket breakdown plus top-level `bucketTotals`. Optional `asOfDate` (YYYY-MM-DD, defaults to today). Single bill = single bucket. |
 | `qb_raw_query` | Execute raw QBXML queries |
 
 ### Session Management

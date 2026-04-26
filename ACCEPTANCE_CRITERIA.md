@@ -55,7 +55,7 @@ _(All Phase 4 in-scope items complete — Items 10, 11, 12, 13, 30. See Complete
 
 ## Phase 5 — Reporting
 
-_(Items 14, 21 done — see Completed below. Items 19, 20 still open per `todo.md`.)_
+_(Items 14, 19, 21 done — see Completed below. Item 20 still open per `todo.md`.)_
 
 ---
 
@@ -66,6 +66,50 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 19 — `qb_ar_aging` / `qb_ap_aging` — open-txn walk + 0-30 / 31-60 / 61-90 / 90+ buckets _(Phase 5)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] `qb_ar_aging` queries `Invoice` records (not `Customer.Balance`), filters to `IsPaid !== true && Number(BalanceRemaining) > 0`, and groups the survivors by `CustomerRef.FullName`.
+- [x] `qb_ap_aging` queries `Bill` records (not `Vendor.Balance`), filters to `IsPaid !== true && Number(AmountDue) > 0`, and groups the survivors by `VendorRef.FullName`. (Bills use `AmountDue` as the open-balance field — the bill-side equivalent of an invoice's `BalanceRemaining`.)
+- [x] Both tools age each open transaction by `daysOutstanding = floor((asOfDate − dueDate) / day)`, where `dueDate = txn.DueDate ?? txn.TxnDate ?? asOfDate`. Date math uses `Date.UTC` to avoid local-TZ drift on YYYY-MM-DD inputs.
+- [x] Bucket boundaries (real QB defaults): `daysOutstanding <= 30` → `0-30` (collapses negative/future-dated into current), `31..60` → `31-60`, `61..90` → `61-90`, `> 90` → `90+`. Verified at every boundary (0, 30, 31, 60, 61, 90, 91, −30 days).
+- [x] Single invoice/bill = single bucket (no per-line aging). Scope guard from handoff.
+- [x] Per-party rows: `{ name, balance, buckets: { "0-30", "31-60", "61-90", "90+" }, txnCount }`. Sorted by `balance` desc.
+- [x] Top-level response: `{ asOfDate, totalAccountsReceivable | totalAccountsPayable, bucketTotals, customers | vendors }`. `totalAccounts*` equals the sum of `bucketTotals` across all 4 buckets.
+- [x] Optional `asOfDate` zod param, regex-validated `YYYY-MM-DD` (matches Item 21's `ISO_DATE_RE` constant). Defaults to `new Date().toISOString().split("T")[0]` (today, UTC) when omitted.
+- [x] Schema rejects `04/26/2026`, `2026/04/26`; accepts `2026-04-26` and `{}`.
+- [x] DueDate fallback: an open invoice with no `DueDate` ages from `TxnDate` instead. Verified — created an invoice without `dueDate` (txnDate `2025-12-01`); `qb_ar_aging({ asOfDate: "2026-01-01" })` puts it in `31-60` (31 days from TxnDate).
+- [x] Both handlers wrapped in try/catch translating `QBXMLResponseError` → `{ success: false, statusCode, statusMessage }` with `isError: true` (Item 25 reference shape, opportunistic since the file was being rewritten anyway).
+- [x] Seed sanity: 2 unpaid seed invoices ($7500 Acme due 2024-12-01, $8500 Global Industries due 2024-12-15) with `asOfDate=2026-04-26` → `bucketTotals = { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 16000 }`, customers sorted Global → Acme.
+- [x] AP path with no seeded bills: empty `vendors`, `totalAccountsPayable === 0`, all bucket totals 0.
+- [x] AP path with 4 created bills hitting all 4 buckets ($100 / $200 / $400 / $800): per-bucket totals match exactly, single vendor row sums to $1500 with `txnCount === 4`.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `qb_balance_summary` (Item 21) — still emits canonical-ordered array, `Bank` first with total 165000, `subtotals.netIncome === -22800`.
+- [x] `qb_company_info` (Item 14) — auto-connect path still returns `Demo Co`.
+- [x] `qb_invoice_create` / `qb_bill_create` — still functional (verified by harness creating live entities, then querying them through the aging tools).
+
+**Documentation criteria**:
+- [x] README Reports & Queries table — `qb_ar_aging` / `qb_ap_aging` rows expanded to describe the open-txn walk, bucket bands, and `asOfDate` semantics.
+- [x] Tool descriptions in [src/tools/reports.ts](src/tools/reports.ts) accurately describe filtering rules, fallback behavior, bucket bands, and "single txn = single bucket" guarantee.
+- [x] No `ARCHITECTURE.md` change — no new pattern was introduced (open-txn walk is the obvious correct implementation; the Customer/Vendor `Balance` denormalized rollup was the bug).
+- [x] No `DECISIONS.md` change — bucket boundaries are straight from QB's documented summary aging report, not a tradeoff.
+
+**Verification commands**:
+```bash
+npm run build         # TypeScript clean
+node verify_item19.mjs   # 54/54 PASS — see HANDOFF.md "Last Session Summary" for the matrix
+```
+
+**Notes**:
+- `runReport` was deliberately not touched (handoff scope guard — that's Item 20).
+- `Terms` → `DueDate` derivation was deliberately not implemented (out of scope per handoff). Operator-supplied `DueDate` is the only path; absence falls back to `TxnDate`.
+- The seed customer rollup `Balance` ($26,700) doesn't match the seeded open-invoice total ($16,000) — known seed-data inconsistency the handoff flagged. Not a bug in this tool; the tool is correct to walk transactions, not the rollup.
+
+---
 
 ### Item 21 — `qb_balance_summary` canonical ordering + subtotals + advisory date range _(Phase 5)_ — done 2026-04-26
 

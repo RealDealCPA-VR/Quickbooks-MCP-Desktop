@@ -4,114 +4,133 @@ _Last updated: 2026-04-26_
 
 ## Last Session Summary
 
-- **Closed Phase 5, Item 21 — `qb_balance_summary` canonical AccountType ordering + subtotals + advisory date range** ([todo.md:44](todo.md#L44) checked). The tool no longer returns an order-fragile `Record<string, ...>`; it now emits a canonically-ordered array with category subtotals and surfaces an advisory `asOfNote` when date params are passed. Three changes in [src/tools/reports.ts](src/tools/reports.ts):
-  - **Canonical ordering constants** at [src/tools/reports.ts:11-26](src/tools/reports.ts#L11-L26). Six const arrays (`ASSET_TYPES`, `LIABILITY_TYPES`, `EQUITY_TYPES`, `INCOME_TYPES`, `EXPENSE_TYPES`, `NONPOSTING_TYPES`) compose into `CANONICAL_ACCOUNT_TYPES`, matching real QB's balance-summary report order: Bank → AccountsReceivable → OtherCurrentAsset → Inventory → FixedAsset → OtherAsset → AccountsPayable → CreditCard → OtherCurrentLiability → LongTermLiability → Equity → Income → OtherIncome → CostOfGoodsSold → Expense → OtherExpense → NonPosting. The same arrays double as the inputs to per-band subtotal sums (DRY).
-  - **Tool rewrite** at [src/tools/reports.ts:79-176](src/tools/reports.ts#L79-L176). Bucket accounts by `AccountType` into a `Map`, then walk `CANONICAL_ACCOUNT_TYPES` to emit non-empty groups in order. Empty groups are skipped (operator-friendly — real QB also hides empty bands). Anything with an unrecognized AccountType lands in a trailing `Other` bucket so nothing is silently dropped. Subtotals block computed from the same buckets via a `sumOf(types)` helper. New optional zod params `fromDate` / `toDate` with regex `^\d{4}-\d{2}-\d{2}$`. When either is passed, `asOfDateRange` populates with the unset side as `null`, and a string `asOfNote` is appended explaining that simulation balances are a snapshot. When neither is passed, `asOfDateRange: null` and `asOfNote` is omitted (JSON.stringify drops the `undefined` key naturally). Wrapped in try/catch translating `QBXMLResponseError` → structured `{ success: false, statusCode, statusMessage }` with `isError: true` (Item 25 reference shape, mirroring `qb_company_info`).
-  - **`round2` helper** at [src/tools/reports.ts:30](src/tools/reports.ts#L30). All numeric totals pass through it before serialization to keep float fuzz out of the response (e.g. `185000 + 72000 = 257000` rather than `257000.00000004`).
-- **README updated** — `qb_balance_summary` row in the Reports & Queries table at [README.md:197](README.md#L197) now describes canonical ordering, subtotals, and the advisory date params.
-- **ACCEPTANCE_CRITERIA.md** — Item 21 entry written and moved to Completed at the top of the Completed section. Phase 5 header updated to indicate Items 14 + 21 done, 19 + 20 still open.
-- **No DECISIONS.md / ARCHITECTURE.md change** — canonical ordering is straight from QB's documented report layout, not a tradeoff. `runReport` was deliberately not touched (the handoff scope guard); that debt belongs with Item 20.
-- **Verified.** `npm run build` green. Item 21 verification harness: 31/31 PASS. Coverage:
-  - `qb_balance_summary({})` returns balanceSummary as a 6-element array in canonical order: Bank → AccountsReceivable → AccountsPayable → Income → CostOfGoodsSold → Expense.
-  - Per-group totals match seed: Bank=165000 (Checking 45000 + Savings 120000), AccountsReceivable=26700, AccountsPayable=3700, Income=257000, CostOfGoodsSold=95000, Expense=184800.
-  - Per-group account name lists preserve seed insertion order.
-  - Subtotals: assets=191700, liabilities=3700, equity=0, income=257000, expenses=279800, **netIncome=−22800**.
-  - `asOfDateRange === null` and `asOfNote` absent when no dates passed.
-  - With `fromDate`+`toDate`: `asOfDateRange` populated, `asOfNote` mentions "Simulation mode", balances unchanged (advisory only).
-  - With `fromDate` alone: `asOfDateRange.to === null`, `asOfNote` still present.
-  - Zod schema (parsed directly via `z.object(schemaShape).safeParse`) rejects `"01/01/2026"`, accepts `"2026-01-01"`, accepts empty `{}`.
-  - Regression: `totalAccounts: 10`, `qb_company_info` still returns the seeded Demo Co with auto-connect.
+- **Closed Phase 5, Item 19 — `qb_ar_aging` / `qb_ap_aging` rewritten to walk open transactions and bucket by aging band** ([todo.md:42](todo.md#L42) checked). Both tools now do real aging instead of dumping `Customer.Balance` / `Vendor.Balance` rollups. Five changes in [src/tools/reports.ts](src/tools/reports.ts):
+  - **Aging-bucket helpers at module scope** ([src/tools/reports.ts:32-58](src/tools/reports.ts#L32-L58)). `BUCKET_KEYS` const tuple, `BucketKey` type, `emptyBuckets()` factory, `bucketFor(days)` → `0-30 | 31-60 | 61-90 | 90+`, plus `dateUTC(s)` and `daysBetween(asOfDate, dueDate)`. Date math uses `Date.UTC` to dodge local-TZ drift on YYYY-MM-DD inputs (regex pre-validates so `split("-").map(Number)` is safe). Negative `daysOutstanding` (asOfDate < dueDate, i.e. not yet due) collapses into the `0-30` band — matches QB's standard summary aging layout.
+  - **`qb_ar_aging` rewrite** ([src/tools/reports.ts:182-260](src/tools/reports.ts#L182-L260)). Queries `Invoice` (not `Customer`), filters to `IsPaid !== true && Number(BalanceRemaining) > 0`, ages each open invoice by `(asOfDate − DueDate ?? TxnDate ?? asOfDate)`, groups by `CustomerRef.FullName` into `{ name, balance, buckets, txnCount }` rows. Top-level response: `{ asOfDate, totalAccountsReceivable, bucketTotals, customers }`. Customers sorted by balance desc. `totalAccountsReceivable` derived from `bucketTotals` (single source of truth — sums always reconcile). Wrapped in try/catch translating `QBXMLResponseError` → `{ success: false, statusCode, statusMessage }` with `isError: true` (Item 25 reference shape, opportunistic since the file was being rewritten).
+  - **`qb_ap_aging` rewrite** ([src/tools/reports.ts:262-340](src/tools/reports.ts#L262-L340)). Same skeleton, swapped for `Bill` / `VendorRef` / `AmountDue`. Bills use `AmountDue` as the open-balance field — the bill-side equivalent of an invoice's `BalanceRemaining`. The handoff for Item 19 said both have `BalanceRemaining`; verified in [src/session/simulation-store.ts:954-955](src/session/simulation-store.ts#L954-L955) — bills only get `AmountDue + IsPaid`, not `BalanceRemaining`. Adjusted accordingly.
+  - **`asOfDate` zod param** — both tools accept `z.string().regex(ISO_DATE_RE).optional()` (reusing the same constant Item 21 added). Defaults to `new Date().toISOString().split("T")[0]` (today, UTC) when omitted. Schema rejects `04/26/2026`, `2026/04/26`; accepts `2026-04-26` and `{}`.
+  - **Tool descriptions tightened** ([src/tools/reports.ts:182](src/tools/reports.ts#L182), [src/tools/reports.ts:262](src/tools/reports.ts#L262)) — describe filtering rules, fallback behavior, bucket bands, and "single txn = single bucket" guarantee, so the LLM consumer (and future readers) can predict behavior from the description alone.
+- **README updated** — `qb_ar_aging` / `qb_ap_aging` rows in the Reports & Queries table at [README.md:198-199](README.md#L198-L199) now describe the open-txn walk, bucket bands, and `asOfDate` semantics.
+- **ACCEPTANCE_CRITERIA.md** — Item 19 entry written and placed at the top of the Completed section. Phase 5 header updated to "Items 14, 19, 21 done — Item 20 still open."
+- **No DECISIONS.md / ARCHITECTURE.md change** — bucket bands are straight from QB's documented summary aging report (not a tradeoff). The open-txn walk is the obvious correct implementation; the Customer/Vendor `Balance` rollup was the bug. `runReport` was deliberately not touched (handoff scope guard — that's Item 20).
+- **Verified.** `npm run build` green. Item 19 verification harness: **54/54 PASS**. Coverage:
+  - **AR seed sanity (asOfDate=2026-04-26)** — both seeded unpaid invoices (Acme $7500 due 2024-12-01, Global $8500 due 2024-12-15) land in `90+`. Total `$16,000`. `bucketTotals = { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 16000 }`. Customers sorted Global → Acme. `txnCount === 1` per row.
+  - **AR bucket boundaries (sweeping asOfDate over Acme's 2024-12-01 due date)** — every boundary verified: 0 / 30 / 31 / 60 / 61 / 90 / 91 / −30 days → `0-30` / `0-30` / `31-60` / `31-60` / `61-90` / `61-90` / `90+` / `0-30`. The `<= 30` band correctly absorbs negative-days (future-dated) txns.
+  - **`asOfDate` default** — no-arg call fills `asOfDate` with today (UTC). Seed still buckets in `90+`.
+  - **TxnDate fallback** — created an invoice with `txnDate=2025-12-01` and **no** `dueDate`. `qb_ar_aging({ asOfDate: "2026-01-01" })` puts the $1234 line in `31-60` (31 days from TxnDate). Confirms the `DueDate ?? TxnDate` chain.
+  - **AP empty path** — no seeded bills → `vendors: []`, `totalAccountsPayable: 0`, all bucket totals 0. No throws on empty Bill store.
+  - **AP created-bill path** — created 4 bills under "Office Supplies Inc" with due dates `2026-04-20 / 2026-03-01 / 2026-02-01 / 2025-01-01` and amounts `100 / 200 / 400 / 800`. With `asOfDate=2026-04-26`: `bucketTotals = { "0-30": 100, "31-60": 200, "61-90": 400, "90+": 800 }`, single vendor row sums to 1500 with `txnCount === 4`. All 4 bands exercised.
+  - **Zod schema** — both tools reject `04/26/2026` and `2026/04/26`; accept `2026-04-26` and `{}`. Validated by `z.object(schemaShape).safeParse(...)` (the verified-handler-bypass-zod gotcha from prior handoff).
+  - **Regression — Item 21** — `qb_balance_summary` still emits canonical-ordered array, `Bank` first with total 165000, `subtotals.netIncome === -22800`.
+  - **Regression — Item 14** — `qb_company_info` auto-connect path still returns `Demo Co`.
 
 ## Verify Before Continuing
 
 - [ ] **Build.** `npm run build` exits 0.
-- [ ] **`qb_balance_summary` returns canonical-ordered array.** No args; `body.balanceSummary` is an **array** (not object), entries `{ accountType, accounts, total }`. With seed: 6 groups in this exact order — `Bank`, `AccountsReceivable`, `AccountsPayable`, `Income`, `CostOfGoodsSold`, `Expense`. `body.balanceSummary[0].accountType === "Bank"` and `body.balanceSummary[0].total === 165000` are the cheap tripwires.
-- [ ] **`qb_balance_summary` subtotals correct.** No args; `body.subtotals.netIncome === -22800` (single number that exercises the income−expenses calc end-to-end). `body.subtotals.assets === 191700`, `body.subtotals.liabilities === 3700`. Proves the per-band sumOf walks the right type lists.
-- [ ] **`qb_balance_summary` date params populate `asOfDateRange` + `asOfNote`.** Call with `{ fromDate: "2026-01-01", toDate: "2026-04-26" }`. Returned `body.asOfDateRange.from === "2026-01-01"`, `body.asOfDateRange.to === "2026-04-26"`, `typeof body.asOfNote === "string"` and includes `"Simulation mode"`. Same call with no args → `body.asOfDateRange === null` and `"asOfNote" in body === false`. Proves the dateRangeRequested branch toggles correctly.
-- [ ] **`qb_company_info` regression — still returns Demo Co.** Auto-connect path untouched.
+- [ ] **`qb_ar_aging` seed sanity.** `qb_ar_aging({ asOfDate: "2026-04-26" })` returns `body.totalAccountsReceivable === 16000`, `body.bucketTotals["90+"] === 16000`, all other buckets 0, and `body.customers.length === 2` with Global Industries first ($8500). Cheap tripwire that the open-invoice walk is wired up. If this returns ~$26,700 (the customer rollup total), the fix didn't take.
+- [ ] **`qb_ar_aging` bucket boundary at +31 days.** `qb_ar_aging({ asOfDate: "2025-01-01" })` puts Acme's $7500 in `31-60`, not `0-30`. Cheap tripwire on the `bucketFor` boundary (off-by-one would surface as `0-30`).
+- [ ] **`qb_ap_aging` empty when no bills.** Fresh process, no bills created. `qb_ap_aging({ asOfDate: "2026-04-26" })` returns `body.vendors === []`, `body.totalAccountsPayable === 0`. Confirms the AP path doesn't pull from the (still-populated) Vendor `Balance` rollup.
+- [ ] **`qb_balance_summary` regression.** Still emits canonical-ordered 6-group array; `body.subtotals.netIncome === -22800`. Confirms the new helpers in `reports.ts` didn't shadow / conflict with Item 21's exports.
+- [ ] **`qb_company_info` regression.** Auto-connects, returns Demo Co.
 
 ## Next Task
 
-**Phase 5, Item 19 — `asOfDate` filtering on `qb_ar_aging` / `qb_ap_aging` with 0-30 / 31-60 / 61-90 / 90+ buckets** ([todo.md:42](todo.md#L42)).
+**Phase 5, Item 20 — `qb_pnl_report` and `qb_balance_sheet_report` via `GeneralSummaryReportQueryRq`** ([todo.md:43](todo.md#L43)).
 
-Current implementation lives at [src/tools/reports.ts:179-256](src/tools/reports.ts#L179-L256) (after the Item 21 rewrite shifted line numbers — verify by opening the file). Both tools currently:
-1. Accept `asOfDate` as an optional `z.string()` arg.
-2. Query `Customer` (or `Vendor`) entities filtered by `ActiveStatus: "ActiveOnly"`.
-3. Return a list of customers/vendors with `Balance > 0`, sorted by balance desc.
-4. **Ignore `asOfDate` entirely** (it just echoes back in the response).
+Today there are no real P&L or Balance Sheet tools. `qb_balance_summary` (Item 21) is account-balance grouping, not a true Balance Sheet report. The session's `runReport` plumbing exists but is stub-shaped:
 
-That's not aging — it's a balance dump. Real aging walks **open transactions** (invoices for AR, bills for AP) and ages each one independently from its `DueDate` to `asOfDate`.
+- [src/session/manager.ts:212-224](src/session/manager.ts#L212-L224) — `runReport` builds via `buildQueryRequest`, sends, calls `extractResponseData(response)` with no second arg, returns `data[0] ?? {}`. That's wrong for report responses — `GeneralSummaryReportQueryRq` returns a `ReportRet` block with `ReportTitle`, `ReportSubtitle`, `ReportBasis`, `NumRows`, `NumColumns`, `ColDesc[]`, `ReportData.DataRow[]`/`TextRow[]`/`SubtotalRow[]`/`TotalRow[]`. The current code returns `{}` because `extractResponseData` looks at the first `*Rs` element name and there's no `ReportRet` extraction path.
 
 ### Implementation shape
 
-1. **Switch the data source.** Don't query Customer/Vendor balance fields — query open invoices (AR) and open bills (AP) directly:
-   - AR: `session.queryEntity("Invoice", {})` then filter to `IsPaid === false` and `BalanceRemaining > 0`.
-   - AP: `session.queryEntity("Bill", {})` then filter to `IsPaid === false` and `BalanceRemaining > 0`.
-   - Both have `IsPaid` + `BalanceRemaining` populated by the simulation store today (Item 16 wired this for invoices, and the same compute path covers bills — verify in [src/session/simulation-store.ts](src/session/simulation-store.ts)). The HANDOFF.md regression suite already exercises invoice creation, so the open-invoice subset is reliable; bills less so (no seeded bills, only ones the operator creates in-session).
-2. **Compute days outstanding per transaction.** For each open txn:
-   - Effective due date = `txn.DueDate ?? txn.TxnDate` (DueDate is operator-supplied today; not all bills will have one — see Context Notes).
-   - `daysOutstanding = floor((asOfDate − dueDate) / day)`. If `asOfDate < dueDate` → `daysOutstanding < 0` (the txn is "current," not yet due). Treat as `0-30` band (or carve out an explicit `Future` / `NotYetDue` band — see scope guard).
-3. **Bucket boundaries** (real QB defaults):
-   - `0-30`: `daysOutstanding <= 30` (includes future-dated and on-time).
-   - `31-60`: `31 <= d <= 60`.
-   - `61-90`: `61 <= d <= 90`.
-   - `90+`: `d > 90`.
-4. **Aggregate per customer/vendor.** Group open txns by `CustomerRef.FullName` (AR) / `VendorRef.FullName` (AP). For each party, emit:
-   ```json
-   {
-     "name": "Acme Corporation",
-     "balance": 7500,
-     "buckets": { "current": 0, "31-60": 0, "61-90": 0, "90+": 7500 }
-   }
+1. **Builder.** `GeneralSummaryReportQueryRq` is structurally different from a list/txn query — see Intuit's spec. Skeleton:
+   ```xml
+   <GeneralSummaryReportQueryRq>
+     <GeneralSummaryReportType>ProfitAndLossStandard</GeneralSummaryReportType>
+     <ReportPeriod>
+       <FromReportDate>2026-01-01</FromReportDate>
+       <ToReportDate>2026-04-26</ToReportDate>
+     </ReportPeriod>
+     <ReportBasis>Accrual</ReportBasis>           <!-- or Cash -->
+     <SummarizeColumnsBy>TotalOnly</SummarizeColumnsBy>
+     <IncludeSubcolumns>0</IncludeSubcolumns>
+   </GeneralSummaryReportQueryRq>
    ```
-   (or keep `0-30` keying — bikeshed pick whichever reads cleanly). Sort by total balance desc.
-5. **Aggregate totals.** Top-level `bucketTotals: { "0-30": ..., "31-60": ..., "61-90": ..., "90+": ... }` summing across all parties. Plus existing `totalAccountsReceivable` / `totalAccountsPayable` (sum of all buckets).
-6. **`asOfDate` default** — today's date in `YYYY-MM-DD`. Add the same regex validation pattern used in Item 21 (`ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/`); promote that constant to module scope if you haven't already, or copy it locally.
+   Probably worth adding a `buildReportRequest(reportType, params, version)` to [src/qbxml/builder.ts](src/qbxml/builder.ts) instead of overloading `buildQueryRequest` — report rqs aren't list/txn queries and have their own param shape (`ReportPeriod`, `ReportBasis`, `SummarizeColumnsBy`, etc.).
+2. **Parser.** `ReportRet` rows are nested. Real shape (sketch):
+   ```
+   ReportRet
+     ReportTitle, ReportSubtitle, ReportBasis, NumRows, NumColumns
+     ColDesc[]   (one per column; first is usually "Label")
+     ReportData
+       DataRow[]    — RowData.value (the label) + ColData[].value (the numbers)
+       TextRow[]    — section headers ("Income", "Expenses")
+       SubtotalRow[] — group subtotals
+       TotalRow[]   — grand total
+   ```
+   Each row type is a sibling under `ReportData`, and they interleave to express the report's tree structure (Section header → Data rows → Subtotal → next section). Add a `extractReportData(response)` to [src/qbxml/parser.ts](src/qbxml/parser.ts) (parallel to `extractResponseData`) that pulls the `ReportRet` block out of the envelope and normalizes the row arrays. `arrayElements` registration: `ColDesc`, `DataRow`, `TextRow`, `SubtotalRow`, `TotalRow`, and probably `ColData`. fast-xml-parser strips empty elements, so empty `<ColData>` cells need a sentinel — see prior gotcha note.
+3. **Simulation store.** This is the harder half. Real QB walks every transaction through every account and aggregates by GL account into a tree (Income → ServiceIncome / SalesIncome → SubtotalRow; Expense → … → SubtotalRow; NetIncome → TotalRow). The simulation needs to do the same. Approach:
+   - Walk all `Invoice` / `SalesReceipt` / `CreditMemo` lines (income side) and `Bill` / `Check` / `CreditCardCharge` lines (expense side).
+   - Bucket each line's `Amount` under its `AccountRef.FullName` → look up that account's `AccountType`.
+   - For P&L: emit only Income / OtherIncome / CostOfGoodsSold / Expense / OtherExpense buckets. Compute NetIncome.
+   - For Balance Sheet: emit Asset / Liability / Equity buckets, derive NetIncome (Income − Expenses), close into Equity. Same canonical ordering as Item 21's `CANONICAL_ACCOUNT_TYPES`.
+   - `ReportPeriod.FromReportDate` / `ToReportDate` filter the transaction walk by `TxnDate`.
+4. **Tools.** Two new tools in [src/tools/reports.ts](src/tools/reports.ts):
+   - `qb_pnl_report` — `{ fromDate, toDate, basis }` (basis defaults to `"Accrual"`). Returns `{ reportTitle, reportPeriod, basis, sections: [{ name, accounts: [{ name, total }], subtotal }], netIncome }`.
+   - `qb_balance_sheet_report` — `{ asOfDate }`. Returns `{ reportTitle, asOfDate, sections: [...], totalAssets, totalLiabilities, totalEquity, netIncome }`.
+5. **Wrap in try/catch + `isError: true`** — same Item 25 reference shape Item 19 / Item 21 use.
 
-### Suggested response shape
+### Suggested response shape (P&L)
 
 ```json
 {
-  "asOfDate": "2026-04-26",
-  "totalAccountsReceivable": 26700,
-  "bucketTotals": { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 26700 },
-  "customers": [
-    { "name": "Acme Corporation", "balance": 7500,
-      "buckets": { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 7500 } },
-    { "name": "Global Industries", "balance": 8500,
-      "buckets": { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 8500 } }
-  ]
+  "reportTitle": "Profit & Loss",
+  "reportBasis": "Accrual",
+  "reportPeriod": { "from": "2026-01-01", "to": "2026-04-26" },
+  "sections": [
+    { "name": "Income",
+      "accounts": [{ "name": "Service Income", "total": 200000 }, { "name": "Product Sales", "total": 57000 }],
+      "subtotal": 257000 },
+    { "name": "Cost of Goods Sold",
+      "accounts": [{ "name": "Materials", "total": 95000 }],
+      "subtotal": 95000 },
+    { "name": "Expenses",
+      "accounts": [{ "name": "Office Supplies", "total": 8800 }, ... ],
+      "subtotal": 184800 }
+  ],
+  "grossProfit": 162000,
+  "netIncome": -22800
 }
 ```
 
-(Same shape for AP, swap `customers` → `vendors`, `totalAccountsReceivable` → `totalAccountsPayable`.)
+(Balance Sheet mirrors with Assets / Liabilities / Equity bands and `asOfDate`.)
 
 ### Scope guards
 
-- **Don't compute per-line aging.** A single invoice = a single bucket. Aging at the line-item level is not how QB's standard aging report works.
-- **Don't pull from the Customer/Vendor `Balance` field.** That's a denormalized rollup — using it for aging double-counts when an operator partially-pays an invoice (the customer's `Balance` updates but you also need the per-invoice `BalanceRemaining`). The whole point of Item 19 is to walk the open transactions.
-- **Don't wire DueDate computation from Terms.** Real QB derives `DueDate` from `TermsRef + TxnDate`. That's a separate piece of work. For Item 19, fall back to `TxnDate` when `DueDate` is missing and document it in the response (e.g. add a per-row `dueDateSource: "DueDate" | "TxnDate (fallback)"` if it helps debugging — optional).
-- **Don't touch `runReport`.** Same scope guard as Item 21 — `runReport` is the Item 20 problem.
+- **Don't try to render the QB report-row tree verbatim.** Real QB's `ReportRet` is a flat array of typed rows that visually reconstructs a tree via row types and indentation. The MCP consumer is an LLM, not a print preview — the simplified `sections[]` shape above is more useful and easier to compute. Keep the raw tree behind the parser; tools surface the simplified shape.
+- **Don't change `qb_balance_summary`'s output shape.** That tool is for a quick balance dump (Item 21). `qb_balance_sheet_report` is a separate, period-aware report. Both can coexist.
+- **Don't compute YTD vs custom periods generically.** P&L takes `from`/`to`. Balance Sheet takes `asOfDate`. Don't add a `period: "ytd" | "qtd" | "month"` shorthand — just take explicit dates.
+- **Don't build full MultiPeriod columns.** `IncludeSubcolumns=0`, `SummarizeColumnsBy=TotalOnly` only. MultiPeriod / class / customer slicing is a separate piece of work (real QB has 5+ axes you can pivot by — that's report tooling, not minimal P&L).
+- **Don't implement live-mode COM yet.** Item 1 (Phase 7) is the only place real QBXMLRP2 calls go. For Item 20, simulation-only is fine — when Phase 7 lands, the live `sendRequest` plumbing will replace the current throw and the parser path covers both modes equally.
 
-### After Item 19
-- 20: P&L + Balance Sheet via `GeneralSummaryReportQueryRq`. The `runReport` path at [src/session/manager.ts:213-225](src/session/manager.ts#L213-L225) is still stub-shaped — Item 20 has to actually parse `ReportRet` rows. This is where the transaction-walk problem (the same one Item 19 surfaces in miniature) gets solved generically.
-- After Phase 5 ships, Phase 6 plumbing items: 23 (env semantics), 25 (sweep tools to use the try/catch + `isError: true` shape that `qb_company_info` and `qb_balance_summary` already model), 26 (status code mapping), 27 (iterators), 28 (AccountType validation), 29 (input validation).
+### After Item 20
+
+- Phase 5 closes. Move to Phase 6: `23` (env semantics), `25` (sweep tool handlers to use the structured-error try/catch — Items 14, 19, 21 are now the reference; Item 25's job is to converge the rest), `26` (status code mapping table), `27` (iterators on large queries), `28` (AccountType enum validation — reuse Item 21's `CANONICAL_ACCOUNT_TYPES`), `29` (input validation: email/phone/postal/ISO date — Item 19 already added `ISO_DATE_RE` for date fields, so the date side of `29` overlaps).
 
 ## Context Notes
 
-- **Item 21 implementation details that affect future edits.**
-  - Canonical-order constants live at module scope in [src/tools/reports.ts:11-26](src/tools/reports.ts#L11-L26). When Item 28 lands (validate `AccountType` enum on `qb_account_add`), reuse `CANONICAL_ACCOUNT_TYPES` as the source of truth — don't duplicate the list in another file.
-  - The `Other` bucket at the end of `balanceSummary` is a future-proofing concern — if QB ever adds a new AccountType, accounts of that type will surface as `{ accountType: "Other", accounts: ["FullName [NewType]"], total: ... }` instead of being silently dropped. Don't remove this branch.
-  - `round2` is intentionally local to `reports.ts`. If a third report tool starts needing it, lift it to a shared util — but two callers isn't enough to justify the move.
-  - The shape change from `Record<string, ...>` to `Array<{ accountType, accounts, total }>` is intentionally breaking. Any future caller is expected to read by `accountType` field. No callers in the codebase today — the tool is consumed by an LLM via the MCP transport, which is fine with shape changes as long as the tool description stays accurate.
-- **Open-transaction filtering for Item 19.**
-  - The seed has 2 unpaid invoices: `T0000001-INV` (Acme, $7500, DueDate 2024-12-01) and `T0000002-INV` (Global Industries, $8500, DueDate 2024-12-15). Both are >90 days past due relative to today (2026-04-26), so the simplest sanity check is "AR aging puts $16,000 in the 90+ bucket and 0 elsewhere." The seeded customer `Balance` total is $26,700, which means there's $10,700 of phantom AR balance not backed by open invoices — that's expected (the seed sets customer balances independently from invoice history; that's a seed-data inconsistency that will surface once you switch the aging tool to walk invoices).
-  - **No seeded bills.** AP aging will return an empty `vendors` array on a fresh process unless the operator creates bills first. Fine — but the verification harness for Item 19 should create at least one bill via `qb_bill_create` to exercise the AP path. Use the `qb_bill_create` tool with a `dueDate` that puts it into a known bucket.
-  - `DueDate` is **operator-supplied** today, not auto-computed from Terms ([src/tools/bills.ts:190](src/tools/bills.ts#L190), [src/tools/bills.ts:266](src/tools/bills.ts#L266)). If `DueDate` is absent, fall back to `TxnDate`. Don't try to compute due dates from Terms — that's a separate piece of work (and a bigger one than it sounds; Terms can be standard or date-driven, see the seeded `StandardTerms` / `DateDrivenTerms` stores).
-- **Project conventions reminder** ([CLAUDE.md](CLAUDE.md) § Stable Code Conventions): TS strict, ESM with `.js` extensions on relative imports, every zod field has `.describe()`, every tool registered in [src/index.ts](src/index.ts) and listed in the README tool table, structured tool errors via try/catch + `isError: true` + `statusCode` (Item 21 + Item 14 are the reference shapes — keep the rest of the tools converging on this).
+- **Item 19 implementation details that affect future edits.**
+  - `BUCKET_KEYS` / `BucketKey` / `emptyBuckets` / `bucketFor` / `daysBetween` / `dateUTC` are all module-local in [src/tools/reports.ts](src/tools/reports.ts). If a third aging tool starts needing them (unlikely — there are only AR and AP), lift to a shared util. Two callers isn't enough yet.
+  - `daysBetween` deliberately uses `Date.UTC` to avoid the trap where `new Date("2026-04-26").getTime()` is interpreted as UTC midnight but `new Date(2026, 3, 26).getTime()` is interpreted as local midnight, and the difference depending on TZ can flip a boundary case (e.g. asOfDate=dueDate could land in `0-30` in UTC but `90+` if the local clock has already crossed midnight). Don't switch to `new Date(s).getTime()` — keep `Date.UTC`.
+  - `bucketFor` is `<= 30 / <= 60 / <= 90 / else` — the `<=` upper bounds are deliberate. Real QB's report says "31-60" inclusive on both sides; the math `daysOutstanding = floor(...)` puts boundary days on the lower-band side. Verified at every boundary in the harness.
+  - The `txnCount` field on per-party rows is debugging cheese — useful when a customer has 8 invoices spread across buckets and the operator needs to know how many txns make up the $X balance. Costs nothing to compute. Don't remove it.
+- **Bills use `AmountDue`, NOT `BalanceRemaining`.** [src/session/simulation-store.ts:950-956](src/session/simulation-store.ts#L950-L956) is the source of truth — `computeTotals` for `Bill` only sets `AmountDue` + `IsPaid`. The original Item 19 handoff said "Both have `IsPaid` + `BalanceRemaining` populated by the simulation store today" — that's wrong for bills. If a future task touches bill payment math, remember `AmountDue` is the open-balance field.
+- **Seed AR has a known $10,700 phantom balance.** Customer `Balance` rollup totals $26,700, but seeded open invoices total $16,000. The Item 19 tool walks invoices, so AR aging shows $16,000 — that's *correct*, the rollup was wrong. If a future task tries to reconcile, fix the seed (subtract $10,700 from the appropriate customer's seeded `Balance`), don't unfix the aging tool.
+- **Empty bill store on fresh process.** AP aging will return empty `vendors` until the operator (or a verification harness) creates bills via `qb_bill_create`. That's expected and correct — there are no seeded bills.
+- **Project conventions reminder** ([CLAUDE.md](CLAUDE.md) § Stable Code Conventions): TS strict, ESM with `.js` extensions on relative imports, every zod field has `.describe()`, every tool registered in [src/index.ts](src/index.ts) and listed in the README tool table, structured tool errors via try/catch + `isError: true` + `statusCode` (Items 14, 19, 21 are reference shapes — Item 25 is the sweep that converges the rest).
+- **Verification gotcha (carried)** — handlers captured via the `fakeServer` pattern do NOT pass through zod validation (the MCP SDK's `server.tool` wraps the handler with the schema, and we capture only the inner handler). Validate the zod schema separately by parsing it via `z.object(schemaShape).safeParse(...)` — the Item 19 harness uses this pattern; reuse it for Item 20.
 - **Verification gotcha (carried)** — `handleQuery` filters require **uppercase** `TxnID` / `RefNumber` / `FullName` in the filter object when calling `session.queryEntity` directly. Tools translate from lowercase correctly. Verification scripts that invoke captured handlers get this for free; ad-hoc `queryEntity` calls in throwaway debug code do not.
-- **Verification gotcha (new)** — handlers captured via the `fakeServer` pattern do NOT pass through zod validation (the MCP SDK's `server.tool` wraps the handler with the schema, and we capture only the inner handler). Item 19's harness should validate the zod schema separately by parsing it via `z.object(schemaShape).safeParse(...)` — see the Item 21 harness in the prior session's git diff for the exact pattern.
 
 ## Post-Task Chores
 
-When Item 19 lands: `npm run build` green, [REGRESSION_CHECKLIST.md](REGRESSION_CHECKLIST.md) walked (especially §3 Tool Surface to confirm aging buckets sum correctly; §1 Build for any new helper modules; existing `qb_balance_summary` / `qb_company_info` regressions still pass), Item 19 ticked in `todo.md`, `ACCEPTANCE_CRITERIA.md` entry written for Item 19 (acceptance: bucket totals correct, per-party aging correct, asOfDate honored, fallback to TxnDate when DueDate absent), Phase 5 status updated to "Items 14, 19, 21 done — Item 20 still open." Fresh `HANDOFF.md` pointing at Item 20 (P&L / Balance Sheet via `GeneralSummaryReportQueryRq` + the `runReport` parse work).
+When Item 20 lands: `npm run build` green, [REGRESSION_CHECKLIST.md](REGRESSION_CHECKLIST.md) walked (especially §3 Tool Surface for the new report tools, §4 QBXML Round-Trip for the `ReportRet` parsing path, §1 Build for the new builder/parser additions, existing `qb_ar_aging` / `qb_ap_aging` / `qb_balance_summary` / `qb_company_info` regressions still pass), Item 20 ticked in `todo.md`, `ACCEPTANCE_CRITERIA.md` entry written for Item 20 (acceptance: report period honored, sections in canonical AccountType order, NetIncome reconciles, Balance Sheet `asOfDate` honored, both modes structurally identical responses), Phase 5 status updated to "All Phase 5 done." Fresh `HANDOFF.md` pointing at the start of Phase 6 (Item 23 env semantics is the next quick win, then Item 25 is the bulk sweep).

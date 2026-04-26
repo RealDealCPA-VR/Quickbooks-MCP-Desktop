@@ -27,6 +27,36 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+// Aging-bucket helpers (qb_ar_aging / qb_ap_aging). Real QB defaults — single
+// invoice/bill = single bucket (no per-line aging). Negative daysOutstanding
+// (asOfDate < dueDate, i.e. not yet due) collapses into the 0-30 band, matching
+// QB's standard summary report layout.
+const BUCKET_KEYS = ["0-30", "31-60", "61-90", "90+"] as const;
+type BucketKey = typeof BUCKET_KEYS[number];
+
+const emptyBuckets = (): Record<BucketKey, number> => ({
+  "0-30": 0,
+  "31-60": 0,
+  "61-90": 0,
+  "90+": 0,
+});
+
+const bucketFor = (days: number): BucketKey => {
+  if (days <= 30) return "0-30";
+  if (days <= 60) return "31-60";
+  if (days <= 90) return "61-90";
+  return "90+";
+};
+
+// YYYY-MM-DD → ms since epoch via Date.UTC, avoiding local-TZ drift in
+// daysBetween. Inputs are pre-validated by ISO_DATE_RE, so split is safe.
+const dateUTC = (s: string): number => {
+  const [y, m, d] = s.split("-").map(Number);
+  return Date.UTC(y, m - 1, d);
+};
+const daysBetween = (asOfDate: string, dueDate: string): number =>
+  Math.floor((dateUTC(asOfDate) - dateUTC(dueDate)) / 86400000);
+
 export function registerReportTools(
   server: McpServer,
   getSession: () => QBSessionManager
@@ -180,38 +210,79 @@ export function registerReportTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_ar_aging",
-    "Get an accounts receivable aging summary showing outstanding customer balances.",
+    "Get an accounts receivable aging summary. Walks open invoices (IsPaid !== true, BalanceRemaining > 0), ages each by (asOfDate − DueDate ?? TxnDate), and buckets into 0-30 / 31-60 / 61-90 / 90+ days. Returns per-customer aging with bucket breakdown plus top-level bucket totals. Single invoice = single bucket (no per-line aging).",
     {
-      asOfDate: z.string().optional().describe("As-of date (YYYY-MM-DD, default today)"),
+      asOfDate: z.string().regex(ISO_DATE_RE).optional().describe("As-of date (YYYY-MM-DD). Defaults to today. Open invoices are aged from this date back to their DueDate (falling back to TxnDate when DueDate is missing)."),
     },
     async ({ asOfDate }) => {
       const session = getSession();
-      const customers = await session.queryEntity("Customer", {
-        ActiveStatus: "ActiveOnly",
-      });
+      try {
+        const effectiveAsOf = asOfDate ?? new Date().toISOString().split("T")[0];
+        const invoices = await session.queryEntity("Invoice", {});
 
-      const aging = customers
-        .filter((c) => Number(c.Balance ?? 0) > 0)
-        .map((c) => ({
-          customer: c.FullName ?? c.Name,
-          balance: Number(c.Balance ?? 0),
-          totalBalance: Number(c.TotalBalance ?? 0),
-        }))
-        .sort((a, b) => b.balance - a.balance);
+        type CustomerAging = {
+          name: string;
+          balance: number;
+          buckets: Record<BucketKey, number>;
+          txnCount: number;
+        };
 
-      const totalAR = aging.reduce((sum, c) => sum + c.balance, 0);
+        const byCustomer = new Map<string, CustomerAging>();
+        const bucketTotals = emptyBuckets();
 
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            asOfDate: asOfDate ?? new Date().toISOString().split("T")[0],
-            totalAccountsReceivable: totalAR,
-            customersWithBalance: aging.length,
-            aging,
-          }, null, 2),
-        }],
-      };
+        for (const inv of invoices) {
+          if (inv.IsPaid === true) continue;
+          const balance = Number(inv.BalanceRemaining ?? 0);
+          if (!(balance > 0)) continue;
+
+          const dueDate = String(inv.DueDate ?? inv.TxnDate ?? effectiveAsOf);
+          const days = daysBetween(effectiveAsOf, dueDate);
+          const bucket = bucketFor(days);
+
+          const ref = inv.CustomerRef as { FullName?: string } | undefined;
+          const name = ref?.FullName ?? "(unknown)";
+
+          let row = byCustomer.get(name);
+          if (!row) {
+            row = { name, balance: 0, buckets: emptyBuckets(), txnCount: 0 };
+            byCustomer.set(name, row);
+          }
+          row.balance = round2(row.balance + balance);
+          row.buckets[bucket] = round2(row.buckets[bucket] + balance);
+          row.txnCount += 1;
+          bucketTotals[bucket] = round2(bucketTotals[bucket] + balance);
+        }
+
+        const customers = [...byCustomer.values()].sort((a, b) => b.balance - a.balance);
+        const totalAccountsReceivable = round2(
+          BUCKET_KEYS.reduce((s, k) => s + bucketTotals[k], 0)
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              asOfDate: effectiveAsOf,
+              totalAccountsReceivable,
+              bucketTotals,
+              customers,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceQueryRq failed",
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -220,37 +291,79 @@ export function registerReportTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_ap_aging",
-    "Get an accounts payable aging summary showing outstanding vendor balances.",
+    "Get an accounts payable aging summary. Walks open bills (IsPaid !== true, AmountDue > 0), ages each by (asOfDate − DueDate ?? TxnDate), and buckets into 0-30 / 31-60 / 61-90 / 90+ days. Returns per-vendor aging with bucket breakdown plus top-level bucket totals. Single bill = single bucket (no per-line aging).",
     {
-      asOfDate: z.string().optional().describe("As-of date (YYYY-MM-DD, default today)"),
+      asOfDate: z.string().regex(ISO_DATE_RE).optional().describe("As-of date (YYYY-MM-DD). Defaults to today. Open bills are aged from this date back to their DueDate (falling back to TxnDate when DueDate is missing)."),
     },
     async ({ asOfDate }) => {
       const session = getSession();
-      const vendors = await session.queryEntity("Vendor", {
-        ActiveStatus: "ActiveOnly",
-      });
+      try {
+        const effectiveAsOf = asOfDate ?? new Date().toISOString().split("T")[0];
+        const bills = await session.queryEntity("Bill", {});
 
-      const aging = vendors
-        .filter((v) => Number(v.Balance ?? 0) > 0)
-        .map((v) => ({
-          vendor: v.FullName ?? v.Name,
-          balance: Number(v.Balance ?? 0),
-        }))
-        .sort((a, b) => b.balance - a.balance);
+        type VendorAging = {
+          name: string;
+          balance: number;
+          buckets: Record<BucketKey, number>;
+          txnCount: number;
+        };
 
-      const totalAP = aging.reduce((sum, v) => sum + v.balance, 0);
+        const byVendor = new Map<string, VendorAging>();
+        const bucketTotals = emptyBuckets();
 
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            asOfDate: asOfDate ?? new Date().toISOString().split("T")[0],
-            totalAccountsPayable: totalAP,
-            vendorsWithBalance: aging.length,
-            aging,
-          }, null, 2),
-        }],
-      };
+        for (const bill of bills) {
+          if (bill.IsPaid === true) continue;
+          const balance = Number(bill.AmountDue ?? 0);
+          if (!(balance > 0)) continue;
+
+          const dueDate = String(bill.DueDate ?? bill.TxnDate ?? effectiveAsOf);
+          const days = daysBetween(effectiveAsOf, dueDate);
+          const bucket = bucketFor(days);
+
+          const ref = bill.VendorRef as { FullName?: string } | undefined;
+          const name = ref?.FullName ?? "(unknown)";
+
+          let row = byVendor.get(name);
+          if (!row) {
+            row = { name, balance: 0, buckets: emptyBuckets(), txnCount: 0 };
+            byVendor.set(name, row);
+          }
+          row.balance = round2(row.balance + balance);
+          row.buckets[bucket] = round2(row.buckets[bucket] + balance);
+          row.txnCount += 1;
+          bucketTotals[bucket] = round2(bucketTotals[bucket] + balance);
+        }
+
+        const vendors = [...byVendor.values()].sort((a, b) => b.balance - a.balance);
+        const totalAccountsPayable = round2(
+          BUCKET_KEYS.reduce((s, k) => s + bucketTotals[k], 0)
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              asOfDate: effectiveAsOf,
+              totalAccountsPayable,
+              bucketTotals,
+              vendors,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "BillQueryRq failed",
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
