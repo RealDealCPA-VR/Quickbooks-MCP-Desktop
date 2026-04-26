@@ -336,50 +336,103 @@ export class SimulationStore {
   // -----------------------------------------------------------------------
 
   // Real QB derives all payment-application bookkeeping server-side: each
-  // AppliedToTxnAdd block reduces the named invoice's BalanceRemaining,
+  // AppliedToTxn block reduces the named invoice's BalanceRemaining,
   // bumps its AppliedAmount, flips IsPaid when the balance hits zero, and
   // moves the customer's Balance by the *applied* portion only (unapplied
   // payment becomes a customer credit). Mirroring that here keeps every
   // downstream view (qb_invoice_list, qb_ar_aging, qb_customer_list)
   // consistent regardless of mode.
   //
+  // Add path: read AppliedToTxnAdd off the payment, delete it, hand the
+  // line array to applyTxnApplications.
+  // Mod path (qb_payment_apply): handleMod reads AppliedToTxnMod off modData
+  // and calls applyTxnApplications directly with the same line shape.
+  //
   // Strict on missing TxnIDs (returns 500) — the operator explicitly named
   // a target, so silently dropping an orphan ref would let payments record
   // against ghosts. See DECISIONS.md 2026-04-25 entry.
-  //
-  // Phase 3 item 8 (qb_payment_apply, ReceivePaymentMod path) will reuse the
-  // same per-line bookkeeping in handleMod by calling a shared helper — for
-  // now this stays inline because there's only one call site.
   private applyReceivePayment(
     payment: StoredEntity
   ): { ok: true } | { ok: false; error: string } {
-    const totalAmount = Number(payment.TotalAmount ?? 0);
     const raw = payment.AppliedToTxnAdd;
     delete payment.AppliedToTxnAdd;
+    const lines = !raw
+      ? []
+      : Array.isArray(raw)
+        ? (raw as Record<string, unknown>[])
+        : [raw as Record<string, unknown>];
+    return this.applyTxnApplications(payment, lines);
+  }
 
-    if (!raw || (Array.isArray(raw) && raw.length === 0)) {
+  // Pure validation pass for AppliedToTxn lines. Splitting validation from
+  // mutation lets the qb_payment_apply path validate the new application set
+  // BEFORE reversing the existing one — so a doomed mod (orphan TxnID,
+  // overapplication) bails out cleanly without disturbing the payment state.
+  private validateTxnApplications(
+    lines: Record<string, unknown>[],
+    totalAmount: number
+  ): { ok: true } | { ok: false; error: string } {
+    if (lines.length === 0) return { ok: true };
+
+    const invoiceStore = this.getStore("Invoice");
+    for (const line of lines) {
+      const txnId = String(line.TxnID ?? "");
+      if (!txnId) {
+        return { ok: false, error: "AppliedToTxn requires TxnID" };
+      }
+      if (!invoiceStore.has(txnId)) {
+        return {
+          ok: false,
+          error: `Invoice "${txnId}" specified in AppliedToTxn cannot be found`,
+        };
+      }
+    }
+
+    // Overapplication guard — sum(applied) must not exceed TotalAmount. The
+    // qb_payment_receive tool enforces this at the schema layer too, but the
+    // qb_payment_apply path doesn't see TotalAmount at the tool layer, so the
+    // simulation is the authoritative gate.
+    const proposedSum = lines.reduce(
+      (acc, l) => acc + Number(l.PaymentAmount ?? 0),
+      0
+    );
+    if (proposedSum > totalAmount + 1e-9) {
+      return {
+        ok: false,
+        error: `sum(AppliedToTxn.PaymentAmount) = ${proposedSum} exceeds payment TotalAmount = ${totalAmount}`,
+      };
+    }
+
+    return { ok: true };
+  }
+
+  // Shared application engine used by both the Add path (applyReceivePayment)
+  // and the Mod path (handleMod ReceivePayment branch via qb_payment_apply).
+  // Two-pass: validate every TxnID first (atomicity — orphan in line N must
+  // NOT leave lines 1..N-1 mutated), then apply mutations + build *Ret entries
+  // + move customer balance + recompute AppliedAmount/UnusedPayment.
+  //
+  // Caller is responsible for reversing any prior application before calling
+  // this on the mod path — see reverseReceivePaymentApplication. The mod
+  // path validates first via validateTxnApplications so the reversal never
+  // runs on a request that's destined to fail.
+  private applyTxnApplications(
+    payment: StoredEntity,
+    lines: Record<string, unknown>[]
+  ): { ok: true } | { ok: false; error: string } {
+    const totalAmount = Number(payment.TotalAmount ?? 0);
+
+    const validation = this.validateTxnApplications(lines, totalAmount);
+    if (!validation.ok) return validation;
+
+    if (lines.length === 0) {
+      payment.AppliedToTxnRet = [];
       payment.AppliedAmount = 0;
       payment.UnusedPayment = totalAmount;
       return { ok: true };
     }
 
-    const lines = (Array.isArray(raw) ? raw : [raw]) as Record<string, unknown>[];
     const invoiceStore = this.getStore("Invoice");
-
-    // First pass: validate every TxnID before mutating any invoice state.
-    // Real QB transactions are atomic — if any application fails, none apply.
-    for (const line of lines) {
-      const txnId = String(line.TxnID ?? "");
-      if (!txnId) {
-        return { ok: false, error: "AppliedToTxnAdd requires TxnID" };
-      }
-      if (!invoiceStore.has(txnId)) {
-        return {
-          ok: false,
-          error: `Invoice "${txnId}" specified in AppliedToTxnAdd cannot be found`,
-        };
-      }
-    }
 
     // Second pass: apply mutations and build *Ret entries.
     let appliedSum = 0;
@@ -434,6 +487,63 @@ export class SimulationStore {
     payment.UnusedPayment = totalAmount - appliedSum;
 
     return { ok: true };
+  }
+
+  // Reverse a payment's existing application: undo every per-invoice bump
+  // and restore the customer balance. Used by the qb_payment_apply path
+  // (handleMod ReceivePayment) before applying the new application set.
+  // After this runs, the payment carries an empty AppliedToTxnRet and the
+  // invoices it touched are back to their pre-application BalanceRemaining /
+  // AppliedAmount / IsPaid state.
+  //
+  // Tolerates orphan TxnIDs in AppliedToTxnRet (silently skipped) — an
+  // invoice deleted between the original application and this reversal
+  // shouldn't block the operator from re-applying the payment elsewhere.
+  // Customer balance still reverses by the *named* applied amount even when
+  // the target invoice is gone, because the original Add path already moved
+  // the customer balance and we have to undo that side regardless.
+  private reverseReceivePaymentApplication(payment: StoredEntity): void {
+    const raw = payment.AppliedToTxnRet;
+    if (!raw) return;
+    const entries = (Array.isArray(raw) ? raw : [raw]) as Record<string, unknown>[];
+    if (entries.length === 0) return;
+
+    const invoiceStore = this.getStore("Invoice");
+    let reversedSum = 0;
+
+    for (const entry of entries) {
+      const txnId = String(entry.TxnID ?? "");
+      const paymentAmount = Number(entry.PaymentAmount ?? 0);
+      const discountAmount = Number(entry.DiscountAmount ?? 0);
+      reversedSum += paymentAmount;
+
+      const invoice = invoiceStore.get(txnId);
+      if (!invoice) continue;
+
+      invoice.BalanceRemaining =
+        Number(invoice.BalanceRemaining ?? 0) + paymentAmount + discountAmount;
+      invoice.AppliedAmount =
+        Number(invoice.AppliedAmount ?? 0) - paymentAmount;
+      invoice.IsPaid = invoice.BalanceRemaining === 0;
+    }
+
+    if (reversedSum > 0) {
+      const customerRef = payment.CustomerRef as Record<string, unknown> | undefined;
+      if (customerRef) {
+        this.adjustEntityBalance(
+          "Customer",
+          {
+            listID: customerRef.ListID ? String(customerRef.ListID) : undefined,
+            fullName: customerRef.FullName ? String(customerRef.FullName) : undefined,
+          },
+          +reversedSum
+        );
+      }
+    }
+
+    payment.AppliedToTxnRet = [];
+    payment.AppliedAmount = 0;
+    payment.UnusedPayment = Number(payment.TotalAmount ?? 0);
   }
 
   // -----------------------------------------------------------------------
@@ -660,6 +770,18 @@ export class SimulationStore {
       };
     }
 
+    // ReceivePayment mod (qb_payment_apply path) is application-only —
+    // no *LineMod shape, no header total to recompute. Reverse the existing
+    // application, apply the new one, merge any header fields, persist.
+    // Short-circuits before the Bill/Invoice line-mod plumbing because the
+    // AppliedToTxnMod block doesn't match the /^(.+?)Line(s?)Mod$/ regex
+    // and the rest of the path doesn't apply.
+    if (entityType === "ReceivePayment") {
+      return this.handleReceivePaymentMod(
+        rsType, retName, store, id, existing, modData
+      );
+    }
+
     // Apply *LineMod arrays (Bill and Invoice exercise this path).
     // The mod's line array becomes the entity's new line array, with
     // merge-by-TxnLineID semantics so a partial mod ("change just memo on
@@ -724,6 +846,106 @@ export class SimulationStore {
         existing, updated, oldPartyAmount
       );
     }
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { [retName]: updated },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // ReceivePayment mod handler (qb_payment_apply path)
+  // -----------------------------------------------------------------------
+
+  // ReceivePaymentMod with AppliedToTxnMod blocks re-applies a payment to a
+  // (possibly different) set of invoices. The flow is validate → reverse →
+  // apply, so a doomed mod (orphan TxnID, overapplication) never triggers
+  // the reversal:
+  //
+  //   1. Validate the new application set via validateTxnApplications. On
+  //      failure return 500 immediately — payment + invoices stay untouched.
+  //   2. Reverse the existing application (restore each named invoice's
+  //      BalanceRemaining / AppliedAmount / IsPaid; restore the customer
+  //      balance by the previously-applied sum).
+  //   3. Apply the new application via applyTxnApplications. Validation is
+  //      cheap to run twice; the second invocation re-validates before
+  //      mutating but is guaranteed to pass since nothing changed in step 2
+  //      that affects validation.
+  //   4. Merge header fields (Memo, RefNumber, TxnDate, etc.) onto the
+  //      payment, stripping AppliedToTxnMod (consumed in step 3).
+  //   5. Bump TimeModified + EditSequence and persist.
+  //
+  // TotalAmount is intentionally NOT re-derived from the application — the
+  // payment amount itself is immutable on this path. Changing the payment
+  // amount is a different operation (currently unsupported by any tool;
+  // the operator would have to delete + recreate).
+  private handleReceivePaymentMod(
+    rsType: string,
+    retName: string,
+    store: EntityStore,
+    id: string,
+    existing: StoredEntity,
+    modData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const rawMod = modData.AppliedToTxnMod;
+    const newLines = !rawMod
+      ? []
+      : Array.isArray(rawMod)
+        ? (rawMod as Record<string, unknown>[])
+        : [rawMod as Record<string, unknown>];
+
+    const totalAmount = Number(existing.TotalAmount ?? 0);
+    const validation = this.validateTxnApplications(newLines, totalAmount);
+    if (!validation.ok) {
+      return {
+        type: rsType,
+        statusCode: 500,
+        statusSeverity: "Error",
+        statusMessage: validation.error,
+        data: {},
+      };
+    }
+
+    this.reverseReceivePaymentApplication(existing);
+    const applyResult = this.applyTxnApplications(existing, newLines);
+    if (!applyResult.ok) {
+      // Defensive — validateTxnApplications passed, so apply should too.
+      // If invoice state changed between validate and apply (impossible
+      // single-threaded, but safer to surface than silently swallow).
+      return {
+        type: rsType,
+        statusCode: 500,
+        statusSeverity: "Error",
+        statusMessage: applyResult.error,
+        data: {},
+      };
+    }
+
+    // Merge header fields. AppliedToTxnMod is consumed; AppliedToTxnRet /
+    // AppliedAmount / UnusedPayment / TotalAmount are derived state that the
+    // mod must not overwrite (TotalAmount is immutable on this path).
+    const reservedKeys = new Set([
+      "AppliedToTxnMod",
+      "AppliedToTxnRet",
+      "AppliedAmount",
+      "UnusedPayment",
+      "TotalAmount",
+      "TxnID",
+      "EditSequence",
+    ]);
+    const headerMod = this.omitKeys(modData, reservedKeys);
+
+    const updated: StoredEntity = {
+      ...existing,
+      ...headerMod,
+      TimeModified: new Date().toISOString(),
+      EditSequence: this.nextEditSequence(),
+    };
+
+    store.set(id, updated);
 
     return {
       type: rsType,

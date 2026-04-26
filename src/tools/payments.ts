@@ -126,6 +126,73 @@ export function registerPaymentTools(
     }
   );
 
+  // -----------------------------------------------------------------------
+  // Apply payment to invoices (re-target an existing ReceivePayment)
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_payment_apply",
+    "Re-apply an existing ReceivePayment to a different set of invoices via ReceivePaymentMod + AppliedToTxnMod. Pass txnId + editSequence (from a prior qb_payment_list — EditSequence is strict, stale rejects with 3170) plus an applyTo array. The new applyTo set REPLACES the payment's existing application wholesale: invoices the payment was previously applied to are reversed (their BalanceRemaining / AppliedAmount / IsPaid restored), the new invoices receive the new application. Customer balance moves by the change in applied sum (new applied − old applied). Optional header fields (memo, refNumber, txnDate, paymentMethodName) propagate. TotalAmount is immutable on this path — to change the payment amount, delete and recreate. sum(applyTo.amount) > totalAmount rejects with statusCode 500.",
+    {
+      txnId: z.string().describe("TxnID of the ReceivePayment to re-apply"),
+      editSequence: z.string().describe("EditSequence from a prior qb_payment_list — must match or the mod is rejected with statusCode 3170"),
+      applyTo: z.array(appliedToSchema)
+        .describe("Replacement application set. Pass an empty array to fully unapply the payment (it becomes pure customer credit)."),
+      memo: z.string().optional().describe("New memo"),
+      refNumber: z.string().optional().describe("New reference/check number"),
+      txnDate: z.string().optional().describe("New payment date (YYYY-MM-DD)"),
+      paymentMethodName: z.string().optional().describe("New payment method"),
+    },
+    async (args) => {
+      const session = getSession();
+
+      const data: Record<string, unknown> = {
+        TxnID: args.txnId,
+        EditSequence: args.editSequence,
+      };
+
+      if (args.memo) data.Memo = args.memo;
+      if (args.refNumber) data.RefNumber = args.refNumber;
+      if (args.txnDate) data.TxnDate = args.txnDate;
+      if (args.paymentMethodName) {
+        data.PaymentMethodRef = { FullName: args.paymentMethodName };
+      }
+
+      data.AppliedToTxnMod = args.applyTo.map((line) => {
+        const lineData: Record<string, unknown> = {
+          TxnID: line.txnId,
+          PaymentAmount: line.amount,
+        };
+        if (line.discountAmount !== undefined && line.discountAmount > 0) {
+          lineData.DiscountAmount = line.discountAmount;
+          if (line.discountAccountName) {
+            lineData.DiscountAccountRef = { FullName: line.discountAccountName };
+          }
+        }
+        return lineData;
+      });
+
+      try {
+        const result = await session.modifyEntity("ReceivePayment", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, payment: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const statusCode = (err as { statusCode?: number })?.statusCode;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: message, statusCode }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   server.tool(
     "qb_payment_list",
     "List received payments in QuickBooks Desktop.",
