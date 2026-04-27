@@ -20,6 +20,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const purchaseOrderLineSchema = z
   .object({
@@ -75,8 +77,8 @@ export function registerPurchaseOrderTools(
       vendorListId: z.string().optional().describe("Filter by vendor ListID"),
       txnId: z.string().optional().describe("Fetch a specific PO by TxnID"),
       refNumber: z.string().optional().describe("Filter by reference/PO number"),
-      fromDate: z.string().optional().describe("Start date (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -98,13 +100,30 @@ export function registerPurchaseOrderTools(
       }
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
-      const purchaseOrders = await session.queryEntity("PurchaseOrder", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: purchaseOrders.length, purchaseOrders }, null, 2),
-        }],
-      };
+      try {
+        const purchaseOrders = await session.queryEntity("PurchaseOrder", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: purchaseOrders.length, purchaseOrders }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "PurchaseOrderQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -114,8 +133,8 @@ export function registerPurchaseOrderTools(
     {
       vendorName: z.string().optional().describe("Vendor full name"),
       vendorListId: z.string().optional().describe("Vendor ListID"),
-      txnDate: z.string().optional().describe("PO date (YYYY-MM-DD, default today)"),
-      dueDate: z.string().optional().describe("Expected delivery / due date (YYYY-MM-DD)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("PO date (YYYY-MM-DD, default today)"),
+      dueDate: z.string().regex(ISO_DATE_RE).optional().describe("Expected delivery / due date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("Reference/PO number"),
       memo: z.string().optional().describe("Memo"),
       shipToEntity: z.string().optional()
@@ -178,12 +197,17 @@ export function registerPurchaseOrderTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "PurchaseOrderAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -199,8 +223,8 @@ export function registerPurchaseOrderTools(
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
       vendorName: z.string().optional().describe("New vendor full name (re-points the PO at a different vendor)"),
       vendorListId: z.string().optional().describe("New vendor ListID"),
-      txnDate: z.string().optional().describe("New PO date"),
-      dueDate: z.string().optional().describe("New expected delivery date"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New PO date (YYYY-MM-DD)"),
+      dueDate: z.string().regex(ISO_DATE_RE).optional().describe("New expected delivery date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New memo"),
       shipToEntity: z.string().optional().describe("New ship-to address entity"),
@@ -253,12 +277,17 @@ export function registerPurchaseOrderTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "PurchaseOrderModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -283,12 +312,17 @@ export function registerPurchaseOrderTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "TxnDelRq (PurchaseOrder) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };

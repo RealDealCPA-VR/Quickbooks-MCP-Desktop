@@ -59,6 +59,12 @@ _(All Phase 5 items done — see Completed below.)_
 
 ---
 
+## Phase 6 — Plumbing, validation, ergonomics
+
+_(Items 23 + 25 + 26 + 27 + 28 + 29 done — see Completed below. Phase 6 fully closed.)_
+
+---
+
 _(Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
 
 ---
@@ -66,6 +72,259 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 27 — IteratorID / IteratorRemainingCount support on large queries _(Phase 6)_ — done 2026-04-27
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] `buildQueryRequest(entity, filters, { iterator: "Start" | "Continue" | "Stop", iteratorID? })` emits the iterator state as XML attributes on the `*QueryRq` element (e.g. `<CustomerQueryRq requestID="1" iterator="Continue" iteratorID="{abc}">`), NOT as child elements. requestID, filter children, and iterator attributes coexist on the same element.
+- [x] iteratorID values are XML-escaped when serialized (defensive — real QB iteratorIDs are GUIDs but the contract is "opaque string").
+- [x] `parseQBXMLResponse` surfaces `@_iteratorRemainingCount` and `@_iteratorID` from `*QueryRs` envelopes onto `QBXMLResponseBody.iteratorRemainingCount` (number) and `iteratorID` (string). `iteratorRemainingCount=0` (exhausted) round-trips correctly and is distinct from "absent."
+- [x] Responses without iterator attributes have neither field on the parsed `QBXMLResponseBody` (regression invariant — only set when the server explicitly emitted them).
+- [x] New `QBSessionManager.queryEntityPaginated(entity, filters, { iterator?, iteratorID? })` returns `{ entities, iteratorRemainingCount?, iteratorID? }`. Existing `queryEntity()` signature is unchanged — pure-additive API.
+- [x] Simulation `iterator="Start"` returns the full result set in one shot with `iteratorRemainingCount=0` and a synthesized `iteratorID` like `SIM-ITER-<time>-<rand>`. Sim does not actually page (seed data is small); the contract still matches what real QB looks like on a final page.
+- [x] Simulation `iterator="Continue"` and `iterator="Stop"` return `statusCode=1` empty data with no iterator metadata, mirroring how real QB treats an exhausted iterator.
+- [x] Tools `qb_customer_list`, `qb_invoice_list`, `qb_bill_list` accept `paginate?: boolean` + `iteratorID?: string`. When either is set, the response surfaces `iteratorRemainingCount` and `iteratorID` (when present) alongside the result array.
+- [x] `qb_item_list` accepts `paginate` + `iteratorID` but REQUIRES `itemType` when paginating — iterators are scoped to a single `Item*QueryRq`, so the multi-subtype fan-out path cannot paginate. Refusal returns `isError: true` with a structured `{ success: false, error: "..." }` payload before any session call.
+- [x] Caller's pagination loop: Start → response with iteratorID → Continue with that iteratorID until `iteratorRemainingCount === 0` or absent. The two-step loop completes correctly through the simulation.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] Non-paginated calls to `qb_customer_list` / `qb_invoice_list` / `qb_bill_list` / `qb_item_list` produce the EXACT same JSON shape as before — no `iteratorRemainingCount` or `iteratorID` keys leak into the default-path response.
+- [x] `qb_item_list` multi-subtype fan-out (no `itemType`, no `paginate`) still works and merges across all 5 stores.
+- [x] All other tools (`qb_account_list`, `qb_vendor_list`, `qb_estimate_list`, `qb_payment_list`, `qb_employee_list`, etc.) are untouched — they call `queryEntity` (legacy), which now passes `{ version }` instead of `version` directly to `buildQueryRequest`. The signature change is internal.
+- [x] Item 25/26 wrapper still fires for `*Query*` calls — manager's `queryEntityPaginated` re-throws `QBXMLResponseError` on hard failure, so tool wrappers translate it correctly.
+- [x] Item 29 schema validation still fires before the iterator path — `paginate: "yes"` would still be rejected by zod (boolean, not string).
+- [x] All four prior harnesses pass: env-matrix 99/99, pickup 7/7, error-shape 47/47, input-validation 44/44.
+
+**Documentation criteria**:
+- [x] No README change needed — pagination is an opt-in flag on existing tools, not a new tool. (The `qb_*_list` tool count and table are unchanged.)
+- [x] `instructions` block in `src/index.ts` not affected — pagination is a per-tool ergonomics layer, not a new capability surface.
+- [x] No `ARCHITECTURE.md` change — the QBXML envelope shape is unchanged; iterator attrs are part of the existing request-element contract. The two-mode session and tool-registration boundaries are untouched.
+- [x] No `DECISIONS.md` entry — the simpler-strategy choice (sim returns all in one shot) was already pre-approved in the HANDOFF outline, no new tradeoff to record.
+- [x] No `REQUIREMENTS.md` change — pagination is a wire-protocol fidelity feature, not a product behavior change.
+
+**Verification commands**:
+```bash
+npm run build
+node scripts/verify-item27-iterator.mjs        # 27/27 pass
+node scripts/verify-item29-input-validation.mjs # 44/44 pass (regression guard)
+node scripts/verify-item25-error-shape.mjs      # 47/47 pass (regression guard)
+node scripts/verify-pickup-2026-04-27.mjs       # 7/7 pass (regression guard)
+node scripts/verify-item23-env-matrix.mjs       # 99/99 pass (regression guard)
+```
+
+**Notes**:
+- The simpler-strategy simulation (return everything on Start, exhausted on Continue) is faithful enough for dev. If seed data ever grows past 500 records, switch to the faithful strategy: maintain a session-scoped iterator-state map keyed by iteratorID with cursor + page size. Until then, the contract round-trips cleanly.
+- `buildQueryRequest`'s 3rd arg signature changed from `version?: string` to `options?: { version?, iterator?, iteratorID? }`. The only caller was `manager.ts` (queryEntity + new queryEntityPaginated); both updated. Other builder helpers (`buildAddRequest`, `buildModRequest`, `buildDeleteRequest`, `buildReportRequest`) keep the legacy `version?: string` 3rd arg — only `buildQueryRequest` supports iterator.
+- `QBXMLRequestBody.attributes?: Record<string, string>` is the generic mechanism — currently only used for iterator state, but extends naturally if future QBXML versions add other request-element attributes.
+- `iteratorRemainingCount === 0` and "absent" mean different things: 0 = "you got the last page, iterator drained on this response"; absent = "this wasn't an iterator request, or the iterator was already drained on a prior request." The harness has explicit assertions for both.
+- The items-pagination refusal lives at the handler layer (not zod refinement) so the error message can explain WHY pagination needs itemType. Following the bills.ts pre-flight pattern from Phase 3.
+- Wire-level round-trip assertion (builder → sim → response) is the load-bearing one: it proves the three layers agree on `@_iterator` / `@_iteratorID` attribute names on the request side and `@_iteratorRemainingCount` / `@_iteratorID` on the response side. Two separate naming conventions (request vs response) — both verified end-to-end.
+
+---
+
+### Item 29 — Input format validation: email / phone / postal / ISO date _(Phase 6)_ — done 2026-04-27
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] Every `txnDate` / `dueDate` / `fromDate` / `toDate` / `asOfDate` / `hiredDate` / `invoiceTxnDate` / `invoiceDueDate` field across the tool surface rejects malformed input at the zod layer with `code: "invalid_string"` and the field name on `path[0]`. Confirmed: 11 representative tools (invoice/bill/estimate/sales-receipt/credit-memo/PO/JE/payment create + invoice list filter + employee add hiredDate + 3 reports) all reject malformed dates.
+- [x] Every contact-bearing tool (`qb_customer_add`/`update`, `qb_vendor_add`/`update`, `qb_employee_add`/`update`) rejects malformed `email` at zod (no `@`, no domain, leading/trailing `@`) with `code: "invalid_string"`.
+- [x] The same surfaces reject letters-only or too-short `phone` strings.
+- [x] `qb_customer_add` (billPostalCode) and `qb_vendor_add` (postalCode) reject too-short / junk-character postal codes.
+- [x] Schema rejection produces zod's default validation error (NOT the canonical Item 25 `{ statusCode, statusMessage, humanReadable? }` shape — that wrapper only runs on input that passed the schema). Same architectural split as Item 28.
+- [x] Valid input (`"2026-04-27"`, `"jane@example.com"`, `"(555) 123-4567"`, `"94110-1234"`, `"K1A 0B1"`) passes through every regex unchanged. End-to-end `qb_invoice_create` with valid args still succeeds.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `src/tools/reports.ts` no longer carries a local `ISO_DATE_RE` const — it now imports from `src/util/validators.js`. `qb_pnl_report` / `qb_balance_sheet_report` / `qb_ar_aging` / `qb_ap_aging` / `qb_balance_summary` all still reject malformed dates (Item 19/21 regression guard — the regex moved, behavior didn't).
+- [x] Item 25 wrapper still produces canonical structured payloads on QB-side errors. Item 28 enum validation still fires for `qb_account_add`. The two existing harnesses (`verify-item25-error-shape.mjs`, `verify-pickup-2026-04-27.mjs`) both pass unchanged.
+- [x] Seed data still loads (3 customers / 2 vendors / 0 invoices / 0 bills baseline preserved).
+- [x] No existing tool surface changed — the schemas got more restrictive on additive paths only. Filter paths (e.g. `qb_invoice_list`'s `fromDate`) tightened too because malformed filter dates previously silently matched nothing; now they fail loudly at zod.
+- [x] `npm run build` passes.
+
+**Documentation criteria**:
+- [x] No README change — tool surface didn't change, only schema strictness.
+- [x] No `instructions` block change in `src/index.ts` — same.
+- [x] No `ARCHITECTURE.md` / `DECISIONS.md` / `REQUIREMENTS.md` change — input validation is a refinement of existing schemas, not a new architectural pattern. The split between zod-layer rejection and Item 25 wrapper is documented in the harness comment and the Item 28 acceptance entry below.
+- [x] `src/util/validators.ts` carries the rationale for permissive vs strict regex shapes inline.
+
+**Verification commands**:
+```bash
+npm run build
+node scripts/verify-item29-input-validation.mjs    # 44/44 pass
+node scripts/verify-item25-error-shape.mjs         # 47/47 pass (unchanged)
+node scripts/verify-pickup-2026-04-27.mjs          # 7/7 pass (unchanged)
+node scripts/verify-item23-env-matrix.mjs          # 99/99 pass (unchanged)
+```
+
+**Notes**: Postal regex coverage matched HANDOFF.md's earlier "bill+ship in create + update" estimate only partially — only `customers.ts:billPostalCode` (create) and `vendors.ts:postalCode` (create) actually exist. The update paths for both don't expose a postal field. No `shipPostalCode` exists. Total swept: 44 date fields, 6 email, 6 phone, 2 postal — all from a single shared regex const each, so future tools that add a date/email/phone/postal field just import the regex; no decision tree.
+
+The simulation store doesn't need to change — it already accepts whatever string gets through, and now zod is gate-keeping shape correctness one layer earlier. QB itself will continue to do semantic validation on the live side (e.g. "this date is in a closed period").
+
+---
+
+### Item 28 — Validate `AccountType` enum in `qb_account_add` _(Phase 6)_ — done 2026-04-27
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] `accountType` argument on `qb_account_add` is now `z.enum(ACCOUNT_TYPES)` (was `z.string()`) at [src/tools/accounts.ts:73-75](src/tools/accounts.ts#L73-L75). The local `ACCOUNT_TYPES` const at [src/tools/accounts.ts:10-15](src/tools/accounts.ts#L10-L15) covers all 16 canonical QB types: `Bank, AccountsReceivable, OtherCurrentAsset, FixedAsset, OtherAsset, AccountsPayable, CreditCard, OtherCurrentLiability, LongTermLiability, Equity, Income, CostOfGoodsSold, Expense, OtherIncome, OtherExpense, NonPosting`.
+- [x] Calling the schema with an unknown type rejects at zod with `code: "invalid_enum_value"`, `path: ["accountType"]`, `options: <16-element array>`, and a message that lists all 16 canonical values verbatim (e.g. `"Invalid enum value. Expected 'Bank' | 'AccountsReceivable' | ... | 'NonPosting', received 'Garbage'"`). The LLM caller can self-correct from the message alone.
+- [x] All 16 canonical types still parse successfully (no off-by-one in the enum membership).
+- [x] End-to-end happy path: `qb_account_add({ name, accountType: "Bank" })` returns `{ success: true, account: ... }` exactly as before. The wrapper at [src/tools/accounts.ts:91-114](src/tools/accounts.ts#L91-L114) is unchanged.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `npm run build` green.
+- [x] [scripts/verify-item25-error-shape.mjs](scripts/verify-item25-error-shape.mjs) extended from 44 → 47 checks (3 new Item 28 assertions: schema rejects unknown with canonical list in error; schema accepts every canonical type; end-to-end add with `Bank` still succeeds). 47/47 pass.
+- [x] [scripts/verify-pickup-2026-04-27.mjs](scripts/verify-pickup-2026-04-27.mjs) — 7/7 pass. Reports / aging / company-info untouched.
+- [x] [scripts/verify-item23-env-matrix.mjs](scripts/verify-item23-env-matrix.mjs) — 99/99 pass. Item 23 unaffected.
+- [x] Existing 10 seed accounts in the simulation store still pass through `qb_account_list` unchanged (their `AccountType` strings are all canonical, so no migration needed).
+- [x] `qb_account_list`'s `accountType` filter remains `z.string().optional()` — intentional: a filter that silently matches nothing on a typo is the same observable behavior as it was before. Only the additive create path needed strictness.
+
+**Documentation criteria**:
+- [x] No README change — the tool's external contract (name, return shape) is unchanged; only the input is narrowed.
+- [x] No `instructions` block change in [src/index.ts](src/index.ts) — same reason.
+- [x] No `ARCHITECTURE.md` / `DECISIONS.md` change — narrowing a zod type is local hygiene, not a structural shift.
+- [x] `todo.md` Item 28 checkbox flipped.
+
+**Verification commands**:
+```bash
+npm run build
+node scripts/verify-item25-error-shape.mjs   # 47/47 pass
+node scripts/verify-pickup-2026-04-27.mjs    # 7/7 pass
+node scripts/verify-item23-env-matrix.mjs    # 99/99 pass
+```
+
+**Notes**:
+- One-line change in tool code, three new harness assertions, ~25 lines of harness scaffolding (the fakeServer pattern was extended to capture schemas in addition to handlers — the carry-over from HANDOFF context note "handlers captured via the fakeServer pattern do NOT pass through zod validation"). The schemas Map keeps schema-level checks self-contained without booting an MCP transport.
+- The rejection happens at SDK registration / dispatch time, NOT in the Item 25 wrapper. So the response shape on invalid input is the SDK's default validation error, not the canonical `{ statusCode, statusMessage, humanReadable? }` shape. This is intentional and noted in the harness comment — Item 25's invariant ("every wrapper produces canonical structured payload") still holds because the wrapper never runs on schema-rejected input.
+- Did NOT consolidate with Item 21's `CANONICAL_ACCOUNT_TYPES` in [src/tools/reports.ts:17-24](src/tools/reports.ts#L17-L24) per HANDOFF guidance — that one is a `readonly string[]` ordered for report grouping (Bank → AR → ... → Equity → Income → ... → Expense), a different shape with different semantic intent. Kept the local `accounts.ts` const.
+
+---
+
+### Item 26 — Status-code mapping table for QB errors _(Phase 6)_ — done 2026-04-27
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] New util module [src/util/qb-status-codes.ts](src/util/qb-status-codes.ts) exports `qbStatusCodeMessage(statusCode: number): string | undefined`. Lookup-table-driven (not switch).
+- [x] Table covers every status code the simulation store actually emits in error paths. Audit: `grep -E "statusCode: [0-9]+" src/session/simulation-store.ts` finds codes `0, 1, 500, 3030, 3120, 3170`. The wrapper only fires on throw, so success codes (`0`) and the parser's "no records" non-error (`1`, converted to `{}` in [src/qbxml/parser.ts:154-159](src/qbxml/parser.ts#L154-L159)) never reach the lookup. Error codes covered: `500, 3030, 3120, 3170`.
+- [x] Table also covers `3260` (insufficient permission) for forward-compat with live mode — real QB returns this when an account/employee delete is blocked by transaction history.
+- [x] Every Item 25 wrapper across the 15 tool files attaches `humanReadable: <string>` to the canonical error response when `qbStatusCodeMessage(e.statusCode ?? -1)` returns a string. Spread is conditional: `...(humanReadable ? { humanReadable } : {})` — no `humanReadable: undefined` field on the wire.
+- [x] When the throw carries an unknown statusCode (or the `-1` fallback for non-`QBXMLResponseError` throws), the response has no `humanReadable` field at all — silent on unknowns, present on knowns.
+- [x] Estimate convert special-case: the `markAcceptedError` partial-state object (the third session call in `qb_estimate_convert_to_invoice`, which intentionally allows failure without rolling back the invoice) also gets `humanReadable` attached. Type widened to `{ statusCode: number; statusMessage: string; humanReadable?: string }`.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `npm run build` green.
+- [x] [scripts/verify-item25-error-shape.mjs](scripts/verify-item25-error-shape.mjs) extended from 39 → 44 checks (5 new humanReadable assertions: 2 direct lookup-table sanity + 2 wrapper-integration with known codes + 1 wrapper-integration with synthetic non-QBXML throw asserting absent field). 44/44 pass.
+- [x] [scripts/verify-pickup-2026-04-27.mjs](scripts/verify-pickup-2026-04-27.mjs) — 7/7 pass. Confirms reports / aging / company-info untouched.
+- [x] [scripts/verify-item23-env-matrix.mjs](scripts/verify-item23-env-matrix.mjs) — 99/99 pass. Item 23 unaffected.
+- [x] All 71 wrapper callsites have humanReadable attached (one-to-one match: 71 `statusMessage: e.message` ↔ 71 `...(humanReadable ? ...)`). Pre-flight validation blocks (the `error: "Either customerName ..."` shape that predates Item 25, used in invoices / sales-receipts / credit-memos / estimates / payments / bills / purchase-orders) intentionally do NOT get the spread — they have no statusCode and `humanReadable` isn't in scope.
+
+**Documentation criteria**:
+- [x] No README change — internal contract, not tool-surface.
+- [x] No `instructions` block change in [src/index.ts](src/index.ts).
+- [x] No `ARCHITECTURE.md` / `DECISIONS.md` change — adding a lookup table is local hygiene, not a structural shift.
+- [x] `todo.md` Item 26 checkbox flipped.
+
+**Verification commands**:
+```bash
+npm run build
+node scripts/verify-item25-error-shape.mjs   # 44/44 pass
+node scripts/verify-pickup-2026-04-27.mjs    # 7/7 pass
+node scripts/verify-item23-env-matrix.mjs    # 99/99 pass
+```
+
+**Notes**:
+- No helper introduced. Each wrapper adds two lines: `const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);` after the existing `const e = err as { ... };`, and `...(humanReadable ? { humanReadable } : {})` inside the JSON response object. Same reasoning as Item 25 — abstracting ~30 callsites would obscure which QBXML op each tool runs.
+- The lookup-table approach (vs. switch statement) lets future agents audit table contents trivially: open `src/util/qb-status-codes.ts`, read the object literal, done. No hidden codepaths.
+- Closing-pattern replace_all initially over-matched 11 pre-flight validation blocks (those `if (!args.customerName) return { ..., error: "...", isError: true }` early-returns share the same closing shape as the wrapper). Those were reverted in a follow-up sweep — `humanReadable` would have been a TS error there since the validation runs before any `const humanReadable` declaration. Kept the over-match → revert pattern documented here so future sweeps know to check.
+
+---
+
+### Item 25 — Structured-error sweep across CRUD tools _(Phase 6)_ — done 2026-04-27
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] Every `session.queryEntity / addEntity / modifyEntity / deleteEntity` call across `src/tools/*.ts` is wrapped in try/catch — verified by grep: 0 unwrapped session calls remain.
+- [x] Every wrapped error path produces the canonical Item 25 shape: `{ success: false, statusCode: number, statusMessage: string }` with `isError: true`. Non-Error throws (no `.statusCode`) get `statusCode = -1` per the reference; the `statusMessage` falls back to a per-op label naming the operation that failed (e.g. `"BillModRq failed"`, `"TxnDelRq (Invoice) failed"`, `"ListDelRq (Customer) failed"`).
+- [x] Real `QBXMLResponseError` instances (the simulation's failure shape) propagate their `statusCode` and `message` faithfully — confirmed in [scripts/verify-item25-error-shape.mjs](scripts/verify-item25-error-shape.mjs): "not found" cases return `statusCode=500`, JE imbalance returns `statusCode=3030`.
+- [x] Tools that previously had a bespoke wrapper using the legacy `{ success: false, error, statusCode }` shape were normalized to the canonical `{ statusCode, statusMessage }` shape so all tools converge. Touched: `accounts.ts` (make_inactive + delete), `bills.ts` (update + bill_pay), `credit-memos.ts` (create + update + apply + delete), `employees.ts` (make_inactive + delete), `estimates.ts` (update + delete + convert's two inner wrappers), `invoices.ts` (update), `journal-entries.ts` (all four), `payments.ts` (receive + apply), `purchase-orders.ts` (create + update + delete), `sales-receipts.ts` (create + update + delete).
+- [x] Tools that had no wrapper got one: `customers.ts` (all four), `vendors.ts` (all four), `items.ts` (all four), `lists.ts` (all six), `accounts.ts` (list + add + update), `employees.ts` (list + add + update), `bills.ts` (list + create + delete + bill_payment_list), `invoices.ts` (list + create + delete), `payments.ts` (payment_list), `estimates.ts` (list + create + convert's queryEntity for source estimate), `sales-receipts.ts` (list), `credit-memos.ts` (list), `purchase-orders.ts` (list).
+- [x] Tool families covered: customers, vendors, accounts, employees, items, invoices, bills, bill payments, payments, estimates, sales receipts, credit memos, purchase orders, journal entries, lists (Class / Terms / PaymentMethod / SalesRep / CustomerType / VendorType). Reports (Item 14, 19, 20, 21) was the reference shape — no changes needed there.
+- [x] `qb_estimate_convert_to_invoice` retains its multi-step shape: the markAccepted side-effect is allowed to fail without rolling back the invoice creation; the partial-state response now uses `markAcceptedError: { statusCode, statusMessage }` (was `{ message, statusCode }`) — same partial semantics, normalized field names.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `npm run build` passes (no TypeScript errors).
+- [x] Pickup verification harness `scripts/verify-pickup-2026-04-27.mjs` (7 checks: P&L empty, P&L populated, Balance Sheet identity, balance summary, AR/AP aging, company info) still 7/7 PASS.
+- [x] Item 23 env-matrix harness `scripts/verify-item23-env-matrix.mjs` still 99/99 PASS.
+- [x] New harness `scripts/verify-item25-error-shape.mjs` exercises 19 error paths + 20 happy-path smokes across every CRUD tool family — 39/39 PASS.
+- [x] Happy-path response shapes (the `count + <entityArray>` envelope) unchanged — confirmed by the 20 happy-path smokes asserting the previous fields still exist.
+- [x] No tool's success path regresses to `isError: true` (the wrapper only changes the failure path).
+
+**Documentation criteria**:
+- [x] No README change — the error-shape change is internal contract, not user-facing tool surface.
+- [x] No `instructions` block change in src/index.ts — same reason.
+- [x] No `ARCHITECTURE.md` change — wrapping handler bodies in try/catch is local hygiene, not a structural shift.
+- [x] No `DECISIONS.md` change — the "no wrapper helper" choice was already noted in HANDOFF.md context (~120 lines saved isn't worth the abstraction across 20 callsites). Documented inline in the per-tool code.
+
+**Verification commands**:
+```bash
+npm run build
+node scripts/verify-item25-error-shape.mjs
+node scripts/verify-pickup-2026-04-27.mjs
+node scripts/verify-item23-env-matrix.mjs
+```
+
+**Notes**:
+- The reference shape from HANDOFF.md was carried verbatim across all wrappers. No helper introduced — six lines of boilerplate per call × ~30 wrappers = ~180 lines of repetition, but extracting a `wrapSessionCall` helper would have replaced that with an indirection that obscures which operation each tool runs. The trade was worth it: every tool's error branch is locally readable, and grep for `statusMessage: e.message ?? "<op>` lists every operation in the codebase.
+- The fallback `statusMessage` label for each call uses real QBXML request names (`InvoiceQueryRq`, `BillModRq`, `TxnDelRq (Invoice)`, `ListDelRq (Customer)`) rather than tool names. Rationale: when a real `QBXMLResponseError` propagates, its message is QB's own (e.g. `"Object 'NOPE' specified in the request cannot be found"`) — that wins. The fallback only fires when something throws a plain `Error` without `.statusCode`, which in practice is unexpected internal failures (TypeError, etc.). Naming the QBXML op makes the tool's structural place in the QBXML protocol traceable from the error alone.
+- Item 26 (`qbStatusCodeMessage(code)` lookup util) is the natural follow-on. Every wrapper currently surfaces the raw `e.message` from QB; a future wrapper can attach a `humanReadable` field by passing the statusCode through a small lookup table. The wrapper sites are already uniform, so adding `humanReadable` is a single sweep across the same callsites.
+- Item 25 sweep target list (per HANDOFF context note) was complete: customers, vendors, accounts, invoices, bills, items, payments, estimates, sales-receipts, credit-memos, purchase-orders, journal-entries, employees, lists were all touched. Reports already conformed (no changes).
+- The `qb_estimate_convert_to_invoice` flow has two side effects (invoice creation + markAccepted). Per HANDOFF "Item 25 reference shape" guidance, the second side effect is allowed to fail without rolling back the first — that's the partial-state semantics callers already depend on. The wrapper normalization preserved that semantic; only the field names in `markAcceptedError` changed (`{ message, statusCode }` → `{ statusCode, statusMessage }`). If a future caller depended on the old `markAcceptedError.message` field name, they'll see `markAcceptedError.statusMessage` now.
+
+
+### Item 23 — `QB_SIMULATION` env semantics _(Phase 6)_ — done 2026-04-27
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] `resolveSimulationMode(env, platform)` exported from [src/session/manager.ts](src/session/manager.ts) is a pure function that returns the boolean per the documented rule: `QB_SIMULATION="true"` forces simulation, `QB_SIMULATION="false"` forces live, otherwise simulate unless `platform === "win32" && QB_LIVE === "1"`.
+- [x] Constructor calls `resolveSimulationMode(process.env, process.platform)` — no inline boolean expression.
+- [x] On non-Windows with `QB_SIMULATION=false`, the constructor sets `simulationMode=false`; subsequent `openSession()` throws "Live QuickBooks connection requires Windows…" (verified: `node -e` smoke confirms the throw).
+- [x] On Windows with `QB_SIMULATION=false` and `QB_LIVE` unset, the resolver returns `false` (was `true` before — that was the surprising behavior the task targeted).
+- [x] On Windows with `QB_SIMULATION=true`, the resolver returns `true` regardless of `QB_LIVE` (forced override preserved).
+- [x] Any `QB_SIMULATION` value other than `"true"` / `"false"` (e.g. `"1"`, `"yes"`, `""`) is treated as unset and defers to the platform/QB_LIVE rule.
+- [x] Any `QB_LIVE` value other than `"1"` is treated as not-set when resolving the default branch (tightened from the prior `!process.env.QB_LIVE` truthiness check, which would have wrongly accepted `QB_LIVE="0"` as opting into live).
+- [x] Matrix harness `scripts/verify-item23-env-matrix.mjs` exercises 90 combinations (3 platforms × 6 `QB_SIMULATION` × 5 `QB_LIVE`) plus 9 canonical cases — all 99 pass.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `npm run build` passes.
+- [x] Pickup verification harness `scripts/verify-pickup-2026-04-27.mjs` (7 checks: P&L empty, P&L populated, Balance Sheet identity, balance summary regression, AR/AP aging, company info) still 7/7 PASS — Item 23 is constructor-side only and doesn't touch any tool path.
+- [x] Default behavior on non-Windows with no env vars is unchanged: simulation banner prints, simulation session opens, all tools work.
+- [x] `simulationMode` is still read once at construction time (no per-request re-evaluation) — the resolver is called from the constructor only.
+
+**Documentation criteria**:
+- [x] [README.md](README.md) — env table updated to clarify `QB_SIMULATION` accepts `"true"` / `"false"` / unset, and `QB_LIVE` is honored only when `QB_SIMULATION` is unset. New "Mode resolution matrix" subsection enumerates all 7 canonical (platform, sim, live) → mode rows.
+- [x] `.env.example` created at repo root, documenting every `QB_*` variable with the same matrix wording. Already covered by `.gitignore` (.env is ignored, .env.example tracked).
+- [x] No `ARCHITECTURE.md` change — env-driven mode selection was already in scope of the existing two-mode session design; this is a behavioral fix, not a structural one.
+- [x] No `DECISIONS.md` change — the choice between "honor explicit false" vs "document quirk" was a small ergonomics call, not a tradeoff with lasting consequences.
+
+**Verification commands**:
+```bash
+npm run build
+node scripts/verify-item23-env-matrix.mjs
+node scripts/verify-pickup-2026-04-27.mjs
+QB_SIMULATION=false node -e "import('./dist/session/manager.js').then(({QBSessionManager})=>{const m=new QBSessionManager({companyFile:'sim',appName:'v',qbxmlVersion:'16.0',connectionMode:'optimistic'}); m.openSession().catch(e=>console.log('threw:',e.message.slice(0,80)));});"
+```
+
+**Notes**:
+- The resolver lives next to the class (same file) instead of in a `util/env.ts` because (a) one consumer, (b) it's tightly coupled to the constructor's contract, (c) tests import it directly from `manager.js`. If a second consumer appears (e.g. a future `qb_session_info` tool that wants to display the rule outcome), promote at that point.
+- The original code's `!process.env.QB_LIVE` check accepted any truthy QB_LIVE (including `"0"`, `"false"`) as opting into live mode. The new `=== "1"` check is stricter and matches the README's documented "Set to `1`" wording. This is a behavior change for users who were relying on undocumented truthiness, but the README never promised that contract.
+- On non-Windows, `QB_SIMULATION="false"` now triggers a constructor that proceeds (no banner), then throws at `openSession()` — that's the right shape: the constructor honors the user's request, and the platform check happens at the moment we actually need to open a connection. If a future task wants to fail fast at construction time on impossible (platform, mode) combos, that's an additional check; it doesn't replace the resolver.
+
 
 ### Item 20 — `qb_pnl_report` / `qb_balance_sheet_report` via `GeneralSummaryReportQueryRq` _(Phase 5)_ — done 2026-04-26
 

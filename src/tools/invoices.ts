@@ -5,6 +5,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const invoiceLineSchema = z.object({
   itemName: z.string().optional().describe("Item name or full name"),
@@ -51,17 +53,19 @@ export function registerInvoiceTools(
 ): void {
   server.tool(
     "qb_invoice_list",
-    "List or search invoices in QuickBooks Desktop.",
+    "List or search invoices in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0.",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
       customerListId: z.string().optional().describe("Filter by customer ListID"),
       txnId: z.string().optional().describe("Fetch a specific invoice by TxnID"),
       refNumber: z.string().optional().describe("Filter by reference/invoice number"),
-      fromDate: z.string().optional().describe("Start date filter (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date filter (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date filter (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date filter (YYYY-MM-DD)"),
       paidStatus: z.enum(["All", "PaidOnly", "NotPaidOnly"]).optional()
         .describe("Filter by payment status"),
       maxReturned: z.number().optional().describe("Maximum results"),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID."),
+      iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
     },
     async (args) => {
       const session = getSession();
@@ -83,13 +87,52 @@ export function registerInvoiceTools(
       if (args.paidStatus) filters.PaidStatus = args.paidStatus;
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
-      const invoices = await session.queryEntity("Invoice", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: invoices.length, invoices }, null, 2),
-        }],
-      };
+      try {
+        if (args.paginate || args.iteratorID) {
+          const result = await session.queryEntityPaginated("Invoice", filters, {
+            iterator: args.iteratorID ? "Continue" : "Start",
+            iteratorID: args.iteratorID,
+          });
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                count: result.entities.length,
+                invoices: result.entities,
+                ...(result.iteratorRemainingCount !== undefined
+                  ? { iteratorRemainingCount: result.iteratorRemainingCount }
+                  : {}),
+                ...(result.iteratorID !== undefined
+                  ? { iteratorID: result.iteratorID }
+                  : {}),
+              }, null, 2),
+            }],
+          };
+        }
+
+        const invoices = await session.queryEntity("Invoice", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: invoices.length, invoices }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -99,8 +142,8 @@ export function registerInvoiceTools(
     {
       customerName: z.string().optional().describe("Customer full name"),
       customerListId: z.string().optional().describe("Customer ListID"),
-      txnDate: z.string().optional().describe("Invoice date (YYYY-MM-DD, default today)"),
-      dueDate: z.string().optional().describe("Due date (YYYY-MM-DD)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Invoice date (YYYY-MM-DD, default today)"),
+      dueDate: z.string().regex(ISO_DATE_RE).optional().describe("Due date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("Reference/invoice number"),
       memo: z.string().optional().describe("Memo for the invoice"),
       lines: z.array(invoiceLineSchema).optional()
@@ -151,13 +194,30 @@ export function registerInvoiceTools(
         });
       }
 
-      const result = await session.addEntity("Invoice", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, invoice: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.addEntity("Invoice", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, invoice: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -169,8 +229,8 @@ export function registerInvoiceTools(
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
       customerName: z.string().optional().describe("New customer full name (re-points the invoice at a different customer)"),
       customerListId: z.string().optional().describe("New customer ListID"),
-      txnDate: z.string().optional().describe("New invoice date"),
-      dueDate: z.string().optional().describe("New due date"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New invoice date (YYYY-MM-DD)"),
+      dueDate: z.string().regex(ISO_DATE_RE).optional().describe("New due date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New memo"),
       lines: z.array(invoiceLineModSchema).optional()
@@ -219,12 +279,17 @@ export function registerInvoiceTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -240,13 +305,30 @@ export function registerInvoiceTools(
     },
     async ({ txnId }) => {
       const session = getSession();
-      const result = await session.deleteEntity("Invoice", txnId);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, deleted: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.deleteEntity("Invoice", txnId);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, deleted: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "TxnDelRq (Invoice) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 }

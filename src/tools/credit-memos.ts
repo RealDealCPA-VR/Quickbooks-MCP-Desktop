@@ -19,6 +19,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const creditMemoLineSchema = z.object({
   itemName: z.string().optional().describe("Item name or full name"),
@@ -81,8 +83,8 @@ export function registerCreditMemoTools(
       customerListId: z.string().optional().describe("Filter by customer ListID"),
       txnId: z.string().optional().describe("Fetch a specific credit memo by TxnID"),
       refNumber: z.string().optional().describe("Filter by reference/credit memo number"),
-      fromDate: z.string().optional().describe("Start date (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -104,13 +106,30 @@ export function registerCreditMemoTools(
       }
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
-      const creditMemos = await session.queryEntity("CreditMemo", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: creditMemos.length, creditMemos }, null, 2),
-        }],
-      };
+      try {
+        const creditMemos = await session.queryEntity("CreditMemo", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: creditMemos.length, creditMemos }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "CreditMemoQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -120,7 +139,7 @@ export function registerCreditMemoTools(
     {
       customerName: z.string().optional().describe("Customer full name"),
       customerListId: z.string().optional().describe("Customer ListID"),
-      txnDate: z.string().optional().describe("Credit memo date (YYYY-MM-DD, default today)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Credit memo date (YYYY-MM-DD, default today)"),
       refNumber: z.string().optional().describe("Reference/credit memo number"),
       memo: z.string().optional().describe("Memo"),
       lines: z.array(creditMemoLineSchema).optional()
@@ -193,12 +212,17 @@ export function registerCreditMemoTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "CreditMemoAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -214,7 +238,7 @@ export function registerCreditMemoTools(
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
       customerName: z.string().optional().describe("New customer full name (re-points the memo at a different customer)"),
       customerListId: z.string().optional().describe("New customer ListID"),
-      txnDate: z.string().optional().describe("New credit memo date"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New credit memo date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New memo"),
       lines: z.array(creditMemoLineModSchema).optional()
@@ -262,12 +286,17 @@ export function registerCreditMemoTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "CreditMemoModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -305,12 +334,17 @@ export function registerCreditMemoTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "CreditMemoModRq (apply) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -335,12 +369,17 @@ export function registerCreditMemoTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "TxnDelRq (CreditMemo) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };

@@ -16,6 +16,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 
 export function registerListTools(
   server: McpServer,
@@ -39,13 +40,30 @@ export function registerListTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const classes = await session.queryEntity("Class", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: classes.length, classes }, null, 2),
-        }],
-      };
+      try {
+        const classes = await session.queryEntity("Class", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: classes.length, classes }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ClassQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -76,20 +94,38 @@ export function registerListTools(
             ? ["DateDrivenTerms"]
             : ["StandardTerms", "DateDrivenTerms"];
 
-      const results = await Promise.all(
-        types.map(async (t) => {
-          const entries = await session.queryEntity(t, filters);
-          return entries.map((e) => ({ ...e, TermsType: t }));
-        })
-      );
-      const terms = results.flat();
+      try {
+        const results = await Promise.all(
+          types.map(async (t) => {
+            const entries = await session.queryEntity(t, filters);
+            return entries.map((e) => ({ ...e, TermsType: t }));
+          })
+        );
+        const terms = results.flat();
 
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: terms.length, terms }, null, 2),
-        }],
-      };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: terms.length, terms }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        const op = types.length === 1 ? `${types[0]}QueryRq` : "Terms*QueryRq";
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? `${op} failed`,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -111,13 +147,30 @@ export function registerListTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const paymentMethods = await session.queryEntity("PaymentMethod", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: paymentMethods.length, paymentMethods }, null, 2),
-        }],
-      };
+      try {
+        const paymentMethods = await session.queryEntity("PaymentMethod", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: paymentMethods.length, paymentMethods }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "PaymentMethodQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -137,13 +190,30 @@ export function registerListTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const salesReps = await session.queryEntity("SalesRep", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: salesReps.length, salesReps }, null, 2),
-        }],
-      };
+      try {
+        const salesReps = await session.queryEntity("SalesRep", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: salesReps.length, salesReps }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "SalesRepQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -165,13 +235,30 @@ export function registerListTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const customerTypes = await session.queryEntity("CustomerType", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: customerTypes.length, customerTypes }, null, 2),
-        }],
-      };
+      try {
+        const customerTypes = await session.queryEntity("CustomerType", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: customerTypes.length, customerTypes }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "CustomerTypeQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -193,13 +280,30 @@ export function registerListTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const vendorTypes = await session.queryEntity("VendorType", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: vendorTypes.length, vendorTypes }, null, 2),
-        }],
-      };
+      try {
+        const vendorTypes = await session.queryEntity("VendorType", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: vendorTypes.length, vendorTypes }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "VendorTypeQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 }

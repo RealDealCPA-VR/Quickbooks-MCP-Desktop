@@ -5,6 +5,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 
 // Real QB has no generic Item entity — each item belongs to one of these five
 // subtypes, each with its own *QueryRq / *AddRq / *ModRq / ListDelType.
@@ -24,16 +25,18 @@ export function registerItemTools(
 ): void {
   server.tool(
     "qb_item_list",
-    "List or search items (products and services) in QuickBooks Desktop. Omit itemType to query all subtypes.",
+    "List or search items (products and services) in QuickBooks Desktop. Omit itemType to query all subtypes. Set paginate:true (with itemType) to use iterator-based pagination — pagination cannot fan out across subtypes, so itemType is required when paginating.",
     {
       itemType: itemTypeSchema.optional()
-        .describe("Restrict to a single subtype. Omit to query all five subtypes and merge."),
+        .describe("Restrict to a single subtype. Omit to query all five subtypes and merge. Required when paginate:true."),
       nameFilter: z.string().optional().describe("Filter items by name (Contains match)"),
       activeOnly: z.boolean().optional().describe("Only return active items (default true)"),
       maxReturned: z.number().optional().describe("Maximum results per subtype query"),
       listId: z.string().optional().describe("Fetch a specific item by ListID"),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Requires itemType — iterators are scoped to a single request type, so the multi-subtype fan-out path is incompatible."),
+      iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate, and itemType must match the original request type."),
     },
-    async ({ itemType, nameFilter, activeOnly, maxReturned, listId }) => {
+    async ({ itemType, nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -42,22 +45,76 @@ export function registerItemTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      let items: Record<string, unknown>[];
-      if (itemType) {
-        items = await session.queryEntity(`Item${itemType}`, filters);
-      } else {
-        const perSubtype = await Promise.all(
-          ITEM_SUBTYPES.map((sub) => session.queryEntity(`Item${sub}`, filters))
-        );
-        items = perSubtype.flat();
+      const wantsPagination = Boolean(paginate || iteratorID);
+      if (wantsPagination && !itemType) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: "paginate requires itemType — QBXML iterators are scoped to a single Item*QueryRq, so the multi-subtype fan-out path cannot paginate. Pass itemType (Service / Inventory / NonInventory / OtherCharge / Group) to paginate one subtype at a time.",
+            }),
+          }],
+          isError: true,
+        };
       }
 
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: items.length, items }, null, 2),
-        }],
-      };
+      try {
+        if (wantsPagination) {
+          const result = await session.queryEntityPaginated(`Item${itemType}`, filters, {
+            iterator: iteratorID ? "Continue" : "Start",
+            iteratorID,
+          });
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                count: result.entities.length,
+                items: result.entities,
+                ...(result.iteratorRemainingCount !== undefined
+                  ? { iteratorRemainingCount: result.iteratorRemainingCount }
+                  : {}),
+                ...(result.iteratorID !== undefined
+                  ? { iteratorID: result.iteratorID }
+                  : {}),
+              }, null, 2),
+            }],
+          };
+        }
+
+        let items: Record<string, unknown>[];
+        if (itemType) {
+          items = await session.queryEntity(`Item${itemType}`, filters);
+        } else {
+          const perSubtype = await Promise.all(
+            ITEM_SUBTYPES.map((sub) => session.queryEntity(`Item${sub}`, filters))
+          );
+          items = perSubtype.flat();
+        }
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: items.length, items }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        const op = itemType ? `Item${itemType}QueryRq` : "Item*QueryRq";
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? `${op} failed`,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -94,13 +151,30 @@ export function registerItemTools(
         data.AssetAccountRef = { FullName: args.assetAccountName };
       }
 
-      const result = await session.addEntity(`Item${args.itemType}`, data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, item: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.addEntity(`Item${args.itemType}`, data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, item: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? `Item${args.itemType}AddRq failed`,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -130,13 +204,30 @@ export function registerItemTools(
       if (args.cost !== undefined) data.Cost = args.cost;
       if (args.isActive !== undefined) data.IsActive = args.isActive;
 
-      const result = await session.modifyEntity(`Item${args.itemType}`, data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, item: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.modifyEntity(`Item${args.itemType}`, data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, item: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? `Item${args.itemType}ModRq failed`,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -149,13 +240,30 @@ export function registerItemTools(
     },
     async ({ itemType, listId }) => {
       const session = getSession();
-      const result = await session.deleteEntity(`Item${itemType}`, listId);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, deleted: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.deleteEntity(`Item${itemType}`, listId);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, deleted: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? `ListDelRq (Item${itemType}) failed`,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 }

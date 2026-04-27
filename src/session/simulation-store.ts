@@ -114,6 +114,24 @@ export class SimulationStore {
     const rsType = reqType.replace("Rq", "Rs");
     const retName = `${entityType}Ret`;
 
+    // Iterator state arrives as XML attributes on the *QueryRq element (Item
+    // 27). fast-xml-parser surfaces them as @_iterator / @_iteratorID on the
+    // request body. The simulation does not actually page — Start returns the
+    // full result set in one shot with iteratorRemainingCount=0; Continue/Stop
+    // are treated as already-exhausted no-ops. See queryEntityPaginated jsdoc.
+    const iteratorMode = reqData["@_iterator"]
+      ? String(reqData["@_iterator"])
+      : null;
+    if (iteratorMode === "Continue" || iteratorMode === "Stop") {
+      return {
+        type: rsType,
+        statusCode: 1,
+        statusSeverity: "Info",
+        statusMessage: "A query request did not find a matching object in QuickBooks",
+        data: {},
+      };
+    }
+
     let results: StoredEntity[] = Array.from(this.getStore(entityType).values());
 
     // Apply filters
@@ -247,22 +265,35 @@ export class SimulationStore {
     }
 
     if (results.length === 0) {
-      return {
+      const empty: QBXMLResponseBody = {
         type: rsType,
         statusCode: 1,
         statusSeverity: "Info",
         statusMessage: "A query request did not find a matching object in QuickBooks",
         data: {},
       };
+      // On a Start that found no matches, real QB still surfaces an
+      // iteratorRemainingCount=0 + iteratorID so the caller knows the
+      // iterator was created and is empty. Mirror that.
+      if (iteratorMode === "Start") {
+        empty.iteratorRemainingCount = 0;
+        empty.iteratorID = `SIM-ITER-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      }
+      return empty;
     }
 
-    return {
+    const ok: QBXMLResponseBody = {
       type: rsType,
       statusCode: 0,
       statusSeverity: "Info",
       statusMessage: "Status OK",
       data: { [retName]: results },
     };
+    if (iteratorMode === "Start") {
+      ok.iteratorRemainingCount = 0;
+      ok.iteratorID = `SIM-ITER-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    }
+    return ok;
   }
 
   // -----------------------------------------------------------------------

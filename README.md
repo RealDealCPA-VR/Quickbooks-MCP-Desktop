@@ -287,8 +287,24 @@ npm start
 | `QB_APP_ID` | Application ID (optional) | — |
 | `QB_QBXML_VERSION` | QBXML protocol version | `16.0` |
 | `QB_CONNECTION_MODE` | `localOnly`, `remoteOnly`, or `optimistic` | `optimistic` |
-| `QB_SIMULATION` | Force simulation mode | `true` on non-Windows |
-| `QB_LIVE` | Set to `1` for live QB connection | — |
+| `QB_SIMULATION` | `"true"` forces simulation; `"false"` forces live (and errors if the platform can't do live); unset = default behavior (see matrix). | unset |
+| `QB_LIVE` | Set to `"1"` to enable live mode on Windows when `QB_SIMULATION` is unset. | unset |
+
+### Mode resolution matrix
+
+`QB_SIMULATION` is the explicit override. `QB_LIVE` only matters when `QB_SIMULATION` is unset.
+
+| Platform | `QB_SIMULATION` | `QB_LIVE` | Mode |
+|----------|-----------------|-----------|------|
+| Windows  | `"true"`        | _any_     | Simulation (forced) |
+| Windows  | `"false"`       | _any_     | Live (errors at `openSession` until Phase 7 lands) |
+| Windows  | unset           | `"1"`     | Live (errors at `openSession` until Phase 7 lands) |
+| Windows  | unset           | unset     | Simulation (default) |
+| non-Windows | `"true"`     | _any_     | Simulation (forced) |
+| non-Windows | `"false"`    | _any_     | Live → errors at `openSession` ("requires Windows") |
+| non-Windows | unset        | _any_     | Simulation (default) |
+
+Any `QB_SIMULATION` value other than `"true"` / `"false"` is treated as unset.
 
 ## How It Works
 

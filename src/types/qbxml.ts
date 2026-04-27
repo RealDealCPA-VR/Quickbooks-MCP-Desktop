@@ -47,6 +47,14 @@ export interface QBXMLRequestBody {
   type: string;
   /** Request ID for correlating responses (auto-incremented if omitted). */
   requestID?: string;
+  /**
+   * Extra XML attributes to emit on the request element alongside requestID.
+   * QBXML uses these for iterator state on *QueryRq elements:
+   *   { iterator: "Start" | "Continue" | "Stop", iteratorID?: "{guid}" }
+   * The builder serializes them as attributes on the request element, NOT as
+   * child elements — Intuit's spec is strict about this distinction.
+   */
+  attributes?: Record<string, string>;
   /** Key-value body of the request (nested XML elements). */
   body: Record<string, unknown>;
 }
@@ -67,6 +75,14 @@ export interface QBXMLResponseBody {
   statusMessage: string;
   /** Parsed response data. */
   data: Record<string, unknown> | Record<string, unknown>[];
+  /**
+   * Iterator metadata surfaced on *QueryRs responses when an iterator request
+   * was sent (Item 27). `iteratorRemainingCount` is the number of rows still
+   * to be fetched after this page (0 means exhausted); `iteratorID` is the
+   * opaque handle that must be passed back on the next Continue/Stop request.
+   */
+  iteratorRemainingCount?: number;
+  iteratorID?: string;
 }
 
 // ---------------------------------------------------------------------------

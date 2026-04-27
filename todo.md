@@ -45,13 +45,13 @@ So that everything below can actually be verified without a Windows box.
 
 ## Phase 6 — Plumbing, validation, ergonomics
 
-- [ ] **23.** Fix `QB_SIMULATION` env semantics in [session/manager.ts:51-53](src/session/manager.ts#L51-L53) — currently `QB_SIMULATION=false` on Windows still simulates unless `QB_LIVE=1` is also set; either honor `QB_SIMULATION=false` alone or document the actual rule and align README.
+- [x] **23.** Fix `QB_SIMULATION` env semantics in [session/manager.ts:51-53](src/session/manager.ts#L51-L53) — currently `QB_SIMULATION=false` on Windows still simulates unless `QB_LIVE=1` is also set; either honor `QB_SIMULATION=false` alone or document the actual rule and align README.
 - [x] **24.** Remove dead code: `parseQBXMLResponse` import in [session/manager.ts:27](src/session/manager.ts#L27), `buildSingleRequest` export in [qbxml/builder.ts:66](src/qbxml/builder.ts#L66), `QBXMLRequestBody` import in [qbxml/builder.ts:9](src/qbxml/builder.ts#L9), and the useless ternary `isTransaction ? id : id` at [simulation-store.ts:214](src/session/simulation-store.ts#L214).
-- [ ] **25.** Wrap `session.queryEntity` / `addEntity` / `modifyEntity` / `deleteEntity` calls in tool handlers with try/catch — translate `QBXMLResponseError` into structured tool error responses (`isError: true` with `statusCode` + `statusMessage`) instead of letting them propagate as raw exceptions.
-- [ ] **26.** Add status code mapping table for common QB errors (3120 missing field, 3170 modify failed, 3260 insufficient permission, 500 not found, etc.) so tool errors are user-readable.
-- [ ] **27.** Add `IteratorID` / `IteratorRemainingCount` support to large queries (Customer, Invoice, Item) — real QB caps at ~500 rows and returns an iterator handle for pagination.
-- [ ] **28.** Validate `AccountType` enum in `qb_account_add` against QB's allowed values (`Bank`, `AccountsReceivable`, `OtherCurrentAsset`, `FixedAsset`, `OtherAsset`, `AccountsPayable`, `CreditCard`, `OtherCurrentLiability`, `LongTermLiability`, `Equity`, `Income`, `CostOfGoodsSold`, `Expense`, `OtherIncome`, `OtherExpense`, `NonPosting`).
-- [ ] **29.** Add minimal input validation: email format, phone, postal code, ISO date strings (`YYYY-MM-DD`) on date fields — currently any string passes through to QB which then rejects with cryptic errors.
+- [x] **25.** Wrap `session.queryEntity` / `addEntity` / `modifyEntity` / `deleteEntity` calls in tool handlers with try/catch — translate `QBXMLResponseError` into structured tool error responses (`isError: true` with `statusCode` + `statusMessage`) instead of letting them propagate as raw exceptions.
+- [x] **26.** Add status code mapping table for common QB errors (3120 missing field, 3170 modify failed, 3260 insufficient permission, 500 not found, etc.) so tool errors are user-readable.
+- [x] **27.** Add `IteratorID` / `IteratorRemainingCount` support to large queries (Customer, Invoice, Bill, Item) — real QB caps at ~500 rows and returns an iterator handle for pagination.
+- [x] **28.** Validate `AccountType` enum in `qb_account_add` against QB's allowed values (`Bank`, `AccountsReceivable`, `OtherCurrentAsset`, `FixedAsset`, `OtherAsset`, `AccountsPayable`, `CreditCard`, `OtherCurrentLiability`, `LongTermLiability`, `Equity`, `Income`, `CostOfGoodsSold`, `Expense`, `OtherIncome`, `OtherExpense`, `NonPosting`).
+- [x] **29.** Add minimal input validation: email format, phone, postal code, ISO date strings (`YYYY-MM-DD`) on date fields — currently any string passes through to QB which then rejects with cryptic errors.
 
 ## Phase 7 — Live mode (last, requires Windows + QB Desktop to verify)
 

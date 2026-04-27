@@ -7,6 +7,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const ASSET_TYPES = ["Bank", "AccountsReceivable", "OtherCurrentAsset", "Inventory", "FixedAsset", "OtherAsset"] as const;
 const LIABILITY_TYPES = ["AccountsPayable", "CreditCard", "OtherCurrentLiability", "LongTermLiability"] as const;
@@ -22,8 +24,6 @@ const CANONICAL_ACCOUNT_TYPES: readonly string[] = [
   ...EXPENSE_TYPES,
   ...NONPOSTING_TYPES,
 ];
-
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
@@ -90,6 +90,7 @@ export function registerReportTools(
         };
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
@@ -97,6 +98,7 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "CompanyQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
             }),
           }],
           isError: true,
@@ -190,6 +192,7 @@ export function registerReportTools(
         };
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
@@ -197,6 +200,7 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "AccountQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
             }),
           }],
           isError: true,
@@ -271,6 +275,7 @@ export function registerReportTools(
         };
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
@@ -278,6 +283,7 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "InvoiceQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
             }),
           }],
           isError: true,
@@ -352,6 +358,7 @@ export function registerReportTools(
         };
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
@@ -359,6 +366,7 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "BillQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
             }),
           }],
           isError: true,
@@ -414,6 +422,7 @@ export function registerReportTools(
         };
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
@@ -421,6 +430,7 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "GeneralSummaryReportQueryRq (ProfitAndLossStandard) failed",
+              ...(humanReadable ? { humanReadable } : {}),
             }),
           }],
           isError: true,
@@ -471,6 +481,7 @@ export function registerReportTools(
         };
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
@@ -478,6 +489,7 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "GeneralSummaryReportQueryRq (BalanceSheetStandard) failed",
+              ...(humanReadable ? { humanReadable } : {}),
             }),
           }],
           isError: true,

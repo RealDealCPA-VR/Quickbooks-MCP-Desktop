@@ -12,6 +12,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const estimateLineSchema = z.object({
   itemName: z.string().optional().describe("Item name or full name"),
@@ -61,8 +63,8 @@ export function registerEstimateTools(
       customerListId: z.string().optional().describe("Filter by customer ListID"),
       txnId: z.string().optional().describe("Fetch a specific estimate by TxnID"),
       refNumber: z.string().optional().describe("Filter by reference/estimate number"),
-      fromDate: z.string().optional().describe("Start date (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -84,13 +86,30 @@ export function registerEstimateTools(
       }
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
-      const estimates = await session.queryEntity("Estimate", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: estimates.length, estimates }, null, 2),
-        }],
-      };
+      try {
+        const estimates = await session.queryEntity("Estimate", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: estimates.length, estimates }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EstimateQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -100,7 +119,7 @@ export function registerEstimateTools(
     {
       customerName: z.string().optional().describe("Customer full name"),
       customerListId: z.string().optional().describe("Customer ListID"),
-      txnDate: z.string().optional().describe("Estimate date (YYYY-MM-DD, default today)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Estimate date (YYYY-MM-DD, default today)"),
       refNumber: z.string().optional().describe("Reference/estimate number"),
       memo: z.string().optional().describe("Memo"),
       lines: z.array(estimateLineSchema).optional()
@@ -148,13 +167,30 @@ export function registerEstimateTools(
         });
       }
 
-      const result = await session.addEntity("Estimate", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, estimate: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.addEntity("Estimate", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, estimate: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EstimateAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -166,7 +202,7 @@ export function registerEstimateTools(
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
       customerName: z.string().optional().describe("New customer full name (re-points the estimate at a different customer)"),
       customerListId: z.string().optional().describe("New customer ListID"),
-      txnDate: z.string().optional().describe("New estimate date"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New estimate date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New memo"),
       isAccepted: z.boolean().optional().describe("Mark the estimate accepted/rejected. Set true when an estimate has been converted to an invoice manually; qb_estimate_convert_to_invoice flips this automatically."),
@@ -216,12 +252,17 @@ export function registerEstimateTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EstimateModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -246,12 +287,17 @@ export function registerEstimateTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "TxnDelRq (Estimate) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -266,9 +312,9 @@ export function registerEstimateTools(
       estimateTxnId: z.string().describe("TxnID of the source estimate"),
       markAccepted: z.boolean().optional()
         .describe("Mark the source estimate IsAccepted=true after the invoice is created. Default true."),
-      invoiceTxnDate: z.string().optional()
+      invoiceTxnDate: z.string().regex(ISO_DATE_RE).optional()
         .describe("Date for the new invoice (YYYY-MM-DD). Default: today."),
-      invoiceDueDate: z.string().optional()
+      invoiceDueDate: z.string().regex(ISO_DATE_RE).optional()
         .describe("Due date for the new invoice (YYYY-MM-DD)."),
       invoiceRefNumber: z.string().optional()
         .describe("Reference number for the new invoice. Default: estimate's RefNumber if present."),
@@ -278,7 +324,25 @@ export function registerEstimateTools(
     async (args) => {
       const session = getSession();
 
-      const matches = await session.queryEntity("Estimate", { TxnID: args.estimateTxnId });
+      let matches: Record<string, unknown>[];
+      try {
+        matches = await session.queryEntity("Estimate", { TxnID: args.estimateTxnId });
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EstimateQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
       const estimate = matches[0];
       if (!estimate) {
         return {
@@ -363,12 +427,17 @@ export function registerEstimateTools(
       try {
         invoice = await session.addEntity("Invoice", invoiceData);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceAddRq (estimate convert) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -379,7 +448,7 @@ export function registerEstimateTools(
       // doing a partial conversion and wants to convert again later).
       const shouldMarkAccepted = args.markAccepted !== false;
       let estimateMarked = false;
-      let markError: { message: string; statusCode?: number } | null = null;
+      let markError: { statusCode: number; statusMessage: string; humanReadable?: string } | null = null;
 
       if (shouldMarkAccepted) {
         try {
@@ -392,9 +461,13 @@ export function registerEstimateTools(
         } catch (err) {
           // The invoice was created successfully — surface the partial state
           // rather than losing it. The operator can re-mark via qb_estimate_update.
-          const message = err instanceof Error ? err.message : String(err);
-          const statusCode = (err as { statusCode?: number })?.statusCode;
-          markError = { message, statusCode };
+          const e = err as { message?: string; statusCode?: number };
+          const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+          markError = {
+            statusCode: e.statusCode ?? -1,
+            statusMessage: e.message ?? "EstimateModRq (mark IsAccepted) failed",
+            ...(humanReadable ? { humanReadable } : {}),
+          };
         }
       }
 

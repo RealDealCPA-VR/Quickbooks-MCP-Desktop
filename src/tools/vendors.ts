@@ -5,6 +5,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { EMAIL_RE, PHONE_RE, POSTAL_RE } from "../util/validators.js";
 
 export function registerVendorTools(
   server: McpServer,
@@ -28,13 +30,30 @@ export function registerVendorTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const vendors = await session.queryEntity("Vendor", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: vendors.length, vendors }, null, 2),
-        }],
-      };
+      try {
+        const vendors = await session.queryEntity("Vendor", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: vendors.length, vendors }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "VendorQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -46,13 +65,13 @@ export function registerVendorTools(
       companyName: z.string().optional().describe("Company name"),
       firstName: z.string().optional().describe("Contact first name"),
       lastName: z.string().optional().describe("Contact last name"),
-      phone: z.string().optional().describe("Phone number"),
-      email: z.string().optional().describe("Email address"),
+      phone: z.string().regex(PHONE_RE).optional().describe("Phone number"),
+      email: z.string().regex(EMAIL_RE).optional().describe("Email address"),
       accountNumber: z.string().optional().describe("Account number"),
       addr1: z.string().optional().describe("Address line 1"),
       city: z.string().optional().describe("City"),
       state: z.string().optional().describe("State"),
-      postalCode: z.string().optional().describe("Postal code"),
+      postalCode: z.string().regex(POSTAL_RE).optional().describe("Postal code"),
       notes: z.string().optional().describe("Notes about the vendor"),
     },
     async (args) => {
@@ -76,13 +95,30 @@ export function registerVendorTools(
         };
       }
 
-      const result = await session.addEntity("Vendor", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, vendor: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.addEntity("Vendor", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, vendor: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "VendorAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -94,8 +130,8 @@ export function registerVendorTools(
       editSequence: z.string().describe("EditSequence for optimistic locking"),
       name: z.string().optional().describe("New vendor name"),
       companyName: z.string().optional().describe("New company name"),
-      phone: z.string().optional().describe("New phone number"),
-      email: z.string().optional().describe("New email address"),
+      phone: z.string().regex(PHONE_RE).optional().describe("New phone number"),
+      email: z.string().regex(EMAIL_RE).optional().describe("New email address"),
       isActive: z.boolean().optional().describe("Set active/inactive status"),
       notes: z.string().optional().describe("New notes"),
     },
@@ -113,13 +149,30 @@ export function registerVendorTools(
       if (args.isActive !== undefined) data.IsActive = args.isActive;
       if (args.notes) data.Notes = args.notes;
 
-      const result = await session.modifyEntity("Vendor", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, vendor: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.modifyEntity("Vendor", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, vendor: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "VendorModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -131,13 +184,30 @@ export function registerVendorTools(
     },
     async ({ listId }) => {
       const session = getSession();
-      const result = await session.deleteEntity("Vendor", listId);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, deleted: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.deleteEntity("Vendor", listId);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, deleted: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ListDelRq (Vendor) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 }

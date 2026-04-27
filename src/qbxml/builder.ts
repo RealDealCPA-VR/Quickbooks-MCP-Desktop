@@ -6,7 +6,7 @@
  * with QuickBooks Desktop via the SDK's session manager.
  */
 
-import type { QBXMLRequest } from "../types/qbxml.js";
+import type { QBXMLRequest, QBXMLRequestBody } from "../types/qbxml.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,7 +49,14 @@ export function buildQBXMLRequest(request: QBXMLRequest): string {
   let autoId = 1;
   for (const req of request.requests) {
     const requestID = req.requestID ?? String(autoId++);
-    lines.push(`    <${req.type} requestID="${requestID}">`);
+    const attrParts: string[] = [`requestID="${escapeXml(requestID)}"`];
+    if (req.attributes) {
+      for (const [k, v] of Object.entries(req.attributes)) {
+        if (v === undefined || v === null) continue;
+        attrParts.push(`${k}="${escapeXml(String(v))}"`);
+      }
+    }
+    lines.push(`    <${req.type} ${attrParts.join(" ")}>`);
     lines.push(...serializeBody(req.body, 3));
     lines.push(`    </${req.type}>`);
   }
@@ -81,9 +88,32 @@ function buildSingleRequest(
 export function buildQueryRequest(
   entityType: string,
   filters: Record<string, unknown> = {},
-  version?: string
+  options: {
+    version?: string;
+    iterator?: "Start" | "Continue" | "Stop";
+    iteratorID?: string;
+  } = {}
 ): string {
-  return buildSingleRequest(`${entityType}QueryRq`, filters, version);
+  const requestBody: QBXMLRequestBody = {
+    type: `${entityType}QueryRq`,
+    body: filters,
+  };
+
+  // Iterator state lives on the request element as XML attributes (per
+  // Intuit's spec), NOT as child elements. The builder routes them through
+  // QBXMLRequestBody.attributes so the request emits e.g.
+  //   <CustomerQueryRq requestID="1" iterator="Continue" iteratorID="{...}">
+  const attributes: Record<string, string> = {};
+  if (options.iterator) attributes.iterator = options.iterator;
+  if (options.iteratorID) attributes.iteratorID = options.iteratorID;
+  if (Object.keys(attributes).length > 0) {
+    requestBody.attributes = attributes;
+  }
+
+  return buildQBXMLRequest({
+    version: options.version || DEFAULT_QBXML_VERSION,
+    requests: [requestBody],
+  });
 }
 
 export function buildAddRequest(

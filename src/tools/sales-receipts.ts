@@ -11,6 +11,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const salesReceiptLineSchema = z.object({
   itemName: z.string().optional().describe("Item name or full name"),
@@ -62,8 +64,8 @@ export function registerSalesReceiptTools(
       customerListId: z.string().optional().describe("Filter by customer ListID"),
       txnId: z.string().optional().describe("Fetch a specific sales receipt by TxnID"),
       refNumber: z.string().optional().describe("Filter by reference/sales receipt number"),
-      fromDate: z.string().optional().describe("Start date (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -85,13 +87,30 @@ export function registerSalesReceiptTools(
       }
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
-      const salesReceipts = await session.queryEntity("SalesReceipt", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: salesReceipts.length, salesReceipts }, null, 2),
-        }],
-      };
+      try {
+        const salesReceipts = await session.queryEntity("SalesReceipt", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: salesReceipts.length, salesReceipts }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "SalesReceiptQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -101,7 +120,7 @@ export function registerSalesReceiptTools(
     {
       customerName: z.string().optional().describe("Customer full name"),
       customerListId: z.string().optional().describe("Customer ListID"),
-      txnDate: z.string().optional().describe("Sale date (YYYY-MM-DD, default today)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Sale date (YYYY-MM-DD, default today)"),
       refNumber: z.string().optional().describe("Reference/sales receipt number"),
       memo: z.string().optional().describe("Memo"),
       paymentMethodName: z.string().optional().describe("Payment method (e.g., Check, Cash, Credit Card) — discoverable via qb_payment_method_list"),
@@ -169,12 +188,17 @@ export function registerSalesReceiptTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "SalesReceiptAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -190,7 +214,7 @@ export function registerSalesReceiptTools(
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
       customerName: z.string().optional().describe("New customer full name (re-points the receipt at a different customer)"),
       customerListId: z.string().optional().describe("New customer ListID"),
-      txnDate: z.string().optional().describe("New sale date"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New sale date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New memo"),
       paymentMethodName: z.string().optional().describe("New payment method"),
@@ -249,12 +273,17 @@ export function registerSalesReceiptTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "SalesReceiptModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -279,12 +308,17 @@ export function registerSalesReceiptTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "TxnDelRq (SalesReceipt) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };

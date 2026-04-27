@@ -5,6 +5,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { EMAIL_RE, ISO_DATE_RE, PHONE_RE } from "../util/validators.js";
 
 export function registerEmployeeTools(
   server: McpServer,
@@ -28,13 +30,30 @@ export function registerEmployeeTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
 
-      const employees = await session.queryEntity("Employee", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: employees.length, employees }, null, 2),
-        }],
-      };
+      try {
+        const employees = await session.queryEntity("Employee", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: employees.length, employees }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EmployeeQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -44,9 +63,9 @@ export function registerEmployeeTools(
     {
       firstName: z.string().describe("Employee first name"),
       lastName: z.string().describe("Employee last name"),
-      phone: z.string().optional().describe("Phone number"),
-      email: z.string().optional().describe("Email address"),
-      hiredDate: z.string().optional().describe("Hire date (YYYY-MM-DD)"),
+      phone: z.string().regex(PHONE_RE).optional().describe("Phone number"),
+      email: z.string().regex(EMAIL_RE).optional().describe("Email address"),
+      hiredDate: z.string().regex(ISO_DATE_RE).optional().describe("Hire date (YYYY-MM-DD)"),
     },
     async (args) => {
       const session = getSession();
@@ -60,13 +79,30 @@ export function registerEmployeeTools(
       if (args.email) data.Email = args.email;
       if (args.hiredDate) data.HiredDate = args.hiredDate;
 
-      const result = await session.addEntity("Employee", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, employee: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.addEntity("Employee", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, employee: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EmployeeAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -78,8 +114,8 @@ export function registerEmployeeTools(
       editSequence: z.string().describe("EditSequence for optimistic locking"),
       firstName: z.string().optional().describe("New first name"),
       lastName: z.string().optional().describe("New last name"),
-      phone: z.string().optional().describe("New phone number"),
-      email: z.string().optional().describe("New email address"),
+      phone: z.string().regex(PHONE_RE).optional().describe("New phone number"),
+      email: z.string().regex(EMAIL_RE).optional().describe("New email address"),
       isActive: z.boolean().optional().describe("Set active/inactive status"),
     },
     async (args) => {
@@ -98,13 +134,30 @@ export function registerEmployeeTools(
       if (args.email) data.Email = args.email;
       if (args.isActive !== undefined) data.IsActive = args.isActive;
 
-      const result = await session.modifyEntity("Employee", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, employee: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.modifyEntity("Employee", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, employee: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EmployeeModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -130,12 +183,17 @@ export function registerEmployeeTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "EmployeeModRq (make_inactive) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -160,12 +218,17 @@ export function registerEmployeeTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ListDelRq (Employee) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };

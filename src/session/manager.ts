@@ -40,6 +40,26 @@ import { SimulationStore } from "./simulation-store.js";
 // Session manager
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve simulation mode from the environment. Pure function so the matrix is
+ * testable without spinning up sessions.
+ *
+ * Rule:
+ *  - QB_SIMULATION="true"  → always simulate (forced-on override).
+ *  - QB_SIMULATION="false" → never simulate; openSession will throw if the
+ *    platform can't actually do live (non-Windows, or live not implemented).
+ *  - QB_SIMULATION unset   → simulate by default unless on win32 with QB_LIVE=1.
+ *
+ * Any QB_SIMULATION value other than "true"/"false" (e.g. "1", "yes") is
+ * treated as unset to keep the contract narrow — the env var is documented as
+ * accepting only those two literal strings.
+ */
+export function resolveSimulationMode(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): boolean {
+  if (env.QB_SIMULATION === "true") return true;
+  if (env.QB_SIMULATION === "false") return false;
+  return platform !== "win32" || env.QB_LIVE !== "1";
+}
+
 export class QBSessionManager {
   private config: QBConnectionConfig;
   private session: QBSession | null = null;
@@ -48,10 +68,7 @@ export class QBSessionManager {
 
   constructor(config: QBConnectionConfig) {
     this.config = config;
-    // Detect if we're in a non-Windows environment or QB not available
-    this.simulationMode = process.env.QB_SIMULATION === "true" ||
-      process.platform !== "win32" ||
-      !process.env.QB_LIVE;
+    this.simulationMode = resolveSimulationMode(process.env, process.platform);
     this.store = new SimulationStore();
 
     if (this.simulationMode) {
@@ -152,7 +169,9 @@ export class QBSessionManager {
     entityType: string,
     filters: Record<string, unknown> = {}
   ): Promise<Record<string, unknown>[]> {
-    const xml = buildQueryRequest(entityType, filters, this.config.qbxmlVersion);
+    const xml = buildQueryRequest(entityType, filters, {
+      version: this.config.qbxmlVersion,
+    });
     const response = await this.sendRequest(xml);
     const data = extractResponseData(response, `${entityType}QueryRs`);
     if (Array.isArray(data)) return data;
@@ -160,6 +179,67 @@ export class QBSessionManager {
       data as Record<string, unknown>,
       `${entityType}Ret`
     );
+  }
+
+  /**
+   * Paginated variant of queryEntity (Item 27). Real QB caps each *QueryRq
+   * response at ~500 rows; subsequent pages are driven by passing the
+   * iteratorID returned on the prior response back as the `iteratorID` arg
+   * with iterator="Continue". When iteratorRemainingCount === 0 the iterator
+   * is exhausted.
+   *
+   * Simulation behavior:
+   *   - iterator="Start" (or omitted iteratorID with paginate intent) →
+   *     returns the full result set in one shot, with iteratorRemainingCount=0
+   *     and a synthesized iteratorID. The simulation does not actually page —
+   *     real-world dev seed data fits well under 500 rows.
+   *   - iterator="Continue"/"Stop" → returns empty (statusCode 1) with no
+   *     iterator metadata, mirroring how real QB behaves once the iterator is
+   *     drained.
+   */
+  async queryEntityPaginated(
+    entityType: string,
+    filters: Record<string, unknown> = {},
+    options: {
+      iterator?: "Start" | "Continue" | "Stop";
+      iteratorID?: string;
+    } = {}
+  ): Promise<{
+    entities: Record<string, unknown>[];
+    iteratorRemainingCount?: number;
+    iteratorID?: string;
+  }> {
+    const xml = buildQueryRequest(entityType, filters, {
+      version: this.config.qbxmlVersion,
+      iterator: options.iterator,
+      iteratorID: options.iteratorID,
+    });
+    const response = await this.sendRequest(xml);
+    const rsType = `${entityType}QueryRs`;
+
+    let entities: Record<string, unknown>[] = [];
+    try {
+      const data = extractResponseData(response, rsType);
+      entities = Array.isArray(data)
+        ? data
+        : flattenEntityArray(
+            data as Record<string, unknown>,
+            `${entityType}Ret`
+          );
+    } catch (err) {
+      // extractResponseData throws QBXMLResponseError on hard failure; that
+      // bubbles out so tool wrappers translate it (Item 25 path).
+      throw err;
+    }
+
+    const rs = response.responses.find((r) => r.type === rsType);
+    return {
+      entities,
+      ...(rs?.iteratorRemainingCount !== undefined
+        ? { iteratorRemainingCount: rs.iteratorRemainingCount }
+        : {}),
+      ...(rs?.iteratorID !== undefined ? { iteratorID: rs.iteratorID } : {}),
+    };
   }
 
   async addEntity(

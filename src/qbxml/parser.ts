@@ -123,12 +123,27 @@ export function parseQBXMLResponse(xml: string): QBXMLResponse {
         }
       }
 
+      // Iterator metadata on *QueryRs envelopes (Item 27). Real QB caps
+      // *QueryRq responses at ~500 rows by default and surfaces these
+      // attributes on the response element to drive paged continuation.
+      // parseAttributeValue: true coerces the count to a number for us.
+      const iteratorRemainingCount =
+        entryObj["@_iteratorRemainingCount"] !== undefined
+          ? Number(entryObj["@_iteratorRemainingCount"])
+          : undefined;
+      const iteratorID =
+        entryObj["@_iteratorID"] !== undefined
+          ? String(entryObj["@_iteratorID"])
+          : undefined;
+
       responses.push({
         type: key,
         statusCode,
         statusSeverity,
         statusMessage,
         data: Object.keys(data).length > 0 ? data : {},
+        ...(iteratorRemainingCount !== undefined ? { iteratorRemainingCount } : {}),
+        ...(iteratorID !== undefined ? { iteratorID } : {}),
       });
     }
   }

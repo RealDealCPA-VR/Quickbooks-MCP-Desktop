@@ -5,6 +5,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const expenseLineSchema = z
   .object({
@@ -97,16 +99,18 @@ export function registerBillTools(
 ): void {
   server.tool(
     "qb_bill_list",
-    "List or search bills (accounts payable) in QuickBooks Desktop.",
+    "List or search bills (accounts payable) in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0.",
     {
       vendorName: z.string().optional().describe("Filter by vendor name"),
       vendorListId: z.string().optional().describe("Filter by vendor ListID"),
       txnId: z.string().optional().describe("Fetch a specific bill by TxnID"),
-      fromDate: z.string().optional().describe("Start date filter (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date filter (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date filter (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date filter (YYYY-MM-DD)"),
       paidStatus: z.enum(["All", "PaidOnly", "NotPaidOnly"]).optional()
         .describe("Filter by payment status"),
       maxReturned: z.number().optional().describe("Maximum results"),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID."),
+      iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
     },
     async (args) => {
       const session = getSession();
@@ -124,13 +128,52 @@ export function registerBillTools(
       if (args.paidStatus) filters.PaidStatus = args.paidStatus;
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
-      const bills = await session.queryEntity("Bill", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: bills.length, bills }, null, 2),
-        }],
-      };
+      try {
+        if (args.paginate || args.iteratorID) {
+          const result = await session.queryEntityPaginated("Bill", filters, {
+            iterator: args.iteratorID ? "Continue" : "Start",
+            iteratorID: args.iteratorID,
+          });
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                count: result.entities.length,
+                bills: result.entities,
+                ...(result.iteratorRemainingCount !== undefined
+                  ? { iteratorRemainingCount: result.iteratorRemainingCount }
+                  : {}),
+                ...(result.iteratorID !== undefined
+                  ? { iteratorID: result.iteratorID }
+                  : {}),
+              }, null, 2),
+            }],
+          };
+        }
+
+        const bills = await session.queryEntity("Bill", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: bills.length, bills }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "BillQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -140,8 +183,8 @@ export function registerBillTools(
     {
       vendorName: z.string().optional().describe("Vendor full name"),
       vendorListId: z.string().optional().describe("Vendor ListID"),
-      txnDate: z.string().optional().describe("Bill date (YYYY-MM-DD)"),
-      dueDate: z.string().optional().describe("Due date (YYYY-MM-DD)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Bill date (YYYY-MM-DD)"),
+      dueDate: z.string().regex(ISO_DATE_RE).optional().describe("Due date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("Reference number"),
       memo: z.string().optional().describe("Memo"),
       expenseLines: z.array(expenseLineSchema).optional()
@@ -222,13 +265,30 @@ export function registerBillTools(
         });
       }
 
-      const result = await session.addEntity("Bill", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, bill: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.addEntity("Bill", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, bill: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "BillAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -240,8 +300,8 @@ export function registerBillTools(
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
       vendorName: z.string().optional().describe("New vendor full name (re-points the bill at a different vendor)"),
       vendorListId: z.string().optional().describe("New vendor ListID"),
-      txnDate: z.string().optional().describe("New bill date (YYYY-MM-DD)"),
-      dueDate: z.string().optional().describe("New due date (YYYY-MM-DD)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New bill date (YYYY-MM-DD)"),
+      dueDate: z.string().regex(ISO_DATE_RE).optional().describe("New due date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New memo"),
       expenseLines: z.array(expenseLineModSchema).optional()
@@ -308,12 +368,17 @@ export function registerBillTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "BillModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -329,13 +394,30 @@ export function registerBillTools(
     },
     async ({ txnId }) => {
       const session = getSession();
-      const result = await session.deleteEntity("Bill", txnId);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, deleted: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.deleteEntity("Bill", txnId);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, deleted: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "TxnDelRq (Bill) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -352,7 +434,7 @@ export function registerBillTools(
         .describe("'check' creates a BillPaymentCheck, 'creditcard' creates a BillPaymentCreditCard"),
       applyTo: z.array(appliedToBillSchema).min(1)
         .describe("Bill applications. At least one entry required — pure unapplied bill payments are not supported (use qb_payment_receive for the AR side if you meant a customer credit)."),
-      txnDate: z.string().optional().describe("Payment date (YYYY-MM-DD)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Payment date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("Reference/check number"),
       memo: z.string().optional().describe("Memo"),
       bankAccountName: z.string().optional()
@@ -425,12 +507,17 @@ export function registerBillTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? `${entityType}AddRq failed`,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -445,8 +532,8 @@ export function registerBillTools(
       vendorName: z.string().optional().describe("Filter by vendor name"),
       paymentType: z.enum(["check", "creditcard"]).optional()
         .describe("Filter by payment method. Omit to query both BillPaymentCheck + BillPaymentCreditCard and merge."),
-      fromDate: z.string().optional().describe("Start date (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
       maxReturned: z.number().optional().describe("Maximum results (applied per-store when fanning out)"),
     },
     async (args) => {
@@ -468,17 +555,35 @@ export function registerBillTools(
             ? ["BillPaymentCreditCard"]
             : ["BillPaymentCheck", "BillPaymentCreditCard"];
 
-      const results = await Promise.all(
-        types.map((t) => session.queryEntity(t, filters))
-      );
-      const billPayments = results.flat();
+      try {
+        const results = await Promise.all(
+          types.map((t) => session.queryEntity(t, filters))
+        );
+        const billPayments = results.flat();
 
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: billPayments.length, billPayments }, null, 2),
-        }],
-      };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: billPayments.length, billPayments }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        const op = types.length === 1 ? `${types[0]}QueryRq` : "BillPayment*QueryRq";
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? `${op} failed`,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 }

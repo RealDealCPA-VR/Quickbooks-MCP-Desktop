@@ -5,6 +5,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 const appliedToSchema = z.object({
   txnId: z.string().describe("TxnID of the invoice this payment applies to"),
@@ -28,7 +30,7 @@ export function registerPaymentTools(
     {
       customerName: z.string().optional().describe("Customer full name"),
       customerListId: z.string().optional().describe("Customer ListID"),
-      txnDate: z.string().optional().describe("Payment date (YYYY-MM-DD)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Payment date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("Reference/check number"),
       totalAmount: z.number().describe("Total payment amount"),
       paymentMethodName: z.string().optional().describe("Payment method (e.g., Check, Cash, Credit Card)"),
@@ -113,12 +115,17 @@ export function registerPaymentTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ReceivePaymentAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -139,7 +146,7 @@ export function registerPaymentTools(
         .describe("Replacement application set. Pass an empty array to fully unapply the payment (it becomes pure customer credit)."),
       memo: z.string().optional().describe("New memo"),
       refNumber: z.string().optional().describe("New reference/check number"),
-      txnDate: z.string().optional().describe("New payment date (YYYY-MM-DD)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New payment date (YYYY-MM-DD)"),
       paymentMethodName: z.string().optional().describe("New payment method"),
     },
     async (args) => {
@@ -180,12 +187,17 @@ export function registerPaymentTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ReceivePaymentModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -198,8 +210,8 @@ export function registerPaymentTools(
     "List received payments in QuickBooks Desktop.",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
-      fromDate: z.string().optional().describe("Start date (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -214,13 +226,30 @@ export function registerPaymentTools(
       }
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
-      const payments = await session.queryEntity("ReceivePayment", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: payments.length, payments }, null, 2),
-        }],
-      };
+      try {
+        const payments = await session.queryEntity("ReceivePayment", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: payments.length, payments }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ReceivePaymentQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 

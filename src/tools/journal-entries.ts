@@ -23,6 +23,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { ISO_DATE_RE } from "../util/validators.js";
 
 // Add-side line schema. Each side's array is independent; the sum-balance
 // invariant is enforced at the simulation layer (statusCode 3030).
@@ -88,8 +90,8 @@ export function registerJournalEntryTools(
     {
       txnId: z.string().optional().describe("Fetch a specific JE by TxnID"),
       refNumber: z.string().optional().describe("Filter by reference/entry number"),
-      fromDate: z.string().optional().describe("Start TxnDate (YYYY-MM-DD)"),
-      toDate: z.string().optional().describe("End TxnDate (YYYY-MM-DD)"),
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start TxnDate (YYYY-MM-DD)"),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End TxnDate (YYYY-MM-DD)"),
       modifiedFrom: z.string().optional().describe("Modified date lower bound (ISO timestamp)"),
       modifiedTo: z.string().optional().describe("Modified date upper bound (ISO timestamp)"),
       maxReturned: z.number().optional().describe("Maximum results"),
@@ -122,12 +124,17 @@ export function registerJournalEntryTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "JournalEntryQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -139,7 +146,7 @@ export function registerJournalEntryTools(
     "qb_journal_entry_create",
     "Create a journal entry in QuickBooks Desktop. Pass a `debits` array AND a `credits` array; sum(debits.amount) MUST equal sum(credits.amount) to the cent or the entry is rejected with statusCode 3030. Both sides require at least one line. Each line names a GL account by full name; an optional entityName attaches a Customer/Vendor reference (recorded but does NOT move that entity's balance in this server). isAdjustment marks the entry as an adjusting entry (real QB shows it differently in the entries list).",
     {
-      txnDate: z.string().optional().describe("Entry date (YYYY-MM-DD, default today)"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("Entry date (YYYY-MM-DD, default today)"),
       refNumber: z.string().optional().describe("Reference / entry number"),
       memo: z.string().optional().describe("Header memo"),
       isAdjustment: z.boolean().optional().describe("Mark as an adjusting journal entry"),
@@ -169,12 +176,17 @@ export function registerJournalEntryTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "JournalEntryAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -188,7 +200,7 @@ export function registerJournalEntryTools(
     {
       txnId: z.string().describe("TxnID of the JE to update"),
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
-      txnDate: z.string().optional().describe("New entry date"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New entry date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       memo: z.string().optional().describe("New header memo"),
       isAdjustment: z.boolean().optional().describe("Mark/unmark as adjusting entry"),
@@ -221,12 +233,17 @@ export function registerJournalEntryTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "JournalEntryModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -251,12 +268,17 @@ export function registerJournalEntryTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "TxnDelRq (JournalEntry) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };

@@ -5,6 +5,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
+import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 
 const ACCOUNT_TYPES = [
   "Bank", "AccountsReceivable", "OtherCurrentAsset", "FixedAsset",
@@ -37,13 +38,30 @@ export function registerAccountTools(
       if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
 
-      const accounts = await session.queryEntity("Account", filters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ count: accounts.length, accounts }, null, 2),
-        }],
-      };
+      try {
+        const accounts = await session.queryEntity("Account", filters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: accounts.length, accounts }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "AccountQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -52,7 +70,7 @@ export function registerAccountTools(
     "Create a new account in the QuickBooks chart of accounts.",
     {
       name: z.string().describe("Account name"),
-      accountType: z.string().describe(
+      accountType: z.enum(ACCOUNT_TYPES).describe(
         `Account type: ${ACCOUNT_TYPES.join(", ")}`
       ),
       accountNumber: z.string().optional().describe("Account number"),
@@ -70,13 +88,30 @@ export function registerAccountTools(
       if (args.description) data.Description = args.description;
       if (args.parentListId) data.ParentRef = { ListID: args.parentListId };
 
-      const result = await session.addEntity("Account", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, account: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.addEntity("Account", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, account: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "AccountAddRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -103,13 +138,30 @@ export function registerAccountTools(
       if (args.description) data.Description = args.description;
       if (args.isActive !== undefined) data.IsActive = args.isActive;
 
-      const result = await session.modifyEntity("Account", data);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({ success: true, account: result }, null, 2),
-        }],
-      };
+      try {
+        const result = await session.modifyEntity("Account", data);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, account: result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "AccountModRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -135,12 +187,17 @@ export function registerAccountTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "AccountModRq (make_inactive) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
@@ -165,12 +222,17 @@ export function registerAccountTools(
           }],
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const statusCode = (err as { statusCode?: number })?.statusCode;
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: false, error: message, statusCode }),
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ListDelRq (Account) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
           }],
           isError: true,
         };
