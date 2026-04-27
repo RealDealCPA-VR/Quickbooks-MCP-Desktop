@@ -29,6 +29,28 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-04-27 — Vitest for the test harness; keep env-matrix as a standalone `.mjs` script
+
+**Chosen:** `vitest@^4` is the test framework. Tests live in `tests/*.test.ts`, import directly from `src/*.ts` (Vitest's Vite-based resolver handles the `.js`-extension imports the project uses for Node16 ESM), and run via `npm test` → `vitest run`. The five new Vitest files port four of the five existing `scripts/verify-*.mjs` harnesses (`item25-error-shape`, `item27-iterator`, `item29-input-validation`, plus two new `qbxml-roundtrip` and `simulation-store` files). The fifth harness — `verify-item23-env-matrix.mjs` — stays as a standalone `node` script invoked from CI / the regression checklist, NOT inside Vitest.
+
+**Why:** Phase 8 Item 31 in `todo.md` requires a Vitest test directory covering builder→parser round-trips, simulation-store CRUD, filter handling, and tool integration. Vitest is the de-facto modern Node test runner for ESM TypeScript projects; it has zero-config TypeScript transform, native ESM, snapshot support, and `--coverage`. The `verify-item23-env-matrix.mjs` script tests environment-variable behavior across `process.platform` values, which it does by spawning child Node processes with mocked `platform` argv — porting that to Vitest would require either `vi.mock("node:os")` / `vi.stubGlobal("process")` patterns that don't reach the CommonJS-imported `os.platform()` call, or extracting the platform check into an injectable interface (which would be a refactor, not a port). Running it as a standalone subprocess driver is the same shape it already has.
+
+**Alternatives rejected:**
+- **Jest.** Heavier ESM story (still requires `node --experimental-vm-modules` or a Babel transform), slower cold start, and no native `.ts` execution without `ts-jest` or `@swc/jest`. Vitest does it natively.
+- **`node --test` (the built-in runner).** Works for plain `.mjs` and is dependency-free, but doesn't transform TypeScript without a separate `--loader` (e.g. `tsx`). Mixing `tsx` + `node --test` reproduces what Vitest gives us out of the box, with worse error messages and no watch mode.
+- **Mocha + Chai.** Mature but requires picking a TS executor (ts-node, tsx, swc) and an assertion library — adds two-to-three deps where Vitest is one. No tangible benefit for this project's scale.
+- **Port `verify-item23-env-matrix.mjs` into Vitest with `vi.stubEnv` + `vi.spyOn(process, "platform")`.** Considered but rejected: the platform check happens during module evaluation in `session/manager.ts` (env-driven branch picked at construction time), so a clean port would require either re-importing the module per test (using `vi.resetModules()` plus dynamic `import()`) or refactoring the check into an injectable. The standalone subprocess script already does this correctly via real child processes — no behavioral fidelity is gained by porting.
+
+**Tradeoffs / consequences:**
+- One new dev dep (`vitest`) and its 73 transitive deps. `package.json` `devDependencies` only — never reaches production install.
+- Tests now run in two places: `npm test` for the main suite, plus `node scripts/verify-item23-env-matrix.mjs` separately. Both must pass for a session to claim "all green." The handoff verification checklist already lists both.
+- Existing `scripts/verify-*.mjs` files are kept after the port (they import from `dist/` and verify the built output, while Vitest imports from `src/` and verifies the source). When a future change breaks the build but leaves source consistent, the `.mjs` harnesses catch it; when source drifts but the dist hasn't been rebuilt, Vitest catches it. They're complementary, not redundant.
+- Vitest config is intentionally minimal — no `vitest.config.ts` file. The default `test/` glob and Node ESM behavior are sufficient. Add a config file only if we need to set up `coverage`, `setupFiles`, or non-default test pools.
+
+**Revisit when:** A workflow emerges that the standalone `.mjs` harnesses can't cover (e.g. coverage reporting, parallel test sharding, snapshot testing of XML output) — at that point, drop the `.mjs` files and centralize in Vitest. Or when the test suite grows past ~5 files and a `vitest.config.ts` becomes necessary for organization.
+
+---
+
 ## 2026-04-26 — `EditSequence` carries a monotonic counter, not a pure ISO timestamp
 
 **Chosen:** The simulation generates `EditSequence` via a new `nextEditSequence()` helper that returns `${new Date().toISOString()}-${counter++}`. The counter is the same `idCounter` field used by `nextId()`, so `EditSequence` is guaranteed to rotate to a unique value on every `handleAdd` and `handleMod`, even when calls land in the same millisecond.

@@ -246,6 +246,14 @@ npm run build
 npm start
 ```
 
+### Test
+```bash
+npm test            # vitest run — 178 assertions across 5 files in tests/
+node scripts/verify-item23-env-matrix.mjs   # standalone — env-var/platform matrix
+```
+
+The Vitest suite imports from `src/` (verifies the source). The five `scripts/verify-*.mjs` harnesses import from `dist/` (verify the built output). Both are kept and complementary — see [DECISIONS.md](DECISIONS.md) `2026-04-27 — Vitest`.
+
 ### Configure as MCP server (opencode.jsonc)
 ```jsonc
 {
