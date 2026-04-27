@@ -55,7 +55,7 @@ _(All Phase 4 in-scope items complete — Items 10, 11, 12, 13, 30. See Complete
 
 ## Phase 5 — Reporting
 
-_(Items 14, 19, 21 done — see Completed below. Item 20 still open per `todo.md`.)_
+_(All Phase 5 items done — see Completed below.)_
 
 ---
 
@@ -66,6 +66,60 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+### Item 20 — `qb_pnl_report` / `qb_balance_sheet_report` via `GeneralSummaryReportQueryRq` _(Phase 5)_ — done 2026-04-26
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] `buildReportRequest({ reportType, fromDate?, toDate?, basis? }, version?)` in [src/qbxml/builder.ts](src/qbxml/builder.ts) emits a `GeneralSummaryReportQueryRq` with `<GeneralSummaryReportType>`, `<ReportPeriod>` (FromReportDate / ToReportDate), `<ReportBasis>` (default Accrual), `<SummarizeColumnsBy>TotalOnly</SummarizeColumnsBy>`, `<IncludeSubcolumns>0</IncludeSubcolumns>`. Report rqs are not list/txn queries — they got their own builder.
+- [x] `extractReportData(response, expectedType?)` in [src/qbxml/parser.ts](src/qbxml/parser.ts) pulls the `ReportRet` block out of the named `*Rs` body, returning `{}` on the "no data" status (1) and re-throwing `QBXMLResponseError` on hard failure.
+- [x] `QBSessionManager.runReport(reportType, { fromDate, toDate, basis })` in [src/session/manager.ts](src/session/manager.ts) wires the new builder + extractor (no longer reuses `buildQueryRequest` / `extractResponseData`).
+- [x] Simulation handler `handleReportQuery` in [src/session/simulation-store.ts](src/session/simulation-store.ts) routes `GeneralSummaryReportQueryRq` (added before the `endsWith("QueryRq")` branch in `processRequest`). Rejects unknown `GeneralSummaryReportType` with `statusCode: 3120`.
+- [x] **P&L** (`reportType=ProfitAndLossStandard`):
+  - [x] Income walk: Invoice + SalesReceipt (positive), CreditMemo (negative). Lines resolve their account via line.AccountRef (rare on these txns), or via line.ItemRef → item.IncomeAccountRef / item.SalesOrPurchase.AccountRef. Unresolved lines → "Uncategorized Income".
+  - [x] Expense walk: Bill + Check + CreditCardCharge ExpenseLineRet (AccountRef direct) + ItemLineRet (item.ExpenseAccountRef / COGSAccountRef / SalesOrPurchase.AccountRef). Unresolved → "Uncategorized Expense".
+  - [x] JournalEntry contributes: debit lines posting to expense accounts add positive expense; credit lines posting to income accounts add positive income. Asset/liability/equity lines don't contribute to P&L.
+  - [x] Filter: `TxnDate ∈ [fromDate, toDate]` inclusive on both bounds. Missing bounds = unbounded.
+  - [x] Sections in canonical order: Income → Other Income → Cost of Goods Sold → Expenses → Other Expenses. Each section: `{ name, accounts: [{ name, total }], subtotal }` with accounts sorted alphabetically.
+  - [x] Top-level totals: `totalIncome`, `totalCOGS`, `totalExpenses`, `grossProfit = totalIncome − totalCOGS`, `netIncome = totalIncome − totalCOGS − totalExpenses`.
+  - [x] `basis: "Accrual" | "Cash"` accepted (currently identical in simulation; live mode lands with Phase 7).
+- [x] **Balance Sheet** (`reportType=BalanceSheetStandard`):
+  - [x] Assets / Liabilities / Equity sections built from `Account.Balance` (snapshot — `asOfDate` is advisory for those sections in simulation, documented).
+  - [x] Period NetIncome (lifetime txn walk up to asOfDate) closes into Equity as a "Net Income" row, mirroring real QB's "Retained Earnings + Net Income" pattern.
+  - [x] Accounting identity Assets = Liabilities + Equity reconciles by closing the simulation seed gap into a "Balancing Adjustment (simulation seed gap)" Equity row. The known $10,700 phantom AR shows up here.
+  - [x] Top-level totals: `totalAssets`, `totalLiabilities`, `totalEquity`, `netIncome`. After the balancing adjustment, `totalAssets === totalLiabilities + totalEquity` always holds.
+  - [x] Optional `asOfDate` zod param (regex-validated `YYYY-MM-DD`, defaults to today UTC).
+- [x] Both tools wrapped in try/catch translating `QBXMLResponseError` → `{ success: false, statusCode, statusMessage }` with `isError: true` (Item 25 reference shape).
+- [x] Both tools registered via `registerReportTools` (auto-discovered through the existing wire-up in [src/index.ts](src/index.ts)).
+- [x] Schema rejects `04/26/2026` and `2026/04/26`; accepts `2026-04-26` and `{}`.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `qb_balance_summary` (Item 21) — still emits canonical-ordered array, `Bank` first with total 165000, `subtotals.netIncome === -22800`.
+- [x] `qb_ar_aging` (Item 19) — seed sanity unchanged (`totalAccountsReceivable === 16000`, all in `90+`, Global Industries first).
+- [x] `qb_ap_aging` (Item 19) — empty path unchanged.
+- [x] `qb_company_info` (Item 14) — auto-connect path still returns `Demo Co`.
+- [x] `qb_invoice_create` / `qb_bill_create` — still functional (the verification harness creates txns and reads them back through the new report tools, so a regression here would surface as P&L numbers being wrong).
+
+**Documentation criteria**:
+- [x] README Reports & Queries table — `qb_pnl_report` and `qb_balance_sheet_report` rows added with full description of walk semantics, section ordering, totals, basis, and asOfDate semantics.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — the `qb_balance_summary / qb_ar_aging / qb_ap_aging` line now also covers `qb_pnl_report / qb_balance_sheet_report` with their walk + closure semantics.
+- [x] No `ARCHITECTURE.md` change — the report path follows the existing builder → simulation-store → parser pipeline (just a new request type). Live-mode row-tree translation is documented as a Phase 7 follow-up in code comments (`extractReportData` jsdoc + `handleReportQuery` method note).
+- [x] `DECISIONS.md` not updated — the simplified-vs-row-tree shape decision is documented inline in `extractReportData` and `handleReportQuery` rather than a standalone decision (it's a scope clarification, not a tradeoff among alternatives).
+
+**Verification commands**:
+```bash
+npm run build              # TypeScript clean
+node verify_item20.mjs     # P&L + BS happy paths + regressions — see HANDOFF.md
+```
+
+**Notes**:
+- Simulation-mode `ReportRet` shape diverges from real QB's row-tree wire format. Documented inline (`extractReportData` jsdoc + `handleReportQuery` method note). Phase 7 (live COM) will need a row-tree → simplified-shape adapter; until then the simulation owns the wire format.
+- `IncludeSubcolumns=0` / `SummarizeColumnsBy=TotalOnly` only — multi-period / class / customer slicing is out of Item 20 scope.
+- Cash basis is currently identical to Accrual in simulation (revenue recognition tied to ReceivePayment is a separate piece of work). The basis param is plumbed through to ReportRet for callers, but doesn't change aggregation yet.
+- The Balance Sheet uses `Account.Balance` as a snapshot rather than walking transactions for asset/liability/equity. This is a pragmatic simplification — real QB walks every transaction through every account through history. The seed gap surfaces transparently as the "Balancing Adjustment" row so the operator sees the discrepancy.
+
+---
 
 ### Item 19 — `qb_ar_aging` / `qb_ap_aging` — open-txn walk + 0-30 / 31-60 / 61-90 / 90+ buckets _(Phase 5)_ — done 2026-04-26
 

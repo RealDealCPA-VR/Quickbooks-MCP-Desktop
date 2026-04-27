@@ -76,7 +76,9 @@ export class SimulationStore {
         ? value as Record<string, unknown>
         : {};
 
-      if (key.endsWith("QueryRq")) {
+      if (key === "GeneralSummaryReportQueryRq") {
+        responses.push(this.handleReportQuery(key, reqData));
+      } else if (key.endsWith("QueryRq")) {
         responses.push(this.handleQuery(key, reqData));
       } else if (key.endsWith("AddRq")) {
         responses.push(this.handleAdd(key, reqData));
@@ -260,6 +262,468 @@ export class SimulationStore {
       statusSeverity: "Info",
       statusMessage: "Status OK",
       data: { [retName]: results },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Report query handler — GeneralSummaryReportQueryRq
+  // -----------------------------------------------------------------------
+
+  // Walks income/expense transactions filtered by ReportPeriod, aggregates by
+  // account, and emits a simplified ReportRet shape:
+  //   { ReportTitle, ReportBasis, FromReportDate, ToReportDate, Sections,
+  //     Totals: { GrossProfit?, NetIncome, TotalAssets?, TotalLiabilities?,
+  //              TotalEquity? } }
+  //
+  // Sections are { Name, Accounts: [{ Name, Total }], Subtotal } in canonical
+  // QB order. Real QB's wire format uses an interleaved row tree (TextRow /
+  // DataRow / SubtotalRow / TotalRow under ReportData) — that's the live-mode
+  // shape Phase 7 will need to translate. The simulation owns its wire format
+  // until then; the simplified shape is what qb_pnl_report /
+  // qb_balance_sheet_report expect.
+  //
+  // Income side: Invoice + SalesReceipt + CreditMemo (negative). Each line's
+  // account is resolved via line.AccountRef (rare on these txns), or via
+  // line.ItemRef → item.IncomeAccountRef / item.SalesOrPurchase.AccountRef
+  // (Service items use the SalesOrPurchase.AccountRef shape). Lines with no
+  // resolvable account land in "Uncategorized Income" so totals still
+  // reconcile.
+  //
+  // Expense side: Bill + Check + CreditCardCharge. ExpenseLineRet carries
+  // AccountRef directly (the common path); ItemLineRet resolves the same way
+  // as income items (item.ExpenseAccountRef / SalesOrPurchase.AccountRef /
+  // COGSAccountRef for Inventory items consumed via Bill ItemLine). JE lines
+  // (JournalDebitLineRet / JournalCreditLineRet) also carry AccountRef and
+  // contribute (debit increases expense, credit increases income — same sign
+  // convention as real QB's posting model).
+  //
+  // Date filter: TxnDate ∈ [FromReportDate, ToReportDate]. Both bounds
+  // inclusive. Missing FromReportDate => no lower bound (all-time). Missing
+  // ToReportDate => no upper bound. ReportDate alone (Balance Sheet) is mapped
+  // to ToReportDate by the builder — so the filter is unified.
+  //
+  // BalanceSheet uses the same walk to derive period NetIncome (which closes
+  // into Equity), and builds Asset / Liability / Equity sections from
+  // Account.Balance (the simulation's snapshot — until Phase 7 we don't have
+  // a transaction history rich enough to reconstruct asset/liability balances
+  // from txn walks). This means asOfDate is advisory for the AS/LI/EQ
+  // sections; the period's NetIncome (which IS walked) reconciles with the
+  // P&L for the same range.
+  private handleReportQuery(
+    reqType: string,
+    reqData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const rsType = reqType.replace("Rq", "Rs");
+    const reportType = String(reqData.GeneralSummaryReportType ?? "");
+    const reportPeriod = (reqData.ReportPeriod as Record<string, unknown> | undefined) ?? {};
+    const fromDate = reportPeriod.FromReportDate ? String(reportPeriod.FromReportDate) : null;
+    const toDate = reportPeriod.ToReportDate ? String(reportPeriod.ToReportDate) : null;
+    const basis = String(reqData.ReportBasis ?? "Accrual") as "Accrual" | "Cash";
+
+    if (reportType !== "ProfitAndLossStandard" && reportType !== "BalanceSheetStandard") {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard and BalanceSheetStandard are implemented)`,
+        data: {},
+      };
+    }
+
+    if (reportType === "ProfitAndLossStandard") {
+      const reportRet = this.buildPnLReport(fromDate, toDate, basis);
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: reportRet },
+      };
+    }
+
+    // BalanceSheetStandard
+    const reportRet = this.buildBalanceSheetReport(toDate, basis);
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { ReportRet: reportRet },
+    };
+  }
+
+  // Resolve the GL account a transaction line posts to. ExpenseLine carries
+  // AccountRef directly. ItemLine carries ItemRef → item lookup → its income
+  // / expense / COGS account ref (depends on direction). Returns null when
+  // unresolvable so the caller can route to an Uncategorized bucket.
+  private resolveLineAccount(
+    line: Record<string, unknown>,
+    direction: "income" | "expense"
+  ): string | null {
+    const directRef = line.AccountRef as Record<string, unknown> | undefined;
+    if (directRef?.FullName) return String(directRef.FullName);
+    if (directRef?.ListID) {
+      const acct = this.getStore("Account").get(String(directRef.ListID));
+      if (acct) return String(acct.FullName ?? acct.Name ?? "");
+    }
+
+    const itemRef = line.ItemRef as Record<string, unknown> | undefined;
+    if (!itemRef) return null;
+    const item = this.findItemByRef(itemRef);
+    if (!item) return null;
+
+    if (direction === "income") {
+      const ref = (item.IncomeAccountRef ??
+        (item.SalesOrPurchase as Record<string, unknown> | undefined)?.AccountRef) as
+        | Record<string, unknown>
+        | undefined;
+      if (ref?.FullName) return String(ref.FullName);
+    } else {
+      const ref = (item.ExpenseAccountRef ??
+        item.COGSAccountRef ??
+        (item.SalesOrPurchase as Record<string, unknown> | undefined)?.AccountRef) as
+        | Record<string, unknown>
+        | undefined;
+      if (ref?.FullName) return String(ref.FullName);
+    }
+    return null;
+  }
+
+  // Find an item across all 5 subtype stores by ListID (preferred) or FullName.
+  private findItemByRef(ref: Record<string, unknown>): StoredEntity | null {
+    const subtypes = ["ItemService", "ItemInventory", "ItemNonInventory", "ItemOtherCharge", "ItemGroup"];
+    const listId = ref.ListID ? String(ref.ListID) : null;
+    const fullName = ref.FullName ? String(ref.FullName) : null;
+    for (const t of subtypes) {
+      const store = this.getStore(t);
+      if (listId) {
+        const hit = store.get(listId);
+        if (hit) return hit;
+      }
+      if (fullName) {
+        for (const e of store.values()) {
+          if (String(e.FullName ?? e.Name ?? "") === fullName) return e;
+        }
+      }
+    }
+    return null;
+  }
+
+  // Walk lines on every txn of the given store-list, filtered by TxnDate ∈
+  // [from, to]. Returns flat { accountName, amount } records. `negate` flips
+  // sign (used for CreditMemo which is AR-negative on income side).
+  private walkTxnLines(
+    storeNames: string[],
+    lineKeys: string[],
+    direction: "income" | "expense",
+    from: string | null,
+    to: string | null,
+    negate = false
+  ): { accountName: string; amount: number }[] {
+    const out: { accountName: string; amount: number }[] = [];
+    for (const storeName of storeNames) {
+      for (const txn of this.getStore(storeName).values()) {
+        const txnDate = String(txn.TxnDate ?? "");
+        if (from && txnDate < from) continue;
+        if (to && txnDate > to) continue;
+        for (const lineKey of lineKeys) {
+          const lines = txn[lineKey];
+          if (!Array.isArray(lines)) continue;
+          for (const line of lines as Record<string, unknown>[]) {
+            const amt = Number(line.Amount ?? 0);
+            if (!Number.isFinite(amt) || amt === 0) continue;
+            const accountName = this.resolveLineAccount(line, direction)
+              ?? (direction === "income" ? "Uncategorized Income" : "Uncategorized Expense");
+            out.push({ accountName, amount: negate ? -amt : amt });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // Walk JournalEntry lines, filtered by TxnDate. Debit lines post to expense/
+  // asset accounts (positive); credit lines post to income/liability accounts
+  // (positive on the income side). Returns separate income / expense arrays
+  // keyed by the account's AccountType, since a JE can hit any account.
+  private walkJournalEntryLines(
+    from: string | null,
+    to: string | null
+  ): { income: { accountName: string; amount: number }[]; expense: { accountName: string; amount: number }[] } {
+    const income: { accountName: string; amount: number }[] = [];
+    const expense: { accountName: string; amount: number }[] = [];
+    const accountStore = this.getStore("Account");
+    const lookupType = (accountName: string): string | null => {
+      for (const a of accountStore.values()) {
+        if (String(a.FullName ?? a.Name ?? "") === accountName) {
+          return String(a.AccountType ?? "");
+        }
+      }
+      return null;
+    };
+
+    for (const je of this.getStore("JournalEntry").values()) {
+      const txnDate = String(je.TxnDate ?? "");
+      if (from && txnDate < from) continue;
+      if (to && txnDate > to) continue;
+
+      const debitLines = Array.isArray(je.JournalDebitLineRet) ? je.JournalDebitLineRet as Record<string, unknown>[] : [];
+      const creditLines = Array.isArray(je.JournalCreditLineRet) ? je.JournalCreditLineRet as Record<string, unknown>[] : [];
+
+      for (const line of debitLines) {
+        const ref = line.AccountRef as Record<string, unknown> | undefined;
+        const name = ref?.FullName ? String(ref.FullName) : null;
+        if (!name) continue;
+        const amt = Number(line.Amount ?? 0);
+        if (!Number.isFinite(amt) || amt === 0) continue;
+        const type = lookupType(name);
+        if (type === "Income" || type === "OtherIncome") {
+          // Rare — a debit to an income account reduces income.
+          income.push({ accountName: name, amount: -amt });
+        } else if (type === "CostOfGoodsSold" || type === "Expense" || type === "OtherExpense") {
+          expense.push({ accountName: name, amount: amt });
+        }
+        // Asset/liability/equity debits don't contribute to P&L.
+      }
+      for (const line of creditLines) {
+        const ref = line.AccountRef as Record<string, unknown> | undefined;
+        const name = ref?.FullName ? String(ref.FullName) : null;
+        if (!name) continue;
+        const amt = Number(line.Amount ?? 0);
+        if (!Number.isFinite(amt) || amt === 0) continue;
+        const type = lookupType(name);
+        if (type === "Income" || type === "OtherIncome") {
+          income.push({ accountName: name, amount: amt });
+        } else if (type === "CostOfGoodsSold" || type === "Expense" || type === "OtherExpense") {
+          // Rare — a credit to an expense account reduces expense.
+          expense.push({ accountName: name, amount: -amt });
+        }
+      }
+    }
+
+    return { income, expense };
+  }
+
+  // Group { accountName, amount } records by AccountType, ordered by the
+  // sectionMap. Records whose AccountType doesn't match any section land in a
+  // trailing "Other" section so they're visible — but Other does NOT
+  // contribute to any of the named subtotals (callers derive section totals
+  // from the per-section Subtotal field, not from a global total).
+  // Accounts within a section are sorted alphabetically.
+  private groupByAccountType(
+    records: { accountName: string; amount: number }[],
+    sectionMap: { name: string; types: readonly string[] }[]
+  ): { Name: string; Accounts: { Name: string; Total: number }[]; Subtotal: number }[] {
+    const accountStore = this.getStore("Account");
+    const accountTypeByName = new Map<string, string>();
+    for (const a of accountStore.values()) {
+      const name = String(a.FullName ?? a.Name ?? "");
+      const type = String(a.AccountType ?? "");
+      if (name) accountTypeByName.set(name, type);
+    }
+
+    const buckets = new Map<string, Map<string, number>>();
+    for (const sec of sectionMap) buckets.set(sec.name, new Map());
+    const unroutedBucket = new Map<string, number>();
+
+    for (const rec of records) {
+      const type = accountTypeByName.get(rec.accountName) ??
+        (rec.accountName === "Uncategorized Income" ? "Income" :
+         rec.accountName === "Uncategorized Expense" ? "Expense" : "");
+      let routed = false;
+      for (const sec of sectionMap) {
+        if (sec.types.includes(type as string)) {
+          const m = buckets.get(sec.name)!;
+          m.set(rec.accountName, (m.get(rec.accountName) ?? 0) + rec.amount);
+          routed = true;
+          break;
+        }
+      }
+      if (!routed) {
+        unroutedBucket.set(rec.accountName, (unroutedBucket.get(rec.accountName) ?? 0) + rec.amount);
+      }
+    }
+
+    const sections: { Name: string; Accounts: { Name: string; Total: number }[]; Subtotal: number }[] = [];
+    for (const sec of sectionMap) {
+      const m = buckets.get(sec.name)!;
+      if (m.size === 0) continue;
+      const accounts = [...m.entries()]
+        .map(([Name, Total]) => ({ Name, Total: Math.round(Total * 100) / 100 }))
+        .sort((a, b) => a.Name.localeCompare(b.Name));
+      const subtotal = accounts.reduce((s, a) => s + a.Total, 0);
+      sections.push({
+        Name: sec.name,
+        Accounts: accounts,
+        Subtotal: Math.round(subtotal * 100) / 100,
+      });
+    }
+    if (unroutedBucket.size > 0) {
+      const accounts = [...unroutedBucket.entries()]
+        .map(([Name, Total]) => ({ Name, Total: Math.round(Total * 100) / 100 }))
+        .sort((a, b) => a.Name.localeCompare(b.Name));
+      const subtotal = accounts.reduce((s, a) => s + a.Total, 0);
+      sections.push({
+        Name: "Other",
+        Accounts: accounts,
+        Subtotal: Math.round(subtotal * 100) / 100,
+      });
+    }
+    return sections;
+  }
+
+  private buildPnLReport(
+    from: string | null,
+    to: string | null,
+    basis: "Accrual" | "Cash"
+  ): Record<string, unknown> {
+    // Income side: Invoice + SalesReceipt (positive), CreditMemo (negative).
+    const incomeLines = [
+      ...this.walkTxnLines(["Invoice"], ["InvoiceLineRet"], "income", from, to),
+      ...this.walkTxnLines(["SalesReceipt"], ["SalesReceiptLineRet"], "income", from, to),
+      ...this.walkTxnLines(["CreditMemo"], ["CreditMemoLineRet"], "income", from, to, true),
+    ];
+    // Expense side: Bill + Check + CreditCardCharge (ExpenseLine + ItemLine).
+    const expenseLines = [
+      ...this.walkTxnLines(["Bill"], ["ExpenseLineRet", "ItemLineRet"], "expense", from, to),
+      ...this.walkTxnLines(["Check"], ["ExpenseLineRet", "ItemLineRet"], "expense", from, to),
+      ...this.walkTxnLines(["CreditCardCharge"], ["ExpenseLineRet", "ItemLineRet"], "expense", from, to),
+    ];
+    const je = this.walkJournalEntryLines(from, to);
+    incomeLines.push(...je.income);
+    expenseLines.push(...je.expense);
+
+    // Single grouping pass over all records — section routing is by the
+    // record's account's AccountType, so income/expense origin doesn't need
+    // to be tracked explicitly. Records that don't match any section's types
+    // land in "Other" but DON'T contribute to the named totals.
+    const allRecords = [...incomeLines, ...expenseLines];
+    const sections = this.groupByAccountType(allRecords, [
+      { name: "Income", types: ["Income"] },
+      { name: "Other Income", types: ["OtherIncome"] },
+      { name: "Cost of Goods Sold", types: ["CostOfGoodsSold"] },
+      { name: "Expenses", types: ["Expense"] },
+      { name: "Other Expenses", types: ["OtherExpense"] },
+    ]);
+
+    const subtotalOf = (name: string): number =>
+      sections.find((s) => s.Name === name)?.Subtotal ?? 0;
+
+    const totalIncome = Math.round((subtotalOf("Income") + subtotalOf("Other Income")) * 100) / 100;
+    const totalCOGS = subtotalOf("Cost of Goods Sold");
+    const totalExpenses = Math.round((subtotalOf("Expenses") + subtotalOf("Other Expenses")) * 100) / 100;
+    const grossProfit = Math.round((totalIncome - totalCOGS) * 100) / 100;
+    const netIncome = Math.round((totalIncome - totalCOGS - totalExpenses) * 100) / 100;
+
+    return {
+      ReportTitle: "Profit & Loss",
+      ReportBasis: basis,
+      FromReportDate: from,
+      ToReportDate: to,
+      Sections: sections,
+      Totals: {
+        TotalIncome: totalIncome,
+        TotalCOGS: totalCOGS,
+        TotalExpenses: totalExpenses,
+        GrossProfit: grossProfit,
+        NetIncome: netIncome,
+      },
+    };
+  }
+
+  // Balance Sheet — Asset / Liability / Equity sections from Account.Balance
+  // (snapshot — see method-level note on handleReportQuery), plus current-
+  // period NetIncome derived from the same txn walk as P&L (FromDate = null,
+  // ToDate = asOfDate). The accounting identity Assets = Liabilities + Equity
+  // is reconciled by closing NetIncome into Equity; if the seeded balances are
+  // off (the known $10,700 phantom AR), that delta surfaces in a "Balancing
+  // Adjustment" pseudo-equity row so totals still reconcile mathematically.
+  private buildBalanceSheetReport(
+    asOfDate: string | null,
+    basis: "Accrual" | "Cash"
+  ): Record<string, unknown> {
+    const accounts = [...this.getStore("Account").values()];
+
+    const sectionMap = [
+      { name: "Assets", types: ["Bank", "AccountsReceivable", "OtherCurrentAsset", "Inventory", "FixedAsset", "OtherAsset"] },
+      { name: "Liabilities", types: ["AccountsPayable", "CreditCard", "OtherCurrentLiability", "LongTermLiability"] },
+      { name: "Equity", types: ["Equity"] },
+    ];
+
+    const sections: { Name: string; Accounts: { Name: string; Total: number }[]; Subtotal: number }[] = [];
+    const sectionTotals: Record<string, number> = { Assets: 0, Liabilities: 0, Equity: 0 };
+
+    for (const sec of sectionMap) {
+      const matched = accounts.filter((a) => sec.types.includes(String(a.AccountType ?? "")));
+      if (matched.length === 0) continue;
+      const accountRows = matched
+        .map((a) => ({
+          Name: String(a.FullName ?? a.Name ?? ""),
+          Total: Math.round(Number(a.Balance ?? 0) * 100) / 100,
+        }))
+        .sort((a, b) => a.Name.localeCompare(b.Name));
+      const subtotal = accountRows.reduce((s, r) => s + r.Total, 0);
+      sections.push({
+        Name: sec.name,
+        Accounts: accountRows,
+        Subtotal: Math.round(subtotal * 100) / 100,
+      });
+      sectionTotals[sec.name] = subtotal;
+    }
+
+    // Current-period NetIncome closes into Equity (mirrors real QB's
+    // "Retained Earnings" + "Net Income" line). asOfDate maps to ToReportDate;
+    // FromDate is null for the lifetime-to-asOfDate net.
+    const pnl = this.buildPnLReport(null, asOfDate, basis);
+    const netIncome = Number((pnl.Totals as Record<string, unknown>).NetIncome ?? 0);
+
+    const equitySection = sections.find((s) => s.Name === "Equity");
+    if (equitySection) {
+      equitySection.Accounts.push({ Name: "Net Income", Total: Math.round(netIncome * 100) / 100 });
+      equitySection.Subtotal = Math.round((equitySection.Subtotal + netIncome) * 100) / 100;
+      sectionTotals.Equity += netIncome;
+    } else {
+      sections.push({
+        Name: "Equity",
+        Accounts: [{ Name: "Net Income", Total: Math.round(netIncome * 100) / 100 }],
+        Subtotal: Math.round(netIncome * 100) / 100,
+      });
+      sectionTotals.Equity = netIncome;
+    }
+
+    const totalAssets = Math.round(sectionTotals.Assets * 100) / 100;
+    const totalLiabilities = Math.round(sectionTotals.Liabilities * 100) / 100;
+    const totalEquity = Math.round(sectionTotals.Equity * 100) / 100;
+
+    // Balancing adjustment: real QB's Assets = Liabilities + Equity holds by
+    // construction. The simulation's seed has phantom Account.Balance fields
+    // that don't match transaction history (known $10,700 AR phantom). Surface
+    // the gap as a pseudo-row so the operator sees totals reconcile.
+    const imbalance = Math.round((totalAssets - (totalLiabilities + totalEquity)) * 100) / 100;
+    if (imbalance !== 0) {
+      const eq = sections.find((s) => s.Name === "Equity");
+      const adjRow = { Name: "Balancing Adjustment (simulation seed gap)", Total: imbalance };
+      if (eq) {
+        eq.Accounts.push(adjRow);
+        eq.Subtotal = Math.round((eq.Subtotal + imbalance) * 100) / 100;
+      } else {
+        sections.push({ Name: "Equity", Accounts: [adjRow], Subtotal: imbalance });
+      }
+    }
+
+    const finalEquity = Math.round((totalEquity + imbalance) * 100) / 100;
+
+    return {
+      ReportTitle: "Balance Sheet",
+      ReportBasis: basis,
+      AsOfDate: asOfDate,
+      Sections: sections,
+      Totals: {
+        TotalAssets: totalAssets,
+        TotalLiabilities: totalLiabilities,
+        TotalEquity: finalEquity,
+        NetIncome: Math.round(netIncome * 100) / 100,
+      },
     };
   }
 

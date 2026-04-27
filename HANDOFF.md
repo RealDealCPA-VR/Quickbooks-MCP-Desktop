@@ -4,133 +4,101 @@ _Last updated: 2026-04-26_
 
 ## Last Session Summary
 
-- **Closed Phase 5, Item 19 — `qb_ar_aging` / `qb_ap_aging` rewritten to walk open transactions and bucket by aging band** ([todo.md:42](todo.md#L42) checked). Both tools now do real aging instead of dumping `Customer.Balance` / `Vendor.Balance` rollups. Five changes in [src/tools/reports.ts](src/tools/reports.ts):
-  - **Aging-bucket helpers at module scope** ([src/tools/reports.ts:32-58](src/tools/reports.ts#L32-L58)). `BUCKET_KEYS` const tuple, `BucketKey` type, `emptyBuckets()` factory, `bucketFor(days)` → `0-30 | 31-60 | 61-90 | 90+`, plus `dateUTC(s)` and `daysBetween(asOfDate, dueDate)`. Date math uses `Date.UTC` to dodge local-TZ drift on YYYY-MM-DD inputs (regex pre-validates so `split("-").map(Number)` is safe). Negative `daysOutstanding` (asOfDate < dueDate, i.e. not yet due) collapses into the `0-30` band — matches QB's standard summary aging layout.
-  - **`qb_ar_aging` rewrite** ([src/tools/reports.ts:182-260](src/tools/reports.ts#L182-L260)). Queries `Invoice` (not `Customer`), filters to `IsPaid !== true && Number(BalanceRemaining) > 0`, ages each open invoice by `(asOfDate − DueDate ?? TxnDate ?? asOfDate)`, groups by `CustomerRef.FullName` into `{ name, balance, buckets, txnCount }` rows. Top-level response: `{ asOfDate, totalAccountsReceivable, bucketTotals, customers }`. Customers sorted by balance desc. `totalAccountsReceivable` derived from `bucketTotals` (single source of truth — sums always reconcile). Wrapped in try/catch translating `QBXMLResponseError` → `{ success: false, statusCode, statusMessage }` with `isError: true` (Item 25 reference shape, opportunistic since the file was being rewritten).
-  - **`qb_ap_aging` rewrite** ([src/tools/reports.ts:262-340](src/tools/reports.ts#L262-L340)). Same skeleton, swapped for `Bill` / `VendorRef` / `AmountDue`. Bills use `AmountDue` as the open-balance field — the bill-side equivalent of an invoice's `BalanceRemaining`. The handoff for Item 19 said both have `BalanceRemaining`; verified in [src/session/simulation-store.ts:954-955](src/session/simulation-store.ts#L954-L955) — bills only get `AmountDue + IsPaid`, not `BalanceRemaining`. Adjusted accordingly.
-  - **`asOfDate` zod param** — both tools accept `z.string().regex(ISO_DATE_RE).optional()` (reusing the same constant Item 21 added). Defaults to `new Date().toISOString().split("T")[0]` (today, UTC) when omitted. Schema rejects `04/26/2026`, `2026/04/26`; accepts `2026-04-26` and `{}`.
-  - **Tool descriptions tightened** ([src/tools/reports.ts:182](src/tools/reports.ts#L182), [src/tools/reports.ts:262](src/tools/reports.ts#L262)) — describe filtering rules, fallback behavior, bucket bands, and "single txn = single bucket" guarantee, so the LLM consumer (and future readers) can predict behavior from the description alone.
-- **README updated** — `qb_ar_aging` / `qb_ap_aging` rows in the Reports & Queries table at [README.md:198-199](README.md#L198-L199) now describe the open-txn walk, bucket bands, and `asOfDate` semantics.
-- **ACCEPTANCE_CRITERIA.md** — Item 19 entry written and placed at the top of the Completed section. Phase 5 header updated to "Items 14, 19, 21 done — Item 20 still open."
-- **No DECISIONS.md / ARCHITECTURE.md change** — bucket bands are straight from QB's documented summary aging report (not a tradeoff). The open-txn walk is the obvious correct implementation; the Customer/Vendor `Balance` rollup was the bug. `runReport` was deliberately not touched (handoff scope guard — that's Item 20).
-- **Verified.** `npm run build` green. Item 19 verification harness: **54/54 PASS**. Coverage:
-  - **AR seed sanity (asOfDate=2026-04-26)** — both seeded unpaid invoices (Acme $7500 due 2024-12-01, Global $8500 due 2024-12-15) land in `90+`. Total `$16,000`. `bucketTotals = { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 16000 }`. Customers sorted Global → Acme. `txnCount === 1` per row.
-  - **AR bucket boundaries (sweeping asOfDate over Acme's 2024-12-01 due date)** — every boundary verified: 0 / 30 / 31 / 60 / 61 / 90 / 91 / −30 days → `0-30` / `0-30` / `31-60` / `31-60` / `61-90` / `61-90` / `90+` / `0-30`. The `<= 30` band correctly absorbs negative-days (future-dated) txns.
-  - **`asOfDate` default** — no-arg call fills `asOfDate` with today (UTC). Seed still buckets in `90+`.
-  - **TxnDate fallback** — created an invoice with `txnDate=2025-12-01` and **no** `dueDate`. `qb_ar_aging({ asOfDate: "2026-01-01" })` puts the $1234 line in `31-60` (31 days from TxnDate). Confirms the `DueDate ?? TxnDate` chain.
-  - **AP empty path** — no seeded bills → `vendors: []`, `totalAccountsPayable: 0`, all bucket totals 0. No throws on empty Bill store.
-  - **AP created-bill path** — created 4 bills under "Office Supplies Inc" with due dates `2026-04-20 / 2026-03-01 / 2026-02-01 / 2025-01-01` and amounts `100 / 200 / 400 / 800`. With `asOfDate=2026-04-26`: `bucketTotals = { "0-30": 100, "31-60": 200, "61-90": 400, "90+": 800 }`, single vendor row sums to 1500 with `txnCount === 4`. All 4 bands exercised.
-  - **Zod schema** — both tools reject `04/26/2026` and `2026/04/26`; accept `2026-04-26` and `{}`. Validated by `z.object(schemaShape).safeParse(...)` (the verified-handler-bypass-zod gotcha from prior handoff).
-  - **Regression — Item 21** — `qb_balance_summary` still emits canonical-ordered array, `Bank` first with total 165000, `subtotals.netIncome === -22800`.
-  - **Regression — Item 14** — `qb_company_info` auto-connect path still returns `Demo Co`.
+- **Closed Phase 5, Item 20 — `qb_pnl_report` and `qb_balance_sheet_report` via `GeneralSummaryReportQueryRq`** ([todo.md:43](todo.md#L43) checked). Phase 5 is now complete.
+  - **Builder.** New `buildReportRequest({ reportType, fromDate?, toDate?, basis? }, version?)` in [src/qbxml/builder.ts](src/qbxml/builder.ts) emits a `GeneralSummaryReportQueryRq` with `<GeneralSummaryReportType>` / `<ReportPeriod>` (FromReportDate + ToReportDate) / `<ReportBasis>` (default Accrual) / `<SummarizeColumnsBy>TotalOnly</SummarizeColumnsBy>` / `<IncludeSubcolumns>0</IncludeSubcolumns>`. Report rqs are not list/txn queries — they got their own builder rather than overloading `buildQueryRequest`.
+  - **Parser.** New `extractReportData(response, expectedType?)` in [src/qbxml/parser.ts](src/qbxml/parser.ts:140) pulls the `ReportRet` block out of the named `*Rs` body. Mirrors `extractResponseData` semantics (throws `QBXMLResponseError` on hard failure, returns `{}` on the "no data" status 1). Live-mode row-tree translation is documented as a Phase 7 follow-up in the jsdoc — until then the simulation owns the wire format.
+  - **Simulation handler.** New `handleReportQuery` branch in [src/session/simulation-store.ts](src/session/simulation-store.ts) routes `GeneralSummaryReportQueryRq` (added before the `endsWith("QueryRq")` branch in `processRequest`). Rejects unknown `GeneralSummaryReportType` with statusCode 3120.
+  - **P&L walk** — Income side: Invoice + SalesReceipt (positive) + CreditMemo (negative); each line's account resolves via `line.AccountRef` (rare on these txns) or `line.ItemRef → item.IncomeAccountRef / item.SalesOrPurchase.AccountRef`. Expense side: Bill + Check + CreditCardCharge ExpenseLine (AccountRef direct) + ItemLine (item.ExpenseAccountRef / COGSAccountRef / SalesOrPurchase.AccountRef). JournalEntry contributes — debit lines posting to expense accounts add positive expense; credit lines posting to income accounts add positive income. TxnDate filtered to `[fromDate, toDate]` inclusive. Lines whose account can't be resolved land in `Uncategorized Income` / `Uncategorized Expense` so totals reconcile.
+  - **P&L sections** — single-pass `groupByAccountType` over the combined income + expense records with sectionMap `[Income, Other Income, Cost of Goods Sold, Expenses, Other Expenses]`. Records that don't match any section's types land in a trailing "Other" section that is visible but does NOT contribute to the named subtotals (it's audit cheese — the tool's `totalIncome` etc. derive from per-section subtotals, not a global total).
+  - **Balance Sheet** — Asset / Liability / Equity sections built from `Account.Balance` (snapshot — `asOfDate` is advisory for those sections in simulation, documented). Period NetIncome (lifetime txn walk up to asOfDate) closes into Equity as a "Net Income" row, mirroring real QB's Retained Earnings + Net Income pattern. The accounting identity Assets = Liabilities + Equity reconciles by closing the simulation seed gap (the known $10,700 phantom AR — see prior handoff) into a "Balancing Adjustment (simulation seed gap)" Equity row.
+  - **Manager wiring** — `QBSessionManager.runReport(reportType, { fromDate, toDate, basis })` in [src/session/manager.ts:212-227](src/session/manager.ts#L212-L227) rewrites to use the new builder + extractor (no longer the wrong `buildQueryRequest` + `extractResponseData` pair). Imports `buildReportRequest` and `extractReportData`.
+  - **Tools.** Two new tools in [src/tools/reports.ts:373-487](src/tools/reports.ts#L373-L487):
+    - `qb_pnl_report({ fromDate?, toDate?, basis? })` — returns `{ reportTitle, reportBasis, reportPeriod: { from, to }, sections: [{ name, accounts: [{ name, total }], subtotal }], totalIncome, totalCOGS, totalExpenses, grossProfit, netIncome }`.
+    - `qb_balance_sheet_report({ asOfDate?, basis? })` — returns `{ reportTitle, reportBasis, asOfDate, sections: [...], totalAssets, totalLiabilities, totalEquity, netIncome }`. asOfDate defaults to today UTC.
+    - Both wrapped in try/catch translating `QBXMLResponseError` → `{ success: false, statusCode, statusMessage }` + `isError: true` (Item 25 reference shape, same as Items 14/19/21).
+  - **Bug squashed mid-implementation.** First pass had `groupByAccountType` returning `{ sections, total }` with `total` including unrouted records — that double-counted into per-section totals when the helper was called per-section (P&L COGS section's `total` ended up summing all expense records, not just COGS). Verification harness caught it: NetIncome was -3100 instead of expected -1050 in the JE-mixing test. Fix: refactor to a single combined-pass call across all 5 sections, return `sections[]` only, derive named totals from per-section subtotals. Same simplification — better correctness.
+- **README updated** — `qb_pnl_report` / `qb_balance_sheet_report` rows added to Reports & Queries table at [README.md:200-201](README.md#L200-L201) with full description of walk semantics, section ordering, totals, basis, asOfDate semantics.
+- **`instructions` block in [src/index.ts](src/index.ts) updated** — the `qb_balance_summary / qb_ar_aging / qb_ap_aging` line now also covers `qb_pnl_report / qb_balance_sheet_report` with their walk + closure semantics. Capabilities header updated to mention "P&L, Balance Sheet."
+- **ACCEPTANCE_CRITERIA.md** — Item 20 entry written and placed at the top of the Completed section. Phase 5 header updated to "All Phase 5 items done."
+- **No DECISIONS.md / ARCHITECTURE.md change** — the report path follows the existing builder → simulation-store → parser pipeline (just a new request type). The simplified-vs-row-tree shape is documented inline in `extractReportData` jsdoc + `handleReportQuery` method note rather than a standalone decision (it's a scope clarification, not a tradeoff among alternatives — Phase 7 will need to add a row-tree adapter when COM lands).
+- **Verified.** `npm run build` green. Item 20 verification harness: **64/64 PASS**. Coverage:
+  - **P&L empty period (`asOfDate=2030-01-01..2030-12-31`)** — `sections === []`, every total === 0.
+  - **P&L seed-only state** — seed invoices have no `InvoiceLineRet` (only Subtotal/IsPaid headers); line walk yields nothing → totalIncome === 0. Confirms the walk doesn't fall back to `Subtotal` (correct — that'd double-count when real lines exist).
+  - **P&L Bill ExpenseLine path** — created bill with `expenseLines: [Rent Expense $1200, Utilities $350]` for `txnDate=2026-03-15`. `qb_pnl_report({ fromDate: "2026-01-01", toDate: "2026-12-31" })` → totalExpenses 1550, Expenses section subtotal 1550, Rent Expense $1200, Utilities $350. Income section absent (correct — no income txns).
+  - **P&L date filter** — same bill against `toDate: "2026-02-28"` → totalExpenses 0 (excluded).
+  - **P&L JournalEntry path** — JE debit Rent Expense $500 / credit Checking $500 contributes $500 to Expense; JE debit Checking $1000 / credit Sales Revenue $1000 contributes $1000 to Income. Final: totalIncome 1000, totalExpenses 2050 (1550 bill + 500 JE), grossProfit 1000, netIncome -1050.
+  - **P&L canonical section order** — Income before Expenses (and would be Income → Other Income → COGS → Expenses → Other Expenses if all populated).
+  - **P&L basis passthrough** — defaults to Accrual; `basis: "Cash"` echoes back as Cash (currently identical aggregation).
+  - **Balance Sheet sections** — Assets / Liabilities / Equity present in canonical order. Bank seeds in Assets ($45k Checking + $120k Savings).
+  - **Balance Sheet identity** — `totalAssets === totalLiabilities + totalEquity` holds (191700 === 191700) thanks to the Balancing Adjustment row absorbing the seed gap.
+  - **Balance Sheet Net Income row** — present in Equity, `total === body.netIncome`.
+  - **Balance Sheet asOfDate default** — omitted asOfDate fills with today UTC.
+  - **Schema validation** — both tools reject `04/26/2026` and `2026/04/26`; accept `2026-04-26` and `{}`. `qb_pnl_report` rejects unknown `basis` enum values.
+  - **Unsupported reportType** — `manager.runReport("BogusReport", {})` throws `QBXMLResponseError` with statusCode 3120.
+  - **Regressions** — Items 14 (qb_company_info → Demo Co), 19 (qb_ar_aging $16000, qb_ap_aging tracks the new bill at $1550), and 21 (qb_balance_summary netIncome -22800, Bank first) all still pass.
 
 ## Verify Before Continuing
 
 - [ ] **Build.** `npm run build` exits 0.
-- [ ] **`qb_ar_aging` seed sanity.** `qb_ar_aging({ asOfDate: "2026-04-26" })` returns `body.totalAccountsReceivable === 16000`, `body.bucketTotals["90+"] === 16000`, all other buckets 0, and `body.customers.length === 2` with Global Industries first ($8500). Cheap tripwire that the open-invoice walk is wired up. If this returns ~$26,700 (the customer rollup total), the fix didn't take.
-- [ ] **`qb_ar_aging` bucket boundary at +31 days.** `qb_ar_aging({ asOfDate: "2025-01-01" })` puts Acme's $7500 in `31-60`, not `0-30`. Cheap tripwire on the `bucketFor` boundary (off-by-one would surface as `0-30`).
-- [ ] **`qb_ap_aging` empty when no bills.** Fresh process, no bills created. `qb_ap_aging({ asOfDate: "2026-04-26" })` returns `body.vendors === []`, `body.totalAccountsPayable === 0`. Confirms the AP path doesn't pull from the (still-populated) Vendor `Balance` rollup.
-- [ ] **`qb_balance_summary` regression.** Still emits canonical-ordered 6-group array; `body.subtotals.netIncome === -22800`. Confirms the new helpers in `reports.ts` didn't shadow / conflict with Item 21's exports.
+- [ ] **`qb_pnl_report` empty period.** `qb_pnl_report({ fromDate: "2030-01-01", toDate: "2030-12-31" })` → `body.totalIncome === 0`, `body.totalExpenses === 0`, `body.netIncome === 0`, `body.sections === []`. Cheap tripwire that the txn walk + date filter are wired up.
+- [ ] **`qb_pnl_report` populated path.** Create a bill with `expenseLines: [{ accountName: "Rent Expense", amount: 1200 }]` for `txnDate=2026-03-15`. Then `qb_pnl_report({ fromDate: "2026-01-01", toDate: "2026-12-31" })` → Expenses section subtotal === 1200, Rent Expense account === 1200. Confirms ExpenseLineRet → AccountRef → AccountType lookup chain works end-to-end.
+- [ ] **`qb_balance_sheet_report` identity.** `qb_balance_sheet_report({ asOfDate: "2026-12-31" })` → `body.totalAssets === body.totalLiabilities + body.totalEquity` (after rounding). Confirms the Balancing Adjustment row is reconciling the seed gap.
+- [ ] **`qb_balance_summary` regression.** Still emits canonical-ordered 6-group array; `body.subtotals.netIncome === -22800`. Confirms the new helpers in `simulation-store.ts` didn't shadow / conflict with Item 21's exports.
+- [ ] **`qb_ar_aging` / `qb_ap_aging` regression.** AR still totals $16000 against the seeded invoices; AP still 0 on a clean process.
 - [ ] **`qb_company_info` regression.** Auto-connects, returns Demo Co.
 
 ## Next Task
 
-**Phase 5, Item 20 — `qb_pnl_report` and `qb_balance_sheet_report` via `GeneralSummaryReportQueryRq`** ([todo.md:43](todo.md#L43)).
+**Phase 6 — pick up `23` (env semantics) as the quick win, then `25` (structured-error sweep) as the bulk follow-up.**
 
-Today there are no real P&L or Balance Sheet tools. `qb_balance_summary` (Item 21) is account-balance grouping, not a true Balance Sheet report. The session's `runReport` plumbing exists but is stub-shaped:
+### Phase 6 task list
 
-- [src/session/manager.ts:212-224](src/session/manager.ts#L212-L224) — `runReport` builds via `buildQueryRequest`, sends, calls `extractResponseData(response)` with no second arg, returns `data[0] ?? {}`. That's wrong for report responses — `GeneralSummaryReportQueryRq` returns a `ReportRet` block with `ReportTitle`, `ReportSubtitle`, `ReportBasis`, `NumRows`, `NumColumns`, `ColDesc[]`, `ReportData.DataRow[]`/`TextRow[]`/`SubtotalRow[]`/`TotalRow[]`. The current code returns `{}` because `extractResponseData` looks at the first `*Rs` element name and there's no `ReportRet` extraction path.
+- [ ] **23.** Fix `QB_SIMULATION` env semantics in [src/session/manager.ts:50-53](src/session/manager.ts#L50-L53) — currently `QB_SIMULATION=false` on Windows still simulates unless `QB_LIVE=1` is also set. Decide on one of:
+  - Honor `QB_SIMULATION=false` alone (drop the `!process.env.QB_LIVE` clause), OR
+  - Document the actual rule (live mode requires both Windows + `QB_LIVE=1` set; `QB_SIMULATION` is just a forced-on override) and align the README + .env.example so the operator can predict behavior.
+  - The current logic is `simulationMode = QB_SIMULATION === "true" || not-windows || !QB_LIVE`. That's a 3-way OR which is hostile to reason about. Simpler: `simulationMode = QB_SIMULATION === "true" || (QB_SIMULATION !== "false" && (not-windows || !QB_LIVE))` — i.e. explicit `false` overrides the default-to-simulation behavior when on Windows + QB_LIVE.
+  - Quick win: 5-line change + .env.example + README env table. Acceptance: matrix of (platform, QB_SIMULATION, QB_LIVE) → expected mode is documented and code matches.
+- [ ] **25.** Wrap `session.queryEntity / addEntity / modifyEntity / deleteEntity` calls in tool handlers with try/catch — translate `QBXMLResponseError` into structured tool error responses (`isError: true` with `statusCode` + `statusMessage`) instead of letting them propagate as raw exceptions. **Items 14, 19, 21 are reference shapes** — Item 25's job is to converge the rest. Bulk sweep across all `src/tools/*.ts` files. Roughly 20+ tools that need the wrap. Acceptance: every tool's happy path still returns the same shape; every tool's "stale editSequence" / "not found" / "missing required field" path now returns `isError: true` with a structured payload instead of a raw stack trace.
+- [ ] **26.** Status code mapping table for common QB errors (3120 missing field, 3170 modify failed, 3260 insufficient permission, 500 not found, etc.). Best done as a small util `qbStatusCodeMessage(statusCode: number): string` that the Item 25 wrapper consults to add a `humanReadable` field alongside `statusMessage`. Acceptance: every status code the simulation emits is in the table; the wrapper attaches `humanReadable` when present.
+- [ ] **27.** `IteratorID` / `IteratorRemainingCount` support on large queries. Real QB caps at ~500 rows. Lower-priority for personal use (the local store has tens of records, not thousands), but worth doing before live-mode lands so iterator handling isn't a Phase 7 surprise.
+- [ ] **28.** Validate `AccountType` enum in `qb_account_add` — reuse Item 21's `CANONICAL_ACCOUNT_TYPES` constant in [src/tools/reports.ts:17-24](src/tools/reports.ts#L17-L24). Currently any string passes through and QB rejects with cryptic 3120. Acceptance: invalid account type rejects at zod with clear list of allowed values; valid types pass through unchanged.
+- [ ] **29.** Input validation for email / phone / postal / ISO date strings on relevant fields. Item 19 already added `ISO_DATE_RE` for date fields, so the date side of 29 overlaps — extend `ISO_DATE_RE` consumers across the rest of the tools. Acceptance: every date field rejects non-`YYYY-MM-DD`; email fields reject obvious non-emails; etc.
 
-### Implementation shape
-
-1. **Builder.** `GeneralSummaryReportQueryRq` is structurally different from a list/txn query — see Intuit's spec. Skeleton:
-   ```xml
-   <GeneralSummaryReportQueryRq>
-     <GeneralSummaryReportType>ProfitAndLossStandard</GeneralSummaryReportType>
-     <ReportPeriod>
-       <FromReportDate>2026-01-01</FromReportDate>
-       <ToReportDate>2026-04-26</ToReportDate>
-     </ReportPeriod>
-     <ReportBasis>Accrual</ReportBasis>           <!-- or Cash -->
-     <SummarizeColumnsBy>TotalOnly</SummarizeColumnsBy>
-     <IncludeSubcolumns>0</IncludeSubcolumns>
-   </GeneralSummaryReportQueryRq>
-   ```
-   Probably worth adding a `buildReportRequest(reportType, params, version)` to [src/qbxml/builder.ts](src/qbxml/builder.ts) instead of overloading `buildQueryRequest` — report rqs aren't list/txn queries and have their own param shape (`ReportPeriod`, `ReportBasis`, `SummarizeColumnsBy`, etc.).
-2. **Parser.** `ReportRet` rows are nested. Real shape (sketch):
-   ```
-   ReportRet
-     ReportTitle, ReportSubtitle, ReportBasis, NumRows, NumColumns
-     ColDesc[]   (one per column; first is usually "Label")
-     ReportData
-       DataRow[]    — RowData.value (the label) + ColData[].value (the numbers)
-       TextRow[]    — section headers ("Income", "Expenses")
-       SubtotalRow[] — group subtotals
-       TotalRow[]   — grand total
-   ```
-   Each row type is a sibling under `ReportData`, and they interleave to express the report's tree structure (Section header → Data rows → Subtotal → next section). Add a `extractReportData(response)` to [src/qbxml/parser.ts](src/qbxml/parser.ts) (parallel to `extractResponseData`) that pulls the `ReportRet` block out of the envelope and normalizes the row arrays. `arrayElements` registration: `ColDesc`, `DataRow`, `TextRow`, `SubtotalRow`, `TotalRow`, and probably `ColData`. fast-xml-parser strips empty elements, so empty `<ColData>` cells need a sentinel — see prior gotcha note.
-3. **Simulation store.** This is the harder half. Real QB walks every transaction through every account and aggregates by GL account into a tree (Income → ServiceIncome / SalesIncome → SubtotalRow; Expense → … → SubtotalRow; NetIncome → TotalRow). The simulation needs to do the same. Approach:
-   - Walk all `Invoice` / `SalesReceipt` / `CreditMemo` lines (income side) and `Bill` / `Check` / `CreditCardCharge` lines (expense side).
-   - Bucket each line's `Amount` under its `AccountRef.FullName` → look up that account's `AccountType`.
-   - For P&L: emit only Income / OtherIncome / CostOfGoodsSold / Expense / OtherExpense buckets. Compute NetIncome.
-   - For Balance Sheet: emit Asset / Liability / Equity buckets, derive NetIncome (Income − Expenses), close into Equity. Same canonical ordering as Item 21's `CANONICAL_ACCOUNT_TYPES`.
-   - `ReportPeriod.FromReportDate` / `ToReportDate` filter the transaction walk by `TxnDate`.
-4. **Tools.** Two new tools in [src/tools/reports.ts](src/tools/reports.ts):
-   - `qb_pnl_report` — `{ fromDate, toDate, basis }` (basis defaults to `"Accrual"`). Returns `{ reportTitle, reportPeriod, basis, sections: [{ name, accounts: [{ name, total }], subtotal }], netIncome }`.
-   - `qb_balance_sheet_report` — `{ asOfDate }`. Returns `{ reportTitle, asOfDate, sections: [...], totalAssets, totalLiabilities, totalEquity, netIncome }`.
-5. **Wrap in try/catch + `isError: true`** — same Item 25 reference shape Item 19 / Item 21 use.
-
-### Suggested response shape (P&L)
-
-```json
-{
-  "reportTitle": "Profit & Loss",
-  "reportBasis": "Accrual",
-  "reportPeriod": { "from": "2026-01-01", "to": "2026-04-26" },
-  "sections": [
-    { "name": "Income",
-      "accounts": [{ "name": "Service Income", "total": 200000 }, { "name": "Product Sales", "total": 57000 }],
-      "subtotal": 257000 },
-    { "name": "Cost of Goods Sold",
-      "accounts": [{ "name": "Materials", "total": 95000 }],
-      "subtotal": 95000 },
-    { "name": "Expenses",
-      "accounts": [{ "name": "Office Supplies", "total": 8800 }, ... ],
-      "subtotal": 184800 }
-  ],
-  "grossProfit": 162000,
-  "netIncome": -22800
-}
-```
-
-(Balance Sheet mirrors with Assets / Liabilities / Equity bands and `asOfDate`.)
-
-### Scope guards
-
-- **Don't try to render the QB report-row tree verbatim.** Real QB's `ReportRet` is a flat array of typed rows that visually reconstructs a tree via row types and indentation. The MCP consumer is an LLM, not a print preview — the simplified `sections[]` shape above is more useful and easier to compute. Keep the raw tree behind the parser; tools surface the simplified shape.
-- **Don't change `qb_balance_summary`'s output shape.** That tool is for a quick balance dump (Item 21). `qb_balance_sheet_report` is a separate, period-aware report. Both can coexist.
-- **Don't compute YTD vs custom periods generically.** P&L takes `from`/`to`. Balance Sheet takes `asOfDate`. Don't add a `period: "ytd" | "qtd" | "month"` shorthand — just take explicit dates.
-- **Don't build full MultiPeriod columns.** `IncludeSubcolumns=0`, `SummarizeColumnsBy=TotalOnly` only. MultiPeriod / class / customer slicing is a separate piece of work (real QB has 5+ axes you can pivot by — that's report tooling, not minimal P&L).
-- **Don't implement live-mode COM yet.** Item 1 (Phase 7) is the only place real QBXMLRP2 calls go. For Item 20, simulation-only is fine — when Phase 7 lands, the live `sendRequest` plumbing will replace the current throw and the parser path covers both modes equally.
-
-### After Item 20
-
-- Phase 5 closes. Move to Phase 6: `23` (env semantics), `25` (sweep tool handlers to use the structured-error try/catch — Items 14, 19, 21 are now the reference; Item 25's job is to converge the rest), `26` (status code mapping table), `27` (iterators on large queries), `28` (AccountType enum validation — reuse Item 21's `CANONICAL_ACCOUNT_TYPES`), `29` (input validation: email/phone/postal/ISO date — Item 19 already added `ISO_DATE_RE` for date fields, so the date side of `29` overlaps).
+After Phase 6 closes, Phase 7 is `1` (live COM) and Phase 8 is `31` (Vitest) + `32` (.gitignore / .env.example) — both are bigger pieces of work.
 
 ## Context Notes
 
-- **Item 19 implementation details that affect future edits.**
-  - `BUCKET_KEYS` / `BucketKey` / `emptyBuckets` / `bucketFor` / `daysBetween` / `dateUTC` are all module-local in [src/tools/reports.ts](src/tools/reports.ts). If a third aging tool starts needing them (unlikely — there are only AR and AP), lift to a shared util. Two callers isn't enough yet.
-  - `daysBetween` deliberately uses `Date.UTC` to avoid the trap where `new Date("2026-04-26").getTime()` is interpreted as UTC midnight but `new Date(2026, 3, 26).getTime()` is interpreted as local midnight, and the difference depending on TZ can flip a boundary case (e.g. asOfDate=dueDate could land in `0-30` in UTC but `90+` if the local clock has already crossed midnight). Don't switch to `new Date(s).getTime()` — keep `Date.UTC`.
-  - `bucketFor` is `<= 30 / <= 60 / <= 90 / else` — the `<=` upper bounds are deliberate. Real QB's report says "31-60" inclusive on both sides; the math `daysOutstanding = floor(...)` puts boundary days on the lower-band side. Verified at every boundary in the harness.
-  - The `txnCount` field on per-party rows is debugging cheese — useful when a customer has 8 invoices spread across buckets and the operator needs to know how many txns make up the $X balance. Costs nothing to compute. Don't remove it.
-- **Bills use `AmountDue`, NOT `BalanceRemaining`.** [src/session/simulation-store.ts:950-956](src/session/simulation-store.ts#L950-L956) is the source of truth — `computeTotals` for `Bill` only sets `AmountDue` + `IsPaid`. The original Item 19 handoff said "Both have `IsPaid` + `BalanceRemaining` populated by the simulation store today" — that's wrong for bills. If a future task touches bill payment math, remember `AmountDue` is the open-balance field.
-- **Seed AR has a known $10,700 phantom balance.** Customer `Balance` rollup totals $26,700, but seeded open invoices total $16,000. The Item 19 tool walks invoices, so AR aging shows $16,000 — that's *correct*, the rollup was wrong. If a future task tries to reconcile, fix the seed (subtract $10,700 from the appropriate customer's seeded `Balance`), don't unfix the aging tool.
-- **Empty bill store on fresh process.** AP aging will return empty `vendors` until the operator (or a verification harness) creates bills via `qb_bill_create`. That's expected and correct — there are no seeded bills.
-- **Project conventions reminder** ([CLAUDE.md](CLAUDE.md) § Stable Code Conventions): TS strict, ESM with `.js` extensions on relative imports, every zod field has `.describe()`, every tool registered in [src/index.ts](src/index.ts) and listed in the README tool table, structured tool errors via try/catch + `isError: true` + `statusCode` (Items 14, 19, 21 are reference shapes — Item 25 is the sweep that converges the rest).
-- **Verification gotcha (carried)** — handlers captured via the `fakeServer` pattern do NOT pass through zod validation (the MCP SDK's `server.tool` wraps the handler with the schema, and we capture only the inner handler). Validate the zod schema separately by parsing it via `z.object(schemaShape).safeParse(...)` — the Item 19 harness uses this pattern; reuse it for Item 20.
-- **Verification gotcha (carried)** — `handleQuery` filters require **uppercase** `TxnID` / `RefNumber` / `FullName` in the filter object when calling `session.queryEntity` directly. Tools translate from lowercase correctly. Verification scripts that invoke captured handlers get this for free; ad-hoc `queryEntity` calls in throwaway debug code do not.
+- **Item 20 implementation details that affect future edits.**
+  - The simulation emits a simplified `ReportRet` shape (`{ ReportTitle, ReportBasis, FromReportDate, ToReportDate, Sections, Totals }`) — NOT real QB's row tree (TextRow / DataRow / SubtotalRow / TotalRow under ReportData). When Phase 7 (live COM) lands, the live response will carry the row tree; the live-side translation to the simplified shape needs to land in `extractReportData` (currently jsdoc-flagged) or in `manager.runReport` (probably the cleaner spot). Tests against this code today are simulation-only; live verification is gated on Phase 7.
+  - `groupByAccountType` returns sections only (no `total` field). Callers derive subtotals via `sections.find((s) => s.Name === X)?.Subtotal ?? 0`. Records that don't match any section's types land in a trailing "Other" section that is visible but doesn't contribute to named totals. Don't reintroduce the global `total` field — the bug it caused (double-counting per-section calls) was a one-line write but a half-hour debug.
+  - `walkJournalEntryLines` uses an inner `lookupType(name)` helper. Could lift to a class field if a third caller appears. Not worth doing for two callers.
+  - The Balance Sheet "Balancing Adjustment (simulation seed gap)" row exists ONLY because the seed has phantom Account.Balance values that don't match the txn-walk-derived NetIncome. If a future task decides to fix the seed (the obvious move: re-derive seed account balances from a small set of opening-balance JEs), the adjustment row will collapse to $0 and disappear. Don't remove the adjustment logic — it's defensive against future seed drift.
+- **Item 25 (next sweep) reference shape.** Items 14, 19, 21, 20 all use this pattern:
+  ```ts
+  try {
+    // session.queryEntity / addEntity / etc.
+    return { content: [{ type: "text" as const, text: JSON.stringify(success, null, 2) }] };
+  } catch (err) {
+    const e = err as { message?: string; statusCode?: number };
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify({
+        success: false,
+        statusCode: e.statusCode ?? -1,
+        statusMessage: e.message ?? "<entity>QueryRq failed",
+      }) }],
+      isError: true,
+    };
+  }
+  ```
+  Reuse this verbatim. Don't introduce a wrapper helper unless the sweep clearly warrants it (~20 tools — a small DRY helper that takes a label + the inner async fn would shave 6 lines per tool, but adds an indirection layer the existing reference tools don't have).
+- **`QB_SIMULATION` env quirk (carried)** — the Item 23 task above is the dedicated fix; until then, on Windows you need both `QB_SIMULATION=false` AND `QB_LIVE=1` to get out of simulation mode. On non-Windows you're always in simulation regardless of env vars.
+- **Bills use `AmountDue`, NOT `BalanceRemaining` (carried).** [src/session/simulation-store.ts:954-956](src/session/simulation-store.ts#L954-L956) is the source of truth.
+- **Verification gotcha (carried)** — handlers captured via the `fakeServer` pattern do NOT pass through zod validation. To test schemas, parse via `z.object(schemaShape).safeParse(...)` separately. Item 20 harness uses this pattern.
+- **Verification gotcha (carried)** — `handleQuery` filters require uppercase `TxnID` / `RefNumber` / `FullName` in the filter object when calling `session.queryEntity` directly. Tools translate from lowercase correctly. Verification scripts that invoke captured handlers get this for free.
+- **REGRESSION_CHECKLIST §4 (QBXML round-trip) was partially covered.** Item 20 touched both builder and parser, but simulation mode bypasses XML round-trip in-process (the simulation store returns parsed `QBXMLResponse` objects directly without re-serializing). Live-mode round-trip lands with Phase 7. The new `arrayElements` in the parser (`ReportRet`, `ColDesc`, `DataRow`, `TextRow`, `SubtotalRow`, `TotalRow`, `ColData`) were added in Item 19's session preemptively and are sitting unused until live mode wires up; they're the right choice and don't hurt anything.
 
 ## Post-Task Chores
 
-When Item 20 lands: `npm run build` green, [REGRESSION_CHECKLIST.md](REGRESSION_CHECKLIST.md) walked (especially §3 Tool Surface for the new report tools, §4 QBXML Round-Trip for the `ReportRet` parsing path, §1 Build for the new builder/parser additions, existing `qb_ar_aging` / `qb_ap_aging` / `qb_balance_summary` / `qb_company_info` regressions still pass), Item 20 ticked in `todo.md`, `ACCEPTANCE_CRITERIA.md` entry written for Item 20 (acceptance: report period honored, sections in canonical AccountType order, NetIncome reconciles, Balance Sheet `asOfDate` honored, both modes structurally identical responses), Phase 5 status updated to "All Phase 5 done." Fresh `HANDOFF.md` pointing at the start of Phase 6 (Item 23 env semantics is the next quick win, then Item 25 is the bulk sweep).
+When Item 23 lands: `npm run build` green, [REGRESSION_CHECKLIST.md](REGRESSION_CHECKLIST.md) §1 (Build), §2 (Server Startup — confirm the new env-var rule prints the expected mode banner), §6 (Mode Boundary — confirm the simulationMode boolean still reads once at construction time, not per-request), Item 23 ticked in `todo.md`, `ACCEPTANCE_CRITERIA.md` entry written for Item 23, fresh `HANDOFF.md` pointing at Item 25 as the next big sweep.
+
+When Item 25 lands: same flow but expand §3 (Tool Surface) — every changed tool's error path returns `isError: true` with structured payload, not raw stack trace. Spot-check 3-5 tools per domain.

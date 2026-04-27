@@ -368,6 +368,125 @@ export function registerReportTools(
   );
 
   // -----------------------------------------------------------------------
+  // P&L report
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_pnl_report",
+    "Run a Profit & Loss report (GeneralSummaryReportType=ProfitAndLossStandard). Aggregates Invoice / SalesReceipt / CreditMemo lines (income side) and Bill / Check / CreditCardCharge lines plus JournalEntry postings (expense side) by GL account, filtered by TxnDate ∈ [fromDate, toDate]. Returns sections in canonical order (Income → Other Income → Cost of Goods Sold → Expenses → Other Expenses) plus totals (TotalIncome, TotalCOGS, TotalExpenses, GrossProfit, NetIncome). Lines whose account can't be resolved (e.g. invoice line whose item carries no IncomeAccountRef) land in 'Uncategorized Income/Expense' so totals reconcile.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start of reporting window (YYYY-MM-DD), inclusive. Omit for no lower bound."),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End of reporting window (YYYY-MM-DD), inclusive. Omit for no upper bound."),
+      basis: z.enum(["Accrual", "Cash"]).optional().describe("Accounting basis. Defaults to Accrual. (Note: simulation mode currently aggregates the same way regardless of basis — Cash basis revenue recognition lands with Phase 7 live mode.)"),
+    },
+    async ({ fromDate, toDate, basis }) => {
+      const session = getSession();
+      try {
+        const reportRet = await session.runReport("ProfitAndLossStandard", {
+          fromDate,
+          toDate,
+          basis,
+        });
+        const totals = (reportRet.Totals as Record<string, unknown> | undefined) ?? {};
+        const sections = (reportRet.Sections as Array<{ Name: string; Accounts: Array<{ Name: string; Total: number }>; Subtotal: number }> | undefined) ?? [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Profit & Loss",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              sections: sections.map((s) => ({
+                name: s.Name,
+                accounts: s.Accounts.map((a) => ({ name: a.Name, total: a.Total })),
+                subtotal: s.Subtotal,
+              })),
+              totalIncome: Number(totals.TotalIncome ?? 0),
+              totalCOGS: Number(totals.TotalCOGS ?? 0),
+              totalExpenses: Number(totals.TotalExpenses ?? 0),
+              grossProfit: Number(totals.GrossProfit ?? 0),
+              netIncome: Number(totals.NetIncome ?? 0),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralSummaryReportQueryRq (ProfitAndLossStandard) failed",
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // Balance Sheet report
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_balance_sheet_report",
+    "Run a Balance Sheet report (GeneralSummaryReportType=BalanceSheetStandard) as of a specified date. Returns Assets / Liabilities / Equity sections in canonical QB order plus totals (TotalAssets, TotalLiabilities, TotalEquity, NetIncome). Period NetIncome (lifetime up to asOfDate) closes into Equity. Note: simulation mode draws asset/liability/equity totals from Account.Balance (a snapshot — asOfDate is advisory for those sections); the period NetIncome that closes into Equity IS walked from transactions and reconciles with qb_pnl_report for the same range.",
+    {
+      asOfDate: z.string().regex(ISO_DATE_RE).optional().describe("As-of date (YYYY-MM-DD). Defaults to today. Used as the upper bound of the lifetime NetIncome walk; the asset/liability/equity sections themselves are seeded snapshots in simulation."),
+      basis: z.enum(["Accrual", "Cash"]).optional().describe("Accounting basis. Defaults to Accrual."),
+    },
+    async ({ asOfDate, basis }) => {
+      const session = getSession();
+      try {
+        const effectiveAsOf = asOfDate ?? new Date().toISOString().split("T")[0];
+        const reportRet = await session.runReport("BalanceSheetStandard", {
+          toDate: effectiveAsOf,
+          basis,
+        });
+        const totals = (reportRet.Totals as Record<string, unknown> | undefined) ?? {};
+        const sections = (reportRet.Sections as Array<{ Name: string; Accounts: Array<{ Name: string; Total: number }>; Subtotal: number }> | undefined) ?? [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Balance Sheet",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              asOfDate: reportRet.AsOfDate ?? effectiveAsOf,
+              sections: sections.map((s) => ({
+                name: s.Name,
+                accounts: s.Accounts.map((a) => ({ name: a.Name, total: a.Total })),
+                subtotal: s.Subtotal,
+              })),
+              totalAssets: Number(totals.TotalAssets ?? 0),
+              totalLiabilities: Number(totals.TotalLiabilities ?? 0),
+              totalEquity: Number(totals.TotalEquity ?? 0),
+              netIncome: Number(totals.NetIncome ?? 0),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralSummaryReportQueryRq (BalanceSheetStandard) failed",
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
   // Raw QBXML query (advanced)
   // -----------------------------------------------------------------------
   server.tool(

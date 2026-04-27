@@ -21,9 +21,11 @@ import {
   buildAddRequest,
   buildModRequest,
   buildDeleteRequest,
+  buildReportRequest,
 } from "../qbxml/builder.js";
 import {
   extractResponseData,
+  extractReportData,
   flattenEntityArray,
 } from "../qbxml/parser.js";
 import type {
@@ -209,17 +211,21 @@ export class QBSessionManager {
   // Report queries
   // -------------------------------------------------------------------------
 
+  /**
+   * Run a GeneralSummaryReportQueryRq (P&L / Balance Sheet) and return the
+   * extracted ReportRet block. In simulation the store emits the simplified
+   * shape (Sections / Totals); live mode (Phase 7) will need a row-tree
+   * adapter — see extractReportData jsdoc.
+   */
   async runReport(
     reportType: string,
-    params: Record<string, unknown> = {}
+    params: { fromDate?: string; toDate?: string; basis?: "Accrual" | "Cash" } = {}
   ): Promise<Record<string, unknown>> {
-    const xml = buildQueryRequest(
-      reportType,
-      params,
+    const xml = buildReportRequest(
+      { reportType, ...params },
       this.config.qbxmlVersion
     );
     const response = await this.sendRequest(xml);
-    const data = extractResponseData(response);
-    return Array.isArray(data) ? data[0] ?? {} : data;
+    return extractReportData(response, "GeneralSummaryReportQueryRs");
   }
 }

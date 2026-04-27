@@ -168,6 +168,34 @@ export function extractResponseData(
 }
 
 /**
+ * Extract the ReportRet block from a report-style response (e.g.
+ * GeneralSummaryReportQueryRs). Mirrors extractResponseData semantics —
+ * scoped to a specific *Rs type, throws QBXMLResponseError on hard failure,
+ * returns {} on the "no data" status (1) — but pulls out the embedded
+ * <ReportRet> object rather than the raw response data block.
+ *
+ * In simulation mode the simulation store emits a simplified ReportRet
+ * shape ({ ReportTitle, ReportBasis, FromReportDate, ToReportDate, Sections,
+ * Totals }) — see simulation-store.handleReportQuery. Live mode (Phase 7)
+ * will surface real QB's row-tree shape (TextRow / DataRow / SubtotalRow /
+ * TotalRow); the live-side translation to the simplified shape lands with
+ * the COM wiring.
+ */
+export function extractReportData(
+  response: QBXMLResponse,
+  expectedType?: string
+): Record<string, unknown> {
+  const data = extractResponseData(response, expectedType);
+  const obj = Array.isArray(data) ? data[0] ?? {} : data;
+  const reportRet = (obj as Record<string, unknown>).ReportRet;
+  if (!reportRet) return {};
+  if (Array.isArray(reportRet)) {
+    return (reportRet[0] as Record<string, unknown>) ?? {};
+  }
+  return reportRet as Record<string, unknown>;
+}
+
+/**
  * Flatten entity arrays from a QBXML query response.
  * QBXML returns entities like { CustomerRet: [...] } — this extracts the array.
  */

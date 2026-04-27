@@ -40,7 +40,7 @@ So that everything below can actually be verified without a Windows box.
 
 - [x] **14.** Implement real `CompanyQueryRq` in `qb_company_info` — return company name, legal name, address, fiscal year start, tax form, etc., not just session state.
 - [x] **19.** Implement `asOfDate` filtering in `qb_ar_aging` and `qb_ap_aging` — currently the param is decorative; should filter open transactions by date and bucket by 0-30 / 31-60 / 61-90 / 90+ days.
-- [ ] **20.** Add proper P&L and Balance Sheet report tools (`GeneralSummaryReportQueryRq` with `ReportType=ProfitAndLossStandard` / `BalanceSheetStandard`) — current "reports" are just account-balance rollups.
+- [x] **20.** Add proper P&L and Balance Sheet report tools (`GeneralSummaryReportQueryRq` with `ReportType=ProfitAndLossStandard` / `BalanceSheetStandard`) — current "reports" are just account-balance rollups.
 - [x] **21.** Add date-range support to `qb_balance_summary`, and group by `AccountType` in canonical QB order (Bank, AccountsReceivable, OtherCurrentAsset, ... Equity, Income, COGS, Expense).
 
 ## Phase 6 — Plumbing, validation, ergonomics

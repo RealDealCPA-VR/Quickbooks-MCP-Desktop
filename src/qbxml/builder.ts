@@ -106,6 +106,48 @@ export function buildModRequest(
   return buildSingleRequest(`${entityType}ModRq`, modBody, version);
 }
 
+/**
+ * Build a GeneralSummaryReportQueryRq for P&L / Balance Sheet style reports.
+ *
+ * Report rqs are structurally distinct from list/txn queries — they take
+ * <ReportPeriod> / <ReportBasis> / <SummarizeColumnsBy> / <IncludeSubcolumns>
+ * children rather than the entity-filter shape buildQueryRequest emits — so
+ * they get their own builder rather than overloading buildQueryRequest.
+ *
+ * `params` shape:
+ *   { reportType, fromDate?, toDate?, basis? }
+ * P&L uses fromDate + toDate. Balance Sheet treats toDate as the asOfDate
+ * (real QB's BalanceSheet rqs use ToReportDate alone). Basis defaults to
+ * Accrual. SummarizeColumnsBy defaults to TotalOnly and IncludeSubcolumns to
+ * 0 — multi-period / class / customer slicing is out of Item 20 scope.
+ */
+export function buildReportRequest(
+  params: {
+    reportType: string;
+    fromDate?: string;
+    toDate?: string;
+    basis?: "Accrual" | "Cash";
+  },
+  version?: string
+): string {
+  const body: Record<string, unknown> = {
+    GeneralSummaryReportType: params.reportType,
+  };
+
+  const reportPeriod: Record<string, unknown> = {};
+  if (params.fromDate) reportPeriod.FromReportDate = params.fromDate;
+  if (params.toDate) reportPeriod.ToReportDate = params.toDate;
+  if (Object.keys(reportPeriod).length > 0) {
+    body.ReportPeriod = reportPeriod;
+  }
+
+  body.ReportBasis = params.basis ?? "Accrual";
+  body.SummarizeColumnsBy = "TotalOnly";
+  body.IncludeSubcolumns = 0;
+
+  return buildSingleRequest("GeneralSummaryReportQueryRq", body, version);
+}
+
 export function buildDeleteRequest(
   entityType: string,
   listIdOrTxnId: string,
