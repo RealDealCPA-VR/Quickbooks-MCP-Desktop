@@ -119,6 +119,15 @@ For invoice/bill creation to work, the operator must be able to discover availab
 - **F12.2** The first operation auto-opens a session if one isn't open.
 - **F12.3** A session can be safely re-opened after disconnect within the same server process.
 
+### F13 — Multi-company workflow (sequential)
+
+The operator manages books for multiple clients, all stored as `.qbw` files in a single folder on a local file server. They must be able to move between clients during one chat session without restarting the server or any per-file authentication step.
+
+- **F13.1** The operator can list the available company files (those discoverable under a configured root, typically the file-server folder).
+- **F13.2** The operator can switch the active company file at runtime via a tool call. Switching closes the current session, opens a session against the new file, and subsequent tool calls operate against the new file.
+- **F13.3** Switching does not require any interactive QB-side authentication. (QuickBooks authorizes the application once via its Integrated Application preferences; subsequent file opens by the same app are silent.)
+- **F13.4** Only one company file is active at a time. QuickBooks Desktop only allows one open file per QB instance — concurrent multi-file is and remains out of scope.
+
 ---
 
 ## Non-Functional Requirements
