@@ -29,6 +29,97 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-09 — Company switching reseeds the simulation store
+
+**Chosen:** `QBSessionManager.switchCompanyFile(path)` (driving `qb_company_open`) ALWAYS instantiates a fresh `SimulationStore` when running in simulation mode, even when the new path matches a previously-opened path. Mutations made against company A while the sim was active are unrecoverable once the session switches to B and back to A.
+
+**Why:** Real QuickBooks Desktop persists each company's books to its own `.qbw` file on disk — switching between files preserves whatever state was last saved. The simulation has no persistence layer; it's a single in-memory `Map<entityType, Map<id, entity>>` per `SimulationStore` instance. The only behaviorally honest option is to scope the store to "the conversation since last open" and accept that switching loses the prior content. The alternative — keeping a per-path Map of stores in memory — would diverge from real QB in a different way (real QB doesn't keep two files open; sim would). Both are tradeoffs; the reseed is the simpler one and the closer match to "open a different book, see that book's state."
+
+The observational contract holds across modes: in live the operator sees the new file's actual saved state; in sim they see a fresh seed. Different specifics, same shape.
+
+**Alternatives rejected:**
+- *Per-path simulation stores cached in a Map.* Closer to "you can switch back and pick up where you left off," but creates two divergences from real QB: (a) two files appear simultaneously open in memory which QBXMLRP2 forbids, (b) the operator's mental model "I switched away — the prior session is over" is broken silently. Also leaks memory across long-lived sessions.
+- *Persist the simulation store to disk per path.* Would mirror real QB more faithfully but introduces a data-format we'd have to migrate over time. Not worth it for a dev tool.
+- *Refuse to switch in simulation.* Throws away the discovery workflow that Item 35 (`qb_company_list`) is designed for. The agent needs to be able to demonstrate switching even without a Windows box.
+
+**Tradeoffs / consequences:**
+- The `qb_company_open` response carries `simulationStoreReset: true` in sim mode so the LLM can observe the discontinuity and re-list entities rather than carrying stale references across the boundary.
+- Tests in [tests/company-switching.test.ts](tests/company-switching.test.ts) pin the reseed contract: A → mutate → B → A returns A's fresh seed, NOT the prior mutations. Any future change toward per-path persistence would need to update that test deliberately.
+- Live mode is unaffected — live always reads real QB state.
+
+**Revisit when:** Adding any persistence layer to the simulation (e.g. snapshot-and-restore for fixture-driven tests). At that point the per-path cache could carry mutations across switches without diverging from real QB further than the persistence layer already does.
+
+---
+
+## 2026-05-09 — Insert filter children in QBXML schema-sequence order
+
+**Chosen:** Every `*QueryRq` filter dict must be populated in the order Intuit's `qbxmlops*.xml` schema declares its children. The canonical order for the standard list-tool filter group is `ListID/FullName → MaxReturned → ActiveStatus → FromModifiedDate → ToModifiedDate → NameFilter → (type-specific tail e.g. AccountType / TotalBalanceFilter / ClassFilter)`. Each affected tool now opens with a comment pointing back at this rule.
+
+**Why:** [src/qbxml/builder.ts](src/qbxml/builder.ts)'s `serializeBody` walks `Object.entries(body)`, which preserves JS string-key insertion order. QB's QBXML parser strictly enforces XSD `<xs:sequence>` ordering — out-of-order children produce the cryptic, untyped error `QuickBooks found an error when parsing the provided XML text stream` (no statusCode, no field hint). Live exercise on 2026-05-09 caught `qb_customer_list`, `qb_vendor_list`, `qb_item_list` failing with that error when called with `maxReturned: 5`; once we re-ordered insertion the exact same payload returned real records. The same wrong-order pattern was latent in `qb_employee_list`, `qb_account_list`, and the six `qb_*_list` tools in [src/tools/lists.ts](src/tools/lists.ts) — all now corrected defensively.
+
+**Why simulation didn't catch it:** [src/session/simulation-store.ts](src/session/simulation-store.ts)'s `handleQuery` reads the filter dict directly (`filters.NameFilter`, `filters.MaxReturned`, etc.) and never re-serializes through the QBXML builder, so insertion order has no observable effect in sim. This is why all 178 simulation tests pass against the broken code. A regression test that exercises the *XML* (`buildQueryRequest("Customer", filters)` then asserts the order of children in the emitted string) would have caught this — worth adding as future test coverage.
+
+**Alternatives rejected:**
+- *Sort filters into schema order inside the builder.* Would centralize the rule, but each request type has a different schema sequence (CustomerQueryRq differs from InvoiceQueryRq differs from AccountQueryRq) and the builder is currently entity-agnostic. Encoding per-type ordering tables in the builder would push schema knowledge into the wrong layer and be brittle as we add new request types. Cheaper to keep the rule at the tool layer where the filter dict is constructed.
+- *Switch to a Map-based filter object.* Same insertion-order semantics as objects in modern V8 (objects already preserve string-key order). No improvement.
+
+**Tradeoffs / consequences:**
+- Tool authors must remember to follow XSD order when adding filters. The opening comment in each `*_list` tool documents the canonical order.
+- The transaction list tools were fixed in the same session under the same rule — `qb_invoice_list`, `qb_bill_list`, `qb_estimate_list`, `qb_sales_receipt_list`, `qb_credit_memo_list`, `qb_purchase_order_list`, `qb_journal_entry_list`, `qb_payment_list`, `qb_bill_payment_list`. Canonical sequence for transaction queries: `TxnID/RefNumber selectors → MaxReturned → ModifiedDateRangeFilter → TxnDateRangeFilter → EntityFilter → AccountFilter → RefNumberFilter → CurrencyFilter → PaidStatus`. Verified against live QB via [scripts/exercise-mcp-live.mjs](scripts/exercise-mcp-live.mjs) with multi-filter probes — 20/20 green, including `DateRange + PaidStatus + MaxReturned` combos.
+
+**Revisit when:** Adding a new `*_list` tool, or once we add a builder-level XSD-order assertion that surfaces the rule statically.
+
+---
+
+## 2026-05-05 — Pin Node 20 LTS for live mode (winax prebuild gap on Node 22+)
+
+**Chosen:** Live-mode environments must run Node **20 LTS**, not the current Node LTS that `winget install OpenJS.NodeJS.LTS` returns. [scripts/setup-qb-pc.ps1](scripts/setup-qb-pc.ps1) installs nvm-windows + Node 20 if any other major version is detected, and a [.nvmrc](.nvmrc) at the repo root pins the project to Node 20.
+
+**Why:** `winax` ships prebuilt `.node` binaries for `{node-v115-win32-x64}` (Node 20 ABI). It does **not** ship prebuilds for Node 22+, so `npm install` falls through to `node-gyp rebuild`, which compiles the bridge's C++ against the host's V8 headers. winax 3.4.x–3.6.9 use V8 API symbols (`PropertyCallbackInfo<void>::HolderV2`) that exist in V8's main-line but are not yet present in Node 22.17.0's V8 12.x — every recent winax version fails compile with `'HolderV2' : is not a member of any direct or indirect base class of 'v8::PropertyCallbackInfo<void>'`. On Node 20 `npm install` skips the compile entirely and uses the prebuilt; on Node 22+ there's no path to a working build today.
+
+The original setup script asked winget for "the LTS" without pinning a major version. When the office PC was provisioned, that resolved to Node 20; when the dev PC was provisioned later, it resolved to Node 22 — silent regression, identical script run, different outcome. Pinning Node 20 explicitly closes that gap.
+
+**Alternatives rejected:**
+- **Stay on Node 22; replace `winax` with a PowerShell child-process bridge.** Version-agnostic, no native deps. Rejected as the default because it adds 20–50ms latency per QBXML round-trip (long-running PS host with stdin/stdout, not per-request spawn) and a second failure-mode surface (PS host crash recovery, JSON-over-stdio framing). Worth revisiting if `winax` development stalls long-term — the bridge is the durable answer to "what if winax stops keeping up with V8."
+- **Stay on Node 22; pin a specific older `winax` version that built historically.** Tried 3.4.2 (and 3.6.9, the current); both fail with the same V8 ABI error against Node 22.17.0. winax never had a Node-22-ABI-compatible release on npm.
+- **Stay on Node 22; fork `winax` and patch the V8 calls.** Brittle — V8 is moving; we'd own the maintenance load. Not worth it for one COM call surface.
+- **Allow both Node 20 and Node 22; let users pick.** Tested simulation works on either, but live mode silently breaks on 22. Operators don't read errors carefully enough — the failure mode (`Cannot find package 'winax'` from a lazy import after `npm install` silently skipped extraction via `ideallyInert`) is too easy to misread as a code bug. Better to enforce one supported version.
+
+**Tradeoffs / consequences:**
+- Setup script grows a Node-version-check + nvm-windows install path. Runtime: ~30s extra on a fresh box, idempotent on re-runs (it skips both if Node 20 is already active).
+- Operators must `nvm use 20` in any new shell where they want to run this project. Mitigated by `nvm alias default 20` (which the script does after install) and by [.nvmrc](.nvmrc) for tooling that honors it.
+- Downstream: anyone who pulls this repo on a fresh Windows PC and has Node 18 or 22+ already installed for other projects will get an nvm install on top. nvm-windows is non-destructive (it doesn't remove existing Node), so other projects keep working — the user just has to remember to switch.
+- Node 20 LTS is supported until **April 2026**. Plenty of runway; we'll need to revisit before then unless winax catches up.
+
+**Revisit when:**
+- `winax` publishes prebuilt binaries for Node 22 win-x64 (`{node-v127-win32-x64}` or higher). At that point the Node 20 pin can drop.
+- OR Node 20 reaches end-of-life (April 2026). At that point we either move to whatever Node version winax supports, or replace winax with the PS-bridge alternative.
+
+---
+
+## 2026-05-05 — `winax` for QBXMLRP2 COM bindings (over `node-activex`)
+
+**Chosen:** Add `winax` (^3.x) as a runtime dependency. Live mode in [session/manager.ts](src/session/manager.ts) uses `new (await import("winax")).Object("QBXMLRP2.RequestProcessor")` to instantiate the COM object, then drives `OpenConnection2` / `BeginSession` / `ProcessRequest` / `EndSession` / `CloseConnection`. The import is lazy (only invoked in the live `openSession` branch) so simulation mode and non-Windows platforms never load it.
+
+**Why:** `winax` is the actively-maintained Node ↔ Windows COM bridge in 2025-2026. It supports modern Node (22+), 64-bit ActiveX, native ESM, and ships TypeScript-compatible builds. The QuickBooks SDK exposes `QBXMLRP2.RequestProcessor` as an in-proc COM server; any Node-side bridge must call into it via `new ActiveXObject(...)` and dispatch member calls — which is exactly what `winax`'s `Object` helper does. Lazy `await import()` keeps the dependency a runtime concern only on Windows + live mode; the simulation path and macOS/Linux dev paths never resolve it. A small `src/types/winax.d.ts` shim declares the module so `tsc` can compile before `npm install` has compiled the native binding (the user's first `npm install` after pulling fresh and the setup script's bootstrap both need this).
+
+**Alternatives rejected:**
+- **`node-activex`.** Functionally equivalent API but stale: last meaningful release in early 2017, no Node 18+ binaries published, GitHub issues open for 4+ years on x64 / ESM / electron compatibility. Even if it worked today, every future Node upgrade would be a coin flip.
+- **`edge-js` + an inline C# host.** Would let us call the QB SDK's higher-level QBFC library, which is friendlier than raw QBXML. But it pulls in a CLR runtime, complicates the install (Mono/.NET dep on the user's box), and the project has already committed to QBXML strings as the wire format. Invariant #2 in [ARCHITECTURE.md](ARCHITECTURE.md) ("simulation and live must be observationally identical") wants the same QBXML round-tripping the simulation already does — moving to QBFC objects breaks that.
+- **Spawn a PowerShell/`cscript` child process per request.** Avoids the native dep entirely. Rejected: per-request process spawn cost (50-150ms each), no way to hold a persistent `BeginSession` ticket across calls without keeping the child alive (which just reinvents the COM-bridge problem in a slower, harder-to-debug shape), and each spawn risks tripping QB's per-app session limits.
+- **Run a separate Windows-only `qb-bridge` service over a local socket.** Cleanest in theory (decouples the MCP server from native deps; the bridge could be C# / VB6 / anything Intuit's docs use). Rejected for this single-user personal tool — adds an installer, a service to manage, and a second failure-mode surface for what amounts to one COM call wrapped in error handling.
+
+**Tradeoffs / consequences:**
+- `npm install` on Windows now requires Python 3 + VS 2022 Build Tools (C++ workload) to compile `winax`'s native binding. [scripts/setup-qb-pc.ps1](scripts/setup-qb-pc.ps1) installs both before running `npm install`, so first-time setup is one-shot.
+- macOS/Linux `npm install` is fine because `winax` is OS-skipped at install (it ships a no-op binary stub for non-win32). The simulation-mode dev story stays cross-platform — that's verified by the lazy `await import()` pattern: `import` only happens inside the live branch of `openSession`.
+- `tsc` needs the type shim at [src/types/winax.d.ts](src/types/winax.d.ts) because `winax`'s own typings don't ship in a way TypeScript's `Node16` resolver picks up cleanly. The shim declares only the surface we use (`Object` constructor that returns a dispatch-style object).
+- `winax`'s upstream is small but active. If it goes unmaintained, the migration target is most likely a `qb-bridge` sidecar — a roughly day-long swap that touches only `manager.ts`'s live branch.
+- Dropping the `Sample Company.qbw` default in [src/index.ts:65](src/index.ts#L65) — empty `QB_COMPANY_FILE` now means "use whatever company file QuickBooks Desktop currently has open." The QB SDK accepts `""` for `BeginSession`'s file argument and treats it as "current open file." That's the better UX for a tool that's most often used while the operator is already in QB; the prior fallback was a phantom default that pointed at a path that may not exist.
+
+**Revisit when:** `winax` releases stop or a Node major version (24+) breaks the binding. Or when a non-Windows live path becomes interesting (QuickBooks Online MCP would be a separate server, not a re-platform of this one).
+
+---
+
 ## 2026-04-27 — Vitest for the test harness; keep env-matrix as a standalone `.mjs` script
 
 **Chosen:** `vitest@^4` is the test framework. Tests live in `tests/*.test.ts`, import directly from `src/*.ts` (Vitest's Vite-based resolver handles the `.js`-extension imports the project uses for Node16 ESM), and run via `npm test` → `vitest run`. The five new Vitest files port four of the five existing `scripts/verify-*.mjs` harnesses (`item25-error-shape`, `item27-iterator`, `item29-input-validation`, plus two new `qbxml-roundtrip` and `simulation-store` files). The fifth harness — `verify-item23-env-matrix.mjs` — stays as a standalone `node` script invoked from CI / the regression checklist, NOT inside Vitest.

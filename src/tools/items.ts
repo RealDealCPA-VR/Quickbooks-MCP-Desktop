@@ -40,10 +40,11 @@ export function registerItemTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Item*QueryRq schema-required child order (see customers.ts).
       if (listId) filters.ListID = listId;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
       const wantsPagination = Boolean(paginate || iteratorID);
       if (wantsPagination && !itemType) {

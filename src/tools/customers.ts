@@ -32,17 +32,27 @@ export function registerCustomerTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // QBXML schema for CustomerQueryRq (and every other *QueryRq with the
+      // standard filter sequence) requires children in this order, per the
+      // <xs:sequence> in qbxmlops*.xml:
+      //   ListID/FullName (selector group, exclusive with filter group) →
+      //   MaxReturned → ActiveStatus → FromModifiedDate/ToModifiedDate →
+      //   NameFilter/NameRangeFilter → (type-specific tail)
+      // Out-of-order children get rejected with "QuickBooks found an error
+      // when parsing the provided XML text stream" — observed live, not
+      // surfaced by simulation since SimulationStore.handleQuery ignores
+      // child ordering.
       if (listId) {
         filters.ListID = listId;
       }
-      if (nameFilter) {
-        filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
+      if (maxReturned) {
+        filters.MaxReturned = maxReturned;
       }
       if (activeOnly !== false) {
         filters.ActiveStatus = "ActiveOnly";
       }
-      if (maxReturned) {
-        filters.MaxReturned = maxReturned;
+      if (nameFilter) {
+        filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
       }
 
       try {

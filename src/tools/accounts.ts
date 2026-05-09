@@ -33,10 +33,12 @@ export function registerAccountTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // AccountQueryRq schema-required child order (see customers.ts):
+      //   ListID → ActiveStatus → NameFilter → AccountType
       if (listId) filters.ListID = listId;
-      if (accountType) filters.AccountType = accountType;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
+      if (accountType) filters.AccountType = accountType;
 
       try {
         const accounts = await session.queryEntity("Account", filters);

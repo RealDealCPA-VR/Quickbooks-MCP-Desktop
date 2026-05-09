@@ -72,20 +72,21 @@ export function registerSalesReceiptTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // SalesReceiptQueryRq schema-required child order (see invoices.ts).
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
-      if (args.customerListId) {
-        filters.EntityFilter = { ListID: args.customerListId };
-      } else if (args.customerName) {
-        filters.EntityFilter = { FullName: args.customerName };
-      }
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
       if (args.fromDate || args.toDate) {
         filters.TxnDateRangeFilter = {
           FromTxnDate: args.fromDate,
           ToTxnDate: args.toDate,
         };
       }
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (args.customerListId) {
+        filters.EntityFilter = { ListID: args.customerListId };
+      } else if (args.customerName) {
+        filters.EntityFilter = { FullName: args.customerName };
+      }
 
       try {
         const salesReceipts = await session.queryEntity("SalesReceipt", filters);

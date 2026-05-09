@@ -206,6 +206,8 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 |------|-------------|
 | `qb_session_connect` | Open a QuickBooks session |
 | `qb_session_disconnect` | Close the session |
+| `qb_company_open` | Switch the active QuickBooks Desktop company file mid-session. Closes the current session, swaps the configured `.qbw` path, opens a new session against the new file. Live mode requires QB Desktop to already have the target file open (QBXMLRP2 cannot open a file QB hasn't loaded). Simulation mode resets the in-memory store to fresh seed — real QB persists per-file, sim doesn't (deliberate sim-fidelity tradeoff per [DECISIONS.md](DECISIONS.md#2026-05-09--company-switching-reseeds-the-simulation-store)); the response carries `simulationStoreReset: true` in sim. |
+| `qb_company_list` | Enumerate `.qbw` company files under a search root. Search root resolves in priority: `root` arg → `$QB_COMPANY_ROOT` → `dirname($QB_COMPANY_FILE)`. Returns `[{ companyFile, displayName, sizeBytes, modifiedAt }]` sorted by `modifiedAt` desc. Pure filesystem op — identical in live and simulation. Pair with `qb_company_open`: returned `companyFile` paths are valid input. |
 
 ## Architecture
 
@@ -216,7 +218,7 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (36 tools)      │──│──────────────┐
+                                    │  │ (74 tools)      │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │
@@ -291,6 +293,7 @@ The Vitest suite imports from `src/` (verifies the source). The five `scripts/ve
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `QB_COMPANY_FILE` | Path to .qbw company file | Sample file path |
+| `QB_COMPANY_ROOT` | Search root for `qb_company_list` — directory to scan for `.qbw` files. Falls back to `dirname($QB_COMPANY_FILE)` if unset. | unset (falls back) |
 | `QB_APP_NAME` | App name for QB registration | `MCP QuickBooks Manager` |
 | `QB_APP_ID` | Application ID (optional) | — |
 | `QB_QBXML_VERSION` | QBXML protocol version | `16.0` |

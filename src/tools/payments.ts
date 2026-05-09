@@ -218,13 +218,14 @@ export function registerPaymentTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
-      if (args.customerName) {
-        filters.EntityFilter = { FullName: args.customerName };
-      }
+      // ReceivePaymentQueryRq schema-required child order (see invoices.ts).
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
       if (args.fromDate || args.toDate) {
         filters.TxnDateRangeFilter = { FromTxnDate: args.fromDate, ToTxnDate: args.toDate };
       }
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (args.customerName) {
+        filters.EntityFilter = { FullName: args.customerName };
+      }
 
       try {
         const payments = await session.queryEntity("ReceivePayment", filters);

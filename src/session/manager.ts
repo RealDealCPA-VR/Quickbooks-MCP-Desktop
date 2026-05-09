@@ -24,6 +24,7 @@ import {
   buildReportRequest,
 } from "../qbxml/builder.js";
 import {
+  parseQBXMLResponse,
   extractResponseData,
   extractReportData,
   flattenEntityArray,
@@ -34,7 +35,28 @@ import type {
   QBXMLRequest,
   QBXMLResponse,
 } from "../types/qbxml.js";
+import type { ComDispatchObject } from "winax";
 import { SimulationStore } from "./simulation-store.js";
+
+// ---------------------------------------------------------------------------
+// QBXMLRP2 SDK constants (Intuit QuickBooks SDK 16.0)
+// ---------------------------------------------------------------------------
+
+/**
+ * `OpenConnection2` connectionType. localQBD (1) requires QuickBooks Desktop
+ * to be running on this machine and have a company file open. The setup
+ * script's COM probe uses the same value, so the cert that the operator
+ * approved on first run is bound to (appName, localQBD) tuples.
+ */
+const RP2_CONNECTION_TYPE_LOCAL_QBD = 1;
+
+/**
+ * `BeginSession` qbFileMode. omDontCare (2) inherits whatever
+ * single/multi-user mode the operator already has the file in. Real QB
+ * rejects single-user-only requests when the file is opened multi-user; we
+ * sidestep that by deferring to the operator's existing choice.
+ */
+const RP2_FILE_MODE_DONT_CARE = 2;
 
 // ---------------------------------------------------------------------------
 // Session manager
@@ -65,6 +87,12 @@ export class QBSessionManager {
   private session: QBSession | null = null;
   private simulationMode: boolean;
   private store: SimulationStore;
+  /**
+   * Live-mode `QBXMLRP2.RequestProcessor` dispatch object. Held between
+   * `openSession` and `closeSession` so the same connection processes every
+   * request in a session. Null in simulation mode and after `closeSession`.
+   */
+  private rp: ComDispatchObject | null = null;
 
   constructor(config: QBConnectionConfig) {
     this.config = config;
@@ -96,14 +124,71 @@ export class QBSessionManager {
       return this.session;
     }
 
-    // LIVE MODE: Would use QBXMLRP2 COM automation here
-    // const rp = new ActiveXObject("QBXMLRP2.RequestProcessor");
-    // rp.OpenConnection2(this.config.appId, this.config.appName, connectionMode);
-    // const ticket = rp.BeginSession(this.config.companyFile, qbFileMode);
-    throw new Error(
-      "Live QuickBooks connection requires Windows with QuickBooks Desktop installed. " +
-      "Set QB_SIMULATION=true to use simulation mode."
-    );
+    // LIVE MODE — QBXMLRP2 COM automation via winax.
+    let winax: typeof import("winax");
+    try {
+      winax = await import("winax");
+    } catch (err) {
+      throw new Error(
+        "winax module not available. Run scripts/setup-qb-pc.ps1 from an elevated PowerShell " +
+        "to install Visual Studio Build Tools + Python and rebuild it, or set QB_SIMULATION=true. " +
+        `Underlying error: ${(err as Error).message}`
+      );
+    }
+    const ActiveXObject =
+      (winax as { Object?: typeof winax.Object }).Object ??
+      (winax as { default?: { Object?: typeof winax.Object } }).default?.Object;
+    if (!ActiveXObject) {
+      throw new Error(
+        "winax loaded but does not expose an `Object` constructor — incompatible winax version installed."
+      );
+    }
+
+    const rp = new ActiveXObject("QBXMLRP2.RequestProcessor");
+
+    try {
+      rp.OpenConnection2(
+        this.config.appId ?? "",
+        this.config.appName,
+        RP2_CONNECTION_TYPE_LOCAL_QBD
+      );
+    } catch (err) {
+      this.rp = null;
+      throw new Error(
+        `QBXMLRP2.OpenConnection2 failed: ${(err as Error).message}. ` +
+        "Verify QuickBooks Desktop is installed and the QuickBooks SDK is registered " +
+        "(scripts/setup-qb-pc.ps1 step 4 probes this)."
+      );
+    }
+
+    let ticket: string;
+    try {
+      // companyFile === "" tells QBXMLRP2 to use whatever file is currently
+      // open in QuickBooks Desktop. That's the better UX for an interactive
+      // tool — operators usually have the file open already.
+      ticket = rp.BeginSession(this.config.companyFile ?? "", RP2_FILE_MODE_DONT_CARE);
+    } catch (err) {
+      try { rp.CloseConnection(); } catch { /* swallow — we're already in error path */ }
+      throw new Error(
+        `QBXMLRP2.BeginSession failed: ${(err as Error).message}. ` +
+        "First connection? QuickBooks should have shown an Application Certificate dialog — " +
+        "approve 'Yes, always' for app name '" + this.config.appName + "'. Otherwise verify " +
+        "the company file path matches what QB has open and the logged-in user has Admin rights."
+      );
+    }
+    if (!ticket) {
+      try { rp.CloseConnection(); } catch { /* swallow */ }
+      throw new Error("QBXMLRP2.BeginSession returned an empty ticket — connection refused without an error.");
+    }
+
+    this.rp = rp;
+    this.session = {
+      ticket,
+      companyFile: this.config.companyFile,
+      openedAt: new Date(),
+    };
+    console.error(`[QB Session] Live session opened: ticket=${ticket}`);
+    return this.session;
   }
 
   async closeSession(): Promise<void> {
@@ -115,8 +200,30 @@ export class QBSessionManager {
       return;
     }
 
-    // LIVE MODE: rp.EndSession(ticket); rp.CloseConnection();
+    // LIVE MODE — pair EndSession + CloseConnection, swallow shutdown errors.
+    // We never want to crash the process during cleanup; better to log and
+    // proceed than to leave the operator with a half-closed session that
+    // blocks the next process from connecting.
+    const ticket = this.session.ticket;
+    if (this.rp) {
+      try {
+        this.rp.EndSession(ticket);
+      } catch (err) {
+        console.error(
+          `[QB Session] EndSession failed (continuing anyway): ${(err as Error).message}`
+        );
+      }
+      try {
+        this.rp.CloseConnection();
+      } catch (err) {
+        console.error(
+          `[QB Session] CloseConnection failed (continuing anyway): ${(err as Error).message}`
+        );
+      }
+    }
+    this.rp = null;
     this.session = null;
+    console.error(`[QB Session] Live session closed: ticket=${ticket}`);
   }
 
   isConnected(): boolean {
@@ -129,6 +236,40 @@ export class QBSessionManager {
 
   isSimulation(): boolean {
     return this.simulationMode;
+  }
+
+  /**
+   * Path of the company file currently registered on the session config (the
+   * one that openSession will pass to BeginSession). Empty string means
+   * "use whatever file QB Desktop has open right now". Reads the live config
+   * value, not a stale cached copy from a prior open session — switchCompanyFile
+   * mutates this.
+   */
+  getCompanyFile(): string {
+    return this.config.companyFile;
+  }
+
+  /**
+   * Swap the active company file. Closes any in-flight session, mutates the
+   * config path, resets the simulation store (sim mode only — real QB persists
+   * per-file, sim doesn't), and opens a fresh session against the new file.
+   *
+   * Live mode: the close path runs EndSession + CloseConnection on the old
+   * file; the open path runs OpenConnection2 + BeginSession on the new one.
+   * QBXMLRP2 only supports one file open per process at a time, so this is
+   * sequential by construction.
+   *
+   * Sim mode: the new SimulationStore reseeds; entities created against the
+   * prior path are gone. This is the deliberate sim-fidelity tradeoff
+   * documented in DECISIONS.md (2026-05-09).
+   */
+  async switchCompanyFile(companyFile: string): Promise<QBSession> {
+    await this.closeSession();
+    this.config.companyFile = companyFile;
+    if (this.simulationMode) {
+      this.store = new SimulationStore();
+    }
+    return this.openSession();
   }
 
   // -------------------------------------------------------------------------
@@ -147,10 +288,18 @@ export class QBSessionManager {
       return this.store.processRequest(qbxmlRequest);
     }
 
-    // LIVE MODE:
-    // const responseXml = rp.ProcessRequest(this.session.ticket, qbxmlRequest);
-    // return parseQBXMLResponse(responseXml);
-    throw new Error("Live mode not available");
+    // LIVE MODE — round-trip the QBXML string through QBXMLRP2 and parse the
+    // response with the same parser the simulation results would have flowed
+    // through. Errors from ProcessRequest bubble out so the existing tool-side
+    // error machinery (Item 25 path) can translate them into structured tool
+    // responses.
+    if (!this.rp || !this.session) {
+      throw new Error(
+        "Live mode is active but no session is open — openSession was expected to be called first."
+      );
+    }
+    const responseXml: string = this.rp.ProcessRequest(this.session.ticket, qbxmlRequest);
+    return parseQBXMLResponse(responseXml);
   }
 
   /**

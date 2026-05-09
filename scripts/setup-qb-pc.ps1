@@ -16,9 +16,9 @@
        Intuit's download page (login required) and waits.
     6. Runs npm install + npm run build in the repo
     7. Scaffolds a .env file in live mode
-    8. Probes a real QBXMLRP2 connection (OpenConnection2 → BeginSession →
-       EndSession → CloseConnection). On first run this triggers
-       QuickBooks' "Application Certificate" dialog — the operator must
+    8. Probes a real QBXMLRP2 connection (OpenConnection2 -> BeginSession ->
+       EndSession -> CloseConnection). On first run this triggers
+       QuickBooks' "Application Certificate" dialog -- the operator must
        approve "Yes, always; allow access even if QuickBooks is not running."
 
 .PARAMETER CompanyFile
@@ -72,6 +72,48 @@ function Refresh-Path {
               [System.Environment]::GetEnvironmentVariable("Path","User")
 }
 
+# Locate nvm.exe regardless of whether the in-process PATH has it. nvm-windows
+# 1.2.x installs to LOCALAPPDATA, older versions used APPDATA, and some manual
+# installs land in C:\nvm or C:\nvm4w. The HKCU NVM_HOME registry value is the
+# most authoritative when it's set.
+function Find-NvmExe {
+  $nvmHome = [System.Environment]::GetEnvironmentVariable("NVM_HOME", "User")
+  if (-not $nvmHome) {
+    $nvmHome = [System.Environment]::GetEnvironmentVariable("NVM_HOME", "Machine")
+  }
+  $candidates = @()
+  if ($nvmHome) { $candidates += (Join-Path $nvmHome "nvm.exe") }
+  if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA "nvm\nvm.exe") }
+  if ($env:APPDATA)      { $candidates += (Join-Path $env:APPDATA      "nvm\nvm.exe") }
+  $candidates += "C:\nvm\nvm.exe"
+  $candidates += "C:\nvm4w\nvm.exe"
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path $c)) { return $c }
+  }
+  return $null
+}
+
+# Add nvm's directories to the in-process PATH so subsequent `nvm` calls work
+# even when the installer's env-var changes haven't propagated to this shell.
+function Stitch-NvmPath($nvmExe) {
+  $nvmDir = Split-Path $nvmExe
+  $symlink = [System.Environment]::GetEnvironmentVariable("NVM_SYMLINK", "User")
+  if (-not $symlink) {
+    $symlink = [System.Environment]::GetEnvironmentVariable("NVM_SYMLINK", "Machine")
+  }
+  $prefix = $nvmDir
+  if ($symlink) { $prefix = "$prefix;$symlink" }
+  $env:Path = "$prefix;" + $env:Path
+}
+
+# winget returns these for "no work needed" outcomes that we want to treat as
+# success rather than hard-failure when the package is already in place.
+$WINGET_EXIT_OK = @(
+  0,
+  -1978335189,  # APPINSTALLER_CLI_ERROR_NO_APPLICABLE_UPDATE_FOUND
+  -1978335212   # APPINSTALLER_CLI_ERROR_INSTALL_PACKAGE_ALREADY_INSTALLED
+)
+
 function Test-QbxmlRp2Registered {
   $keys = @(
     "HKLM:\SOFTWARE\Classes\QBXMLRP2.RequestProcessor",
@@ -92,7 +134,7 @@ if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
   exit 1
 }
 
-# 64-bit check — QB 2022+ is 64-bit and Node must match.
+# 64-bit check -- QB 2022+ is 64-bit and Node must match.
 if (-not [Environment]::Is64BitOperatingSystem) {
   Write-Fail "This script targets 64-bit Windows. 32-bit installs are out of scope."
   exit 1
@@ -102,23 +144,108 @@ if (-not [Environment]::Is64BitProcess) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: Node.js LTS
+# Step 1: Node.js 20 LTS (pinned -- winax has no prebuilt for Node 22+)
 # ---------------------------------------------------------------------------
-Write-Step 1 "Node.js LTS (64-bit)"
+# See DECISIONS.md ("Pin Node 20 LTS for live mode") for why this is hard-pinned
+# instead of just installing whatever winget calls "LTS." TL;DR: winax's only
+# published prebuilt binaries are for the Node 20 ABI, and source-compile against
+# Node 22's V8 12.x fails with a HolderV2 API mismatch.
+Write-Step 1 "Node.js 20 LTS (pinned via nvm-windows)"
+
+$wantMajor = 20
+$nodeMajor = $null
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 if ($nodeCmd) {
-  Write-Ok "Node already installed ($(& node --version))"
+  $nodeVerString = (& node --version)
+  $nodeMajor = [int](($nodeVerString -replace '^v', '').Split('.')[0])
+}
+
+if ($nodeMajor -eq $wantMajor) {
+  Write-Ok "Node $nodeVerString already active (matches required major v$wantMajor)"
 } else {
-  Write-Host "  Installing Node.js LTS via winget..."
-  winget install --id OpenJS.NodeJS.LTS --silent `
-    --accept-source-agreements --accept-package-agreements
-  if ($LASTEXITCODE -ne 0) { Write-Fail "Node install failed (exit $LASTEXITCODE)."; exit 1 }
+  if ($nodeMajor) {
+    Write-Note "Found Node $nodeVerString on PATH but this project requires Node $wantMajor."
+    Write-Note "winax (the COM bridge) has no prebuilt for Node 22+, and source-compile fails."
+    Write-Note "Will install nvm-windows so multiple Node versions can coexist."
+  } else {
+    Write-Host "  No Node detected. Installing nvm-windows + Node $wantMajor..."
+  }
+
+  # Find nvm. Order: PATH first (cheapest), then canonical install paths
+  # (handles "already installed but PATH not propagated" -- the most common
+  # outcome on a re-run). Only invoke winget if neither check finds nvm.
+  $nvmCmd = Get-Command nvm -ErrorAction SilentlyContinue
+  if (-not $nvmCmd) {
+    $existingNvm = Find-NvmExe
+    if ($existingNvm) {
+      Write-Note "nvm-windows is installed at $existingNvm but not on this shell's PATH."
+      Stitch-NvmPath $existingNvm
+      $nvmCmd = Get-Command nvm -ErrorAction SilentlyContinue
+    }
+  }
+
+  if (-not $nvmCmd) {
+    Write-Host "  Installing nvm-windows via winget (CoreyButler.NVMforWindows)..."
+    winget install --id CoreyButler.NVMforWindows --silent `
+      --accept-source-agreements --accept-package-agreements
+    $wgExit = $LASTEXITCODE
+    if ($WINGET_EXIT_OK -notcontains $wgExit) {
+      Write-Fail "nvm-windows install failed (winget exit $wgExit)."
+      Write-Host "  Manual install: https://github.com/coreybutler/nvm-windows/releases"
+      exit 1
+    }
+    Refresh-Path
+
+    # winget reported success (or "already installed"). Find nvm.exe so we can
+    # invoke it without depending on PATH propagation in this process.
+    $nvmCmd = Get-Command nvm -ErrorAction SilentlyContinue
+    if (-not $nvmCmd) {
+      $found = Find-NvmExe
+      if (-not $found) {
+        Write-Fail "winget reported success but nvm.exe not found in any standard location."
+        Write-Host "  Open a NEW elevated PowerShell and re-run this script."
+        exit 1
+      }
+      Stitch-NvmPath $found
+      $nvmCmd = Get-Command nvm -ErrorAction SilentlyContinue
+      if (-not $nvmCmd) {
+        Write-Fail "Even after PATH stitch, nvm still not invocable. Open a NEW elevated PowerShell and re-run."
+        exit 1
+      }
+    }
+    Write-Ok "nvm-windows installed (or already present)."
+  } else {
+    Write-Ok "nvm-windows already on PATH."
+  }
+
+  # Install Node 20 via nvm and switch to it. nvm install accepts a major-only
+  # version string and picks the latest LTS in that line.
+  Write-Host "  Running: nvm install $wantMajor"
+  & nvm install $wantMajor
+  if ($LASTEXITCODE -ne 0) { Write-Fail "nvm install $wantMajor failed."; exit 1 }
+
+  Write-Host "  Running: nvm use $wantMajor"
+  & nvm use $wantMajor
+  if ($LASTEXITCODE -ne 0) { Write-Fail "nvm use $wantMajor failed."; exit 1 }
+
+  # Note: nvm-windows 1.2.x has no `alias default` subcommand (that's nvm-osx).
+  # Stickiness across new shells is handled instead by detecting and warning
+  # about a competing system-PATH Node install (Step 1.5 below).
+
   Refresh-Path
   if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    Write-Fail "Node not on PATH after install. Open a new shell and re-run."
+    Write-Fail "Node not on PATH after nvm install. Open a NEW elevated PowerShell, run 'nvm use $wantMajor', and re-run this script."
     exit 1
   }
-  Write-Ok "Node installed: $(& node --version)"
+
+  $nodeVerString = (& node --version)
+  $nodeMajor = [int](($nodeVerString -replace '^v', '').Split('.')[0])
+  if ($nodeMajor -ne $wantMajor) {
+    Write-Fail "After nvm install, Node is still $nodeVerString (wanted v$wantMajor.x)."
+    Write-Host "  Open a new shell, run 'nvm use $wantMajor', and re-run this script."
+    exit 1
+  }
+  Write-Ok "Node $nodeVerString active via nvm-windows."
 }
 
 # ---------------------------------------------------------------------------
@@ -163,7 +290,7 @@ if ($haveVcTools) {
   winget install --id Microsoft.VisualStudio.2022.BuildTools `
     --silent --accept-source-agreements --accept-package-agreements `
     --override $override
-  # winget can return 0x8A150061 / non-zero even on success — verify via vswhere.
+  # winget can return 0x8A150061 / non-zero even on success -- verify via vswhere.
   if (Test-Path $vsWhere) {
     $found = & $vsWhere -products * `
       -requires Microsoft.VisualStudio.Workload.VCTools `
@@ -185,7 +312,7 @@ Write-Step 4 "QuickBooks SDK 16.0 (registers QBXMLRP2 COM)"
 if (Test-QbxmlRp2Registered) {
   Write-Ok "QBXMLRP2.RequestProcessor is registered."
 } else {
-  Write-Note "QuickBooks SDK not detected — QBXMLRP2 ProgID is not in the registry."
+  Write-Note "QuickBooks SDK not detected -- QBXMLRP2 ProgID is not in the registry."
   Write-Host "  Intuit requires a (free) developer account login to download the SDK,"
   Write-Host "  so this step is partially manual."
   Write-Host ""
@@ -242,7 +369,7 @@ if (Test-Path $envPath) {
     $CompanyFile = Read-Host "  Full path to your .qbw company file"
   }
   if (-not (Test-Path $CompanyFile)) {
-    Write-Note "File '$CompanyFile' does not exist yet. Continuing — fix QB_COMPANY_FILE in .env later."
+    Write-Note "File '$CompanyFile' does not exist yet. Continuing -- fix QB_COMPANY_FILE in .env later."
   }
   $companyRoot = Split-Path -Parent $CompanyFile
   $envContent = @"
@@ -326,8 +453,8 @@ Write-Host "  1. From repo root: node dist\index.js </NUL"
 Write-Host "     -> banner should NOT say 'Mode: simulation' once Item 1 lands."
 Write-Host "     -> until Item 1 lands, the server will throw 'Live QuickBooks"
 Write-Host "        connection requires Windows...' on first tool call. That's"
-Write-Host "        the expected pre-Item-1 state — env wiring is correct."
+Write-Host "        the expected pre-Item-1 state -- env wiring is correct."
 Write-Host "  2. Pull the latest branch from the dev machine after Item 1 ships,"
-Write-Host "     re-run: npm install && npm run build && node dist\index.js"
-Write-Host "  3. Use an MCP client to call qb_session_connect → qb_company_info."
+Write-Host "     re-run: npm install ; npm run build ; node dist\index.js"
+Write-Host "  3. Use an MCP client to call qb_session_connect -> qb_company_info."
 Write-Host ""

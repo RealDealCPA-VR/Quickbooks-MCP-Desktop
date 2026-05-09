@@ -99,21 +99,24 @@ export function registerJournalEntryTools(
     async (args) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
+      // JournalEntryQueryRq schema-required child order (see invoices.ts):
+      // selectors → MaxReturned → ModifiedDateRangeFilter → TxnDateRangeFilter
+      // → (entity/account/ref filters).
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
-      if (args.fromDate || args.toDate) {
-        filters.TxnDateRangeFilter = {
-          FromTxnDate: args.fromDate,
-          ToTxnDate: args.toDate,
-        };
-      }
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
       if (args.modifiedFrom || args.modifiedTo) {
         filters.ModifiedDateRangeFilter = {
           FromModifiedDate: args.modifiedFrom,
           ToModifiedDate: args.modifiedTo,
         };
       }
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (args.fromDate || args.toDate) {
+        filters.TxnDateRangeFilter = {
+          FromTxnDate: args.fromDate,
+          ToTxnDate: args.toDate,
+        };
+      }
 
       try {
         const journalEntries = await session.queryEntity("JournalEntry", filters);

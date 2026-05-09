@@ -71,21 +71,27 @@ export function registerInvoiceTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // InvoiceQueryRq schema-required child order (see DECISIONS.md
+      // 2026-05-09): TxnID/RefNumber selectors → MaxReturned →
+      // ModifiedDateRangeFilter → TxnDateRangeFilter → EntityFilter →
+      // AccountFilter → RefNumberFilter → CurrencyFilter → PaidStatus.
+      // Out-of-order children get rejected with the cryptic "QuickBooks
+      // found an error when parsing the provided XML text stream".
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
-      if (args.customerListId) {
-        filters.EntityFilter = { ListID: args.customerListId };
-      } else if (args.customerName) {
-        filters.EntityFilter = { FullName: args.customerName };
-      }
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
       if (args.fromDate || args.toDate) {
         filters.TxnDateRangeFilter = {
           FromTxnDate: args.fromDate,
           ToTxnDate: args.toDate,
         };
       }
+      if (args.customerListId) {
+        filters.EntityFilter = { ListID: args.customerListId };
+      } else if (args.customerName) {
+        filters.EntityFilter = { FullName: args.customerName };
+      }
       if (args.paidStatus) filters.PaidStatus = args.paidStatus;
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
       try {
         if (args.paginate || args.iteratorID) {

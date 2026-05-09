@@ -4,6 +4,8 @@
  * Provides high-level reporting, balance queries, and summary tools.
  */
 
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
@@ -99,6 +101,142 @@ export function registerReportTools(
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "CompanyQueryRq failed",
               ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // Company file management — open / list (Items 34-35)
+  // -----------------------------------------------------------------------
+
+  // Switching mid-conversation lets the operator move between client books
+  // without restarting the server. Live mode does a clean EndSession +
+  // CloseConnection on the old file followed by OpenConnection2 +
+  // BeginSession on the new one (QBXMLRP2 is single-file per process).
+  // Simulation mode swaps the path string and reseeds the store — real QB
+  // persists per-file, sim doesn't, so without the reseed the operator would
+  // observe entities from the prior company on the "new" one. The
+  // observational contract is "open a different book, see that book's
+  // state" — same in both modes. See DECISIONS.md 2026-05-09.
+  server.tool(
+    "qb_company_open",
+    "Switch the active QuickBooks Desktop company file. Closes the current session, swaps the configured company file path, and opens a new session against the new file. In live mode the file must either be the one currently open in QuickBooks Desktop or be openable by QBXMLRP2 (typically requires QB to have it open already — QBXMLRP2 won't open a file QB hasn't loaded). In simulation mode the in-memory store is reset to fresh seed (deliberate sim-fidelity tradeoff — real QB persists per-file, sim doesn't; see DECISIONS.md 2026-05-09).",
+    {
+      companyFile: z.string().min(1).describe("Absolute or UNC path to the .qbw file (e.g. 'C:\\\\path\\\\to\\\\Acme.qbw' or '\\\\\\\\server\\\\share\\\\Acme.qbw'). Pass an empty string to fall back to 'whatever file QB Desktop has open' — but the schema rejects empty strings to force an explicit choice; if you want the currently-open file, just don't call this tool."),
+    },
+    async ({ companyFile }) => {
+      const session = getSession();
+      const previousCompanyFile = session.getCompanyFile();
+      try {
+        const newSession = await session.switchCompanyFile(companyFile);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              previousCompanyFile,
+              companyFile: newSession.companyFile,
+              ticket: newSession.ticket,
+              openedAt: newSession.openedAt.toISOString(),
+              simulationMode: session.isSimulation(),
+              ...(session.isSimulation()
+                ? { simulationStoreReset: true }
+                : {}),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "Failed to open company file",
+              previousCompanyFile,
+              attemptedCompanyFile: companyFile,
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Pure FS op — identical in live and simulation. Resolves the search root
+  // from QB_COMPANY_ROOT (preferred) or dirname(QB_COMPANY_FILE) (fallback);
+  // returns an empty list with a descriptive note when neither is set rather
+  // than failing, since the operator can still call qb_company_open with a
+  // path they happen to know.
+  server.tool(
+    "qb_company_list",
+    "List QuickBooks company files (.qbw) under the configured root directory. Search root is taken from $QB_COMPANY_ROOT, falling back to dirname($QB_COMPANY_FILE). Returns [{companyFile, displayName, sizeBytes, modifiedAt}] sorted by modifiedAt desc. Pure filesystem operation — identical behavior in live and simulation mode. Use the returned `companyFile` paths as input to qb_company_open.",
+    {
+      root: z.string().optional().describe("Override the search root for this call (absolute path). Defaults to $QB_COMPANY_ROOT, then dirname($QB_COMPANY_FILE)."),
+    },
+    async ({ root: rootOverride }) => {
+      const envRoot = process.env.QB_COMPANY_ROOT;
+      const fallbackRoot = process.env.QB_COMPANY_FILE
+        ? path.dirname(process.env.QB_COMPANY_FILE)
+        : null;
+      const root = rootOverride ?? envRoot ?? fallbackRoot;
+
+      if (!root) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: -1,
+              statusMessage: "Cannot determine company root: set QB_COMPANY_ROOT, QB_COMPANY_FILE, or pass a `root` argument.",
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      try {
+        const entries = await fs.readdir(root, { withFileTypes: true });
+        const qbwEntries = entries.filter(
+          (e) => e.isFile() && e.name.toLowerCase().endsWith(".qbw")
+        );
+        const files = await Promise.all(
+          qbwEntries.map(async (e) => {
+            const full = path.join(root, e.name);
+            const stat = await fs.stat(full);
+            return {
+              companyFile: full,
+              displayName: path.basename(e.name, path.extname(e.name)),
+              sizeBytes: stat.size,
+              modifiedAt: stat.mtime.toISOString(),
+            };
+          })
+        );
+        files.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ root, count: files.length, companies: files }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; code?: string };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: -1,
+              statusMessage: `Failed to enumerate ${root}: ${e.message ?? String(err)}`,
+              root,
+              ...(e.code ? { errorCode: e.code } : {}),
             }),
           }],
           isError: true,

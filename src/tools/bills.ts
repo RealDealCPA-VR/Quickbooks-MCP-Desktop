@@ -116,17 +116,18 @@ export function registerBillTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // BillQueryRq schema-required child order (see invoices.ts).
       if (args.txnId) filters.TxnID = args.txnId;
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (args.fromDate || args.toDate) {
+        filters.TxnDateRangeFilter = { FromTxnDate: args.fromDate, ToTxnDate: args.toDate };
+      }
       if (args.vendorListId) {
         filters.EntityFilter = { ListID: args.vendorListId };
       } else if (args.vendorName) {
         filters.EntityFilter = { FullName: args.vendorName };
       }
-      if (args.fromDate || args.toDate) {
-        filters.TxnDateRangeFilter = { FromTxnDate: args.fromDate, ToTxnDate: args.toDate };
-      }
       if (args.paidStatus) filters.PaidStatus = args.paidStatus;
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
 
       try {
         if (args.paginate || args.iteratorID) {
@@ -540,13 +541,15 @@ export function registerBillTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
-      if (args.vendorName) {
-        filters.EntityFilter = { FullName: args.vendorName };
-      }
+      // BillPaymentCheck/CreditCardQueryRq schema-required child order
+      // (see invoices.ts).
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
       if (args.fromDate || args.toDate) {
         filters.TxnDateRangeFilter = { FromTxnDate: args.fromDate, ToTxnDate: args.toDate };
       }
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (args.vendorName) {
+        filters.EntityFilter = { FullName: args.vendorName };
+      }
 
       const types: ("BillPaymentCheck" | "BillPaymentCreditCard")[] =
         args.paymentType === "check"

@@ -62,7 +62,11 @@ import { registerReportTools } from "./tools/reports.js";
 // ---------------------------------------------------------------------------
 
 const config: QBConnectionConfig = {
-  companyFile: process.env.QB_COMPANY_FILE ?? "C:\\Users\\Public\\Documents\\Intuit\\QuickBooks\\Sample Company.qbw",
+  // Empty string means "use whatever company file is currently open in QB
+  // Desktop" (QBXMLRP2.BeginSession contract). Better default for an
+  // interactive tool than a phantom Sample Company.qbw path that may not
+  // exist on this machine.
+  companyFile: process.env.QB_COMPANY_FILE ?? "",
   appName: process.env.QB_APP_NAME ?? "MCP QuickBooks Manager",
   appId: process.env.QB_APP_ID,
   qbxmlVersion: process.env.QB_QBXML_VERSION ?? "16.0",
@@ -103,6 +107,8 @@ const server = new McpServer(
       "  • qb_class_list / qb_terms_list / qb_payment_method_list / qb_sales_rep_list / qb_customer_type_list / qb_vendor_type_list — Reference lists (read-only). Used to discover valid FullName values that transactions reference (Class on lines, Terms on invoice/bill headers, PaymentMethod on receive-payments, SalesRep/CustomerType/VendorType for segmentation). qb_terms_list fans across both StandardTerms and DateDrivenTerms by default — pass termsType to scope.",
       "  • qb_balance_summary / qb_ar_aging / qb_ap_aging / qb_pnl_report / qb_balance_sheet_report — Financial reports. qb_pnl_report walks Invoice/SalesReceipt/CreditMemo (income) and Bill/Check/CreditCardCharge plus JournalEntry (expense) lines filtered by TxnDate ∈ [fromDate, toDate], aggregates by GL account → AccountType, returns canonical-ordered sections (Income → Other Income → COGS → Expenses → Other Expenses) plus TotalIncome / TotalCOGS / TotalExpenses / GrossProfit / NetIncome. qb_balance_sheet_report returns Assets / Liabilities / Equity sections from Account.Balance (snapshot — asOfDate is advisory for those sections in simulation), with current-period NetIncome (lifetime → asOfDate) closed into Equity; the accounting identity Assets = Liabilities + Equity is reconciled by closing the simulation seed gap into a 'Balancing Adjustment' row when present. Both tools accept basis: 'Accrual' | 'Cash' (currently identical in simulation; Cash basis revenue recognition lands with Phase 7 live mode).",
       "  • qb_company_info  — Connection & company info",
+      "  • qb_company_open  — Switch the active QuickBooks company file mid-session. Closes the current session, swaps the configured `.qbw` path, and opens a new session against the new file. Live mode requires QB Desktop to have the target file open (QBXMLRP2 cannot open a file QB hasn't loaded). Simulation mode resets the in-memory store to fresh seed — real QB persists per-file, sim doesn't, so without the reseed the operator would see entities from the prior company on the 'new' one (deliberate sim-fidelity tradeoff per DECISIONS.md 2026-05-09). Use qb_company_list first to discover available `.qbw` paths.",
+      "  • qb_company_list  — List `.qbw` company files under $QB_COMPANY_ROOT (fallback: dirname($QB_COMPANY_FILE), or pass `root` arg). Pure filesystem op — identical in live and simulation. Returns [{companyFile, displayName, sizeBytes, modifiedAt}] sorted by modifiedAt desc. Pair with qb_company_open: the returned `companyFile` paths are valid input.",
       "  • qb_raw_query     — Direct QBXML queries for advanced use",
       "  • qb_session_*     — Session connect/disconnect",
       "",
@@ -153,14 +159,45 @@ registerReportTools(server, getSessionManager);
 // Start the server
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Graceful shutdown — close any open QuickBooks session before exiting so the
+// QBXMLRP2 ticket isn't stranded. A stranded ticket means the next process
+// connecting with the same appName has to wait for QB to time it out (~5
+// minutes) or for the operator to restart QB.
+// ---------------------------------------------------------------------------
+
+let shuttingDown = false;
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`\n[QB Session] Received ${signal}, closing QuickBooks session...`);
+  if (sessionManager) {
+    try {
+      await sessionManager.closeSession();
+    } catch (err) {
+      console.error(`[QB Session] Shutdown error (continuing exit): ${(err as Error).message}`);
+    }
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
+process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
+
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Eagerly construct the session manager so the Mode banner reports the
+  // actual resolved mode (which honors QB_SIMULATION overrides) rather than
+  // duplicating the env-resolution logic here. Construction is cheap — it
+  // reads env, picks a mode, and creates an empty SimulationStore. No QB
+  // session opens until the first tool call.
+  const sm = getSessionManager();
   console.error("QuickBooks Desktop MCP Server running on stdio");
-  console.error(`  Company file: ${config.companyFile}`);
+  console.error(`  Company file: ${config.companyFile || "(use currently open QB file)"}`);
   console.error(`  App name: ${config.appName}`);
   console.error(`  QBXML version: ${config.qbxmlVersion}`);
-  console.error(`  Mode: ${process.platform === "win32" && process.env.QB_LIVE ? "live" : "simulation"}`);
+  console.error(`  Mode: ${sm.isSimulation() ? "simulation" : "live"}`);
 }
 
 main().catch((error) => {

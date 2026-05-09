@@ -25,10 +25,11 @@ export function registerEmployeeTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // EmployeeQueryRq schema-required child order (see customers.ts).
       if (listId) filters.ListID = listId;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
       try {
         const employees = await session.queryEntity("Employee", filters);

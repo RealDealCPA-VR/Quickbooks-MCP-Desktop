@@ -35,10 +35,12 @@ export function registerListTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Schema-required child order — selector → MaxReturned → ActiveStatus
+      // → NameFilter (see customers.ts for the full reasoning).
       if (listId) filters.ListID = listId;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
       try {
         const classes = await session.queryEntity("Class", filters);
@@ -82,10 +84,12 @@ export function registerListTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Schema-required child order — selector → MaxReturned → ActiveStatus
+      // → NameFilter (see customers.ts for the full reasoning).
       if (listId) filters.ListID = listId;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
       const types: ("StandardTerms" | "DateDrivenTerms")[] =
         termsType === "Standard"
@@ -142,10 +146,12 @@ export function registerListTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Schema-required child order — selector → MaxReturned → ActiveStatus
+      // → NameFilter (see customers.ts for the full reasoning).
       if (listId) filters.ListID = listId;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
       try {
         const paymentMethods = await session.queryEntity("PaymentMethod", filters);
@@ -186,9 +192,10 @@ export function registerListTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // SalesRepQueryRq schema order (see customers.ts).
       if (listId) filters.ListID = listId;
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
 
       try {
         const salesReps = await session.queryEntity("SalesRep", filters);
@@ -230,10 +237,12 @@ export function registerListTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Schema-required child order — selector → MaxReturned → ActiveStatus
+      // → NameFilter (see customers.ts for the full reasoning).
       if (listId) filters.ListID = listId;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
       try {
         const customerTypes = await session.queryEntity("CustomerType", filters);
@@ -275,10 +284,12 @@ export function registerListTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Schema-required child order — selector → MaxReturned → ActiveStatus
+      // → NameFilter (see customers.ts for the full reasoning).
       if (listId) filters.ListID = listId;
-      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
-      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (maxReturned) filters.MaxReturned = maxReturned;
+      if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
+      if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
       try {
         const vendorTypes = await session.queryEntity("VendorType", filters);

@@ -85,20 +85,21 @@ export function registerPurchaseOrderTools(
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // PurchaseOrderQueryRq schema-required child order (see invoices.ts).
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
-      if (args.vendorListId) {
-        filters.EntityFilter = { ListID: args.vendorListId };
-      } else if (args.vendorName) {
-        filters.EntityFilter = { FullName: args.vendorName };
-      }
+      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
       if (args.fromDate || args.toDate) {
         filters.TxnDateRangeFilter = {
           FromTxnDate: args.fromDate,
           ToTxnDate: args.toDate,
         };
       }
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (args.vendorListId) {
+        filters.EntityFilter = { ListID: args.vendorListId };
+      } else if (args.vendorName) {
+        filters.EntityFilter = { FullName: args.vendorName };
+      }
 
       try {
         const purchaseOrders = await session.queryEntity("PurchaseOrder", filters);
