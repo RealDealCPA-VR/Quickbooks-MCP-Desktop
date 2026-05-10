@@ -14,7 +14,7 @@
 // to schema-compliant XML.
 
 import { describe, it, expect } from "vitest";
-import { buildQueryRequest, buildReportRequest } from "../src/qbxml/builder.js";
+import { buildQueryRequest, buildQBXMLRequest, buildReportRequest } from "../src/qbxml/builder.js";
 
 // Returns the names of `candidates` that appear inside the given request
 // element, sorted by their position in the emitted XML.
@@ -325,6 +325,65 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
       "TxnDateRangeFilter",
       "AccountFilter",
     ]);
+  });
+
+  it("multi-request envelope (Phase 10 #43 batch JE): N AddRq blocks, sequential requestIDs, single stopOnError envelope", () => {
+    // Phase 10 #43 — qb_journal_entry_batch_create packs N JournalEntryAddRq
+    // blocks into one envelope under <QBXMLMsgsRq onError="stopOnError">.
+    // Each block must carry its own sequential requestID (the wire-side anchor
+    // session.executeBatchAdd uses to align response slots back to input
+    // index when the JournalEntryAddRs blocks come back). This test pins the
+    // structural contract — same envelope pattern reused by #58 (batch
+    // invoice/SR) when wired.
+    const xml = buildQBXMLRequest({
+      version: "16.0",
+      requests: [
+        {
+          type: "JournalEntryAddRq",
+          requestID: "1",
+          body: {
+            JournalEntryAdd: {
+              JournalDebitLineAdd: [{ AccountRef: { FullName: "X" }, Amount: 1 }],
+              JournalCreditLineAdd: [{ AccountRef: { FullName: "Y" }, Amount: 1 }],
+            },
+          },
+        },
+        {
+          type: "JournalEntryAddRq",
+          requestID: "2",
+          body: {
+            JournalEntryAdd: {
+              JournalDebitLineAdd: [{ AccountRef: { FullName: "X" }, Amount: 2 }],
+              JournalCreditLineAdd: [{ AccountRef: { FullName: "Y" }, Amount: 2 }],
+            },
+          },
+        },
+        {
+          type: "JournalEntryAddRq",
+          requestID: "3",
+          body: {
+            JournalEntryAdd: {
+              JournalDebitLineAdd: [{ AccountRef: { FullName: "X" }, Amount: 3 }],
+              JournalCreditLineAdd: [{ AccountRef: { FullName: "Y" }, Amount: 3 }],
+            },
+          },
+        },
+      ],
+    });
+
+    // Single envelope (one MsgsRq open + one close) — N requests share it,
+    // they are NOT each in their own envelope.
+    expect(xml.match(/<QBXMLMsgsRq /g) ?? []).toHaveLength(1);
+    expect(xml.match(/<\/QBXMLMsgsRq>/g) ?? []).toHaveLength(1);
+    // stopOnError is the only envelope mode the builder emits.
+    expect(xml).toContain('<QBXMLMsgsRq onError="stopOnError">');
+
+    // N AddRq blocks, each with sequential requestID.
+    expect(xml.match(/<JournalEntryAddRq /g) ?? []).toHaveLength(3);
+    const idMatches = [...xml.matchAll(/<JournalEntryAddRq requestID="(\d+)"/g)].map(
+      (m) => m[1],
+    );
+    expect(idMatches).toEqual(["1", "2", "3"]);
   });
 
   it("preserves arbitrary insertion order — does not silently sort", () => {

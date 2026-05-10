@@ -76,6 +76,13 @@ export interface QBXMLResponseBody {
   /** Parsed response data. */
   data: Record<string, unknown> | Record<string, unknown>[];
   /**
+   * The `requestID` attribute echoed by QB on every *Rs element. Always
+   * present in well-formed QBXML responses (the builder always assigns one).
+   * Used by batch callers (Phase 10 #43) to align responses with input
+   * requests when N entries of the same type share a *Rs name.
+   */
+  requestID?: string;
+  /**
    * Iterator metadata surfaced on *QueryRs responses when an iterator request
    * was sent (Item 27). `iteratorRemainingCount` is the number of rows still
    * to be fetched after this page (0 means exhausted); `iteratorID` is the

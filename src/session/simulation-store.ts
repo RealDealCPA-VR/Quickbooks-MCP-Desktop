@@ -67,41 +67,80 @@ export class SimulationStore {
       };
     }
 
+    // QBXMLMsgsRq carries an `onError` attribute. The builder hardcodes
+    // "stopOnError" — when one *Rq fails, subsequent *Rqs in the same envelope
+    // are NOT processed. This matters for Phase 10 #43 (batch JE create) and
+    // any future multi-request envelope: the simulation must honor the same
+    // semantics so live and sim behave observationally identically.
+    const onError = String(msgsRq["@_onError"] ?? "stopOnError");
+
     const responses: QBXMLResponseBody[] = [];
 
-    for (const [key, value] of Object.entries(msgsRq)) {
+    // Multi-request envelope handling: when N requests share a *Rq name (e.g.
+    // batch JE create), fast-xml-parser packs them as an array under a single
+    // key. The outer Object.entries loop fires once per unique key; the inner
+    // loop walks the array (or wraps a single object). Each request element
+    // carries its own @_requestID attribute, propagated to the response so
+    // batch callers can align response-to-input by position.
+    outer: for (const [key, value] of Object.entries(msgsRq)) {
       if (key.startsWith("@_")) continue;
 
-      const reqData = (typeof value === "object" && value !== null)
-        ? value as Record<string, unknown>
-        : {};
+      const reqs = Array.isArray(value) ? value : [value];
 
-      if (key === "GeneralSummaryReportQueryRq") {
-        responses.push(this.handleReportQuery(key, reqData));
-      } else if (key === "TransactionQueryRq") {
-        // TransactionQueryRq is a CROSS-TYPE query — fans out across every
-        // transaction store and emits per-line postings as TransactionRet.
-        // The generic handleQuery would treat it as a per-type query against
-        // a "Transaction" store (which doesn't exist) and return empty.
-        responses.push(this.handleTransactionQuery(key, reqData));
-      } else if (key.endsWith("QueryRq")) {
-        responses.push(this.handleQuery(key, reqData));
-      } else if (key.endsWith("AddRq")) {
-        responses.push(this.handleAdd(key, reqData));
-      } else if (key.endsWith("ModRq")) {
-        responses.push(this.handleMod(key, reqData));
-      } else if (key === "ListDelRq") {
-        responses.push(this.handleListDel(reqData));
-      } else if (key === "TxnDelRq") {
-        responses.push(this.handleTxnDel(reqData));
-      } else {
-        responses.push({
-          type: key.replace("Rq", "Rs"),
-          statusCode: -1,
-          statusSeverity: "Error",
-          statusMessage: `Unsupported request type: ${key}`,
-          data: {},
-        });
+      for (const req of reqs) {
+        const reqData = (typeof req === "object" && req !== null)
+          ? req as Record<string, unknown>
+          : {};
+
+        const requestID = reqData["@_requestID"] !== undefined
+          ? String(reqData["@_requestID"])
+          : undefined;
+
+        let response: QBXMLResponseBody;
+        if (key === "GeneralSummaryReportQueryRq") {
+          response = this.handleReportQuery(key, reqData);
+        } else if (key === "TransactionQueryRq") {
+          // TransactionQueryRq is a CROSS-TYPE query — fans out across every
+          // transaction store and emits per-line postings as TransactionRet.
+          // The generic handleQuery would treat it as a per-type query against
+          // a "Transaction" store (which doesn't exist) and return empty.
+          response = this.handleTransactionQuery(key, reqData);
+        } else if (key.endsWith("QueryRq")) {
+          response = this.handleQuery(key, reqData);
+        } else if (key.endsWith("AddRq")) {
+          response = this.handleAdd(key, reqData);
+        } else if (key.endsWith("ModRq")) {
+          response = this.handleMod(key, reqData);
+        } else if (key === "ListDelRq") {
+          response = this.handleListDel(reqData);
+        } else if (key === "TxnDelRq") {
+          response = this.handleTxnDel(reqData);
+        } else {
+          response = {
+            type: key.replace("Rq", "Rs"),
+            statusCode: -1,
+            statusSeverity: "Error",
+            statusMessage: `Unsupported request type: ${key}`,
+            data: {},
+          };
+        }
+
+        if (requestID !== undefined) {
+          response = { ...response, requestID };
+        }
+        responses.push(response);
+
+        if (
+          onError === "stopOnError" &&
+          response.statusSeverity === "Error" &&
+          response.statusCode !== 0
+        ) {
+          // Per the QBXML spec, stopOnError halts further processing of the
+          // envelope on the first error. Skipped requests get no response
+          // (the live wire behaves the same way), which is what allows batch
+          // callers to derive `skipped` count from `inputCount - responses`.
+          break outer;
+        }
       }
     }
 
@@ -2635,7 +2674,12 @@ export class SimulationStore {
       customers.set(c.ListID as string, c);
     }
 
-    // Sample vendors
+    // Sample vendors. The first two are non-1099 (Office Supplies sells goods,
+    // Cloud Hosting is a corp); the next three are 1099-eligible — needed by
+    // the Phase 10 #44 form-1099 tools so qb_1099_summary / qb_1099_detail
+    // return non-trivial dev results without forcing every test to seed its own.
+    // VendorTaxIdent + Vendor1099Type drive the per-vendor classification
+    // (NEC default for nonemployee compensation, MISC for rents/royalties).
     const sampleVendors: StoredEntity[] = [
       {
         ListID: "90000001-1234567890",
@@ -2646,6 +2690,7 @@ export class SimulationStore {
         Phone: "555-0400",
         Email: "orders@officesupplies.com",
         Balance: 2500.00,
+        IsVendorEligibleFor1099: false,
         EditSequence: now,
         TimeCreated: "2024-01-10T09:00:00",
         TimeModified: now,
@@ -2659,8 +2704,78 @@ export class SimulationStore {
         Phone: "555-0500",
         Email: "billing@cloudhost.com",
         Balance: 1200.00,
+        IsVendorEligibleFor1099: false,
         EditSequence: now,
         TimeCreated: "2024-02-05T10:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "90000003-1234567890",
+        Name: "Joe Contractor",
+        FullName: "Joe Contractor",
+        IsActive: true,
+        CompanyName: "Joe Contractor",
+        Phone: "555-0600",
+        Email: "joe@contractor.example",
+        Balance: 0,
+        IsVendorEligibleFor1099: true,
+        Vendor1099Type: "NEC",
+        VendorTaxIdent: "12-3456789",
+        VendorAddress: {
+          Addr1: "789 Worker Ln",
+          City: "Austin",
+          State: "TX",
+          PostalCode: "73301",
+          Country: "US",
+        },
+        EditSequence: now,
+        TimeCreated: "2024-01-05T09:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "90000004-1234567890",
+        Name: "Sarah Designer LLC",
+        FullName: "Sarah Designer LLC",
+        IsActive: true,
+        CompanyName: "Sarah Designer LLC",
+        Phone: "555-0700",
+        Email: "sarah@designer.example",
+        Balance: 0,
+        IsVendorEligibleFor1099: true,
+        Vendor1099Type: "NEC",
+        VendorTaxIdent: "98-7654321",
+        VendorAddress: {
+          Addr1: "456 Studio Way",
+          City: "Brooklyn",
+          State: "NY",
+          PostalCode: "11201",
+          Country: "US",
+        },
+        EditSequence: now,
+        TimeCreated: "2024-01-12T09:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "90000005-1234567890",
+        Name: "ACME Property Mgmt",
+        FullName: "ACME Property Mgmt",
+        IsActive: true,
+        CompanyName: "ACME Property Mgmt LLC",
+        Phone: "555-0800",
+        Email: "rent@acmepm.example",
+        Balance: 0,
+        IsVendorEligibleFor1099: true,
+        Vendor1099Type: "MISC",
+        VendorTaxIdent: "11-2233445",
+        VendorAddress: {
+          Addr1: "1 Real Estate Plaza",
+          City: "Chicago",
+          State: "IL",
+          PostalCode: "60601",
+          Country: "US",
+        },
+        EditSequence: now,
+        TimeCreated: "2024-01-02T09:00:00",
         TimeModified: now,
       },
     ];

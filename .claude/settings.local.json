@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(\"\" | & node dist/index.js; \"ExitCode=$LASTEXITCODE\")",
+      "PowerShell($out = \"\" | & node dist/index.js 2>&1; \"EXIT=$LASTEXITCODE\"; $out)",
+      "PowerShell($cfg = Get-Content \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\" -Raw; $cfg)",
+      "Bash(npm test *)",
+      "PowerShell($out = \"\" | & node dist/index.js 2>&1; \"EXIT=$LASTEXITCODE\"; $out | Select-Object -Last 6)",
+      "PowerShell(\"\" | & node dist/index.js; Write-Output \"ExitCode=$LASTEXITCODE\")",
+      "Bash(npm view *)"
+    ]
+  }
+}

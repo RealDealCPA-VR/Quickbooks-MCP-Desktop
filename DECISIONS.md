@@ -29,6 +29,86 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-10 — qb_1099_summary / qb_1099_detail aggregate from typed Bill + Check queries, not Form1099QueryRq
+
+**Chosen:** Phase 10 #44 ships as `qb_1099_summary` + `qb_1099_detail`, both implemented as a tool-side aggregation over the existing typed `Bill` + `Check` stores via `session.queryEntity`. No new wire request type is added. Vendor classification is driven by two fields on the `Vendor` record: `IsVendorEligibleFor1099 === true` selects which vendors participate, and `Vendor1099Type === 'MISC'` opts a vendor into 1099-MISC (default is 1099-NEC, the modern default for nonemployee compensation post the IRS 2020 split). Threshold defaults to $600 (the IRS general TY2024+ threshold for both 1099-NEC and 1099-MISC); `qb_1099_summary` accepts a `threshold` arg for the rare special-box cases ($10 royalties).
+
+**Why:** Three reasons.
+
+1. **Keeps the "tools never construct QBXML directly" rule (CLAUDE.md).** Adding a builder for `Form1099QueryRq` would have introduced a new schema-order surface — the same class of bug that took down `qb_pnl_report` and `TransactionQueryRq` until pinned in `tests/builder-emit-order.test.ts`. Aggregating over `BillQueryRq` + `CheckQueryRq` (already exercised, schema-pinned, live-verified) reuses chokepoints we already trust.
+
+2. **Identical sim/live behavior.** The same TypeScript code path produces results in both modes. No simulation handler to write for a new request type, no shape divergence between sim's emit and QB's wire response, no live verification step blocked on a Windows + QB box (which the handoff confirms isn't currently in this session).
+
+3. **No dependency on QB Preferences' per-account 1099 box mapping.** Real QB's `Form1099QueryRq` honors a per-account → per-1099-box mapping that lives in Preferences. Surfacing it correctly would have required either reading Preferences (which has its own SDK quirks) or letting the wire response carry the mapping implicitly. The chosen aggregation skips this entirely: every payment to an eligible vendor counts toward the threshold. In practice this is a more permissive (safer) signal — operators get a superset of vendors who *might* need a 1099, never miss a vendor who should — and the operator can post-filter in their downstream prep workflow.
+
+Card payments (`CreditCardCharge`) are deliberately excluded from the walk per IRS Form 1099 instructions (the card processor reports those on 1099-K). Bills paid via credit card go through `BillPaymentCreditCard` which doesn't show up in the `Bill` walk's amount accounting either way (the bill itself was originally posted via `Bill`, which IS counted; the credit-card *payment* is the IRS-excluded part — surfacing the bill amount as "spend with vendor X" is the right answer for 1099 reporting).
+
+`qb_1099_summary` defaults to **last completed tax year** (current year − 1) — January is 1099 prep season and the operator's first instinct is "show me last year." Explicit `taxYear` arg overrides; explicit `fromDate` / `toDate` override taxYear. The vendor row sort is `totalPaid` desc so the highest-spend vendors (most likely to need a 1099) surface first.
+
+**Alternatives rejected:**
+- Wire `Form1099QueryRq` directly — adds a new schema-order surface, blocked on live verification, and forces sim to emit a shape that mirrors QB's wire response (additional simulation handler complexity for a request that's effectively "summarize Bills + Checks by vendor"). The aggregation we ended up with IS the body of what `Form1099QueryRq` does — exposing the aggregation directly skips the round trip.
+- Read QB Preferences for the 1099 box mapping and apply it server-side — possible follow-up, but Preferences read has its own SDK surface (`PreferencesQueryRq` returns a wide tree where the 1099 mapping is one node among many) and would couple the tool to a tax-year-specific mapping that changes when the IRS reshuffles boxes. Out of scope for v1.
+- Walk only `Bill` and ignore `Check` — would miss vendors paid by direct check (the operator's `1042` Q2 contractor payment in the test fixture). Both surfaces are needed.
+- Walk `BillPaymentCheck` / `BillPaymentCreditCard` instead of `Bill` (cash-basis 1099) — closer to IRS truth but requires every Bill to have a matching BillPayment in the same year, which doesn't always hold (Q4 bills paid in January). For most small-practice operators where bills are paid same-period, the simpler "Bills + Checks" walk produces the same answer. A strict cash-basis flag could be added later if the operator runs into multi-year-AP cases.
+
+**Tradeoffs / consequences:**
+- Operators with custom 1099 box mappings in QB Preferences will see slightly different totals than QB's Form1099 wizard. The aggregation is more permissive (counts everything posted to an eligible vendor); the wizard filters to specific GL accounts. Documented in the tool description so operators know to use the wizard for box-by-box filing.
+- A future `qb_1099_box_summary` tool that DOES honor Preferences could layer on top of this aggregation by joining account → box mapping post-aggregation. The current tool does not block that.
+- Bill totals come from line sum, not header `AmountDue` — paid bills have `AmountDue: 0` but the original total still reads from the line array. Tool requires `IncludeLineItems: true` on the underlying `BillQueryRq` (passed automatically). Falls back to `AmountDue` when lines aren't surfaced (defensive — catches edge cases where the simulation or live response strips lines unexpectedly).
+- Card payments are excluded from the walk, but that's the IRS contract, not a limitation. Documented in the tool description.
+
+**Revisit when:** An operator workflow surfaces a need for QB-Preferences-driven box-by-box reporting (e.g., a state filing form that requires Box 1 NEC vs Box 7 services to be split), OR a practice with multi-year-AP runs into the cash-basis-1099 edge case. Either case is additive (a new tool layered on top); the current tool's contract doesn't have to change.
+
+---
+
+## 2026-05-10 — Read-only session flag gates at the session manager, not per-tool
+
+**Chosen:** Phase 10 #42 ships as a single chokepoint inside `QBSessionManager`: a private `readOnly: boolean` flag, public `setReadOnly` / `isReadOnly` accessors, and a private `assertWritable(operation)` helper called at the entry of every typed mutation method (`addEntity`, `modifyEntity`, `deleteEntity`, `executeBatchAdd`). The gate throws `QBReadOnlyError` (synthetic statusCode 9001) BEFORE any QBXML envelope is built or wire I/O happens. The error surfaces through the existing tool-side error wrapper (the Item 25 catch) without touching any tool file — every `*_add` / `*_update` / `*_delete` / `*_apply` / `*_pay` / `*_make_inactive` / `*_convert_to_invoice` / `batch_create` tool returns `isError: true` with `statusCode: 9001` and a humanReadable message automatically.
+
+**Why:** All 47 mutation call sites across the 14 tool files go through one of those four typed methods (verified by grep on `session.{addEntity,modifyEntity,deleteEntity,executeBatchAdd}`). Gating at the session manager catches every existing mutation tool AND every future one for free, with zero per-tool churn and zero risk of a new tool slipping past the gate. A new statusCode (9001, deliberately above the QB SDK's 0/1/3xxx/5xx range) was added rather than reusing 3260 ("insufficient permission"): the latter is a real wire response from QB, this is a CLIENT-SIDE gate that never reaches QB — distinguishing them lets agents tell "I'm in read-only mode" apart from "QB rejected my user role" without needing to parse a string.
+
+`switchCompanyFile` is intentionally NOT gated — switching the active book is a session-level operation, not a data mutation. The flag also persists across `openSession` / `closeSession`, so a session that drops and auto-reconnects mid-conversation stays in read-only mode (only `setReadOnly(false)` clears it). `qb_session_connect` defaults the flag to `false` on every call: a fresh `qb_session_connect()` with no `readOnly` arg ALWAYS re-enables writes, even if the session was previously read-only — matches the "I want to start over" mental model.
+
+**Alternatives rejected:**
+- Gate at each tool handler — would touch 14 files, ~47 call sites, and any future tool would silently drift past the gate unless the contributor remembered to add the check. The chokepoint design is structurally safer.
+- Gate at `sendRequest` by scanning the XML for mutation request types — brittle (regex on XML) and produces a less informative error (the operation name "addEntity(Customer)" beats "QBXML envelope contained CustomerAddRq").
+- Reuse `statusCode 3260` ("insufficient permission") — semantically close but conflates a real QB role denial with a client-side gate. Agents that retry on 3260 (because the operator might have flipped a permission in QB Desktop) would loop forever on 9001.
+- Add an `atomic: false` opt-out arg to mutation tools to allow "I'm read-only EXCEPT for this one call" — rejected as a footgun. Read-only mode should be unambiguous.
+
+**Tradeoffs / consequences:**
+- Every typed mutation now pays a one-property-read overhead before the wire call (`if (this.readOnly)`). Negligible vs. the QBXML build + wire roundtrip — measurable in ns vs ms.
+- A future code path that bypasses the four typed helpers (e.g., constructing QBXML and calling `sendRequest` directly) would slip past the gate. CLAUDE.md's "tools never construct QBXML directly" rule already forbids this; if it's ever broken, this gate is one more reason to fix the bypass rather than add per-tool gates.
+- The flag is per-`QBSessionManager` instance — when the operator runs multiple processes (e.g., a write-mode CLI alongside a read-only diagnostic agent), each process's flag is independent. No cross-process coordination is needed because the QBXMLRP2 gate is also per-process.
+
+**Revisit when:** A use case emerges for "write-mode by default, read-only for one specific tool" (e.g., a diagnostic that should never write even when the session is otherwise writable). At that point a per-tool override could layer on top of the session-level flag without breaking the current contract.
+
+---
+
+## 2026-05-10 — qb_journal_entry_batch_create defaults to atomic with auto-rollback (compensating delete)
+
+**Chosen:** Phase 10 #43 ships as a single tool that defaults to all-or-nothing semantics. Per-entry balance is validated upfront (sum(debits) === sum(credits) within $0.005) so an obviously-bad batch never reaches the wire. Wire I/O uses a multi-`JournalEntryAddRq` envelope under `<QBXMLMsgsRq onError="stopOnError">`. When stopOnError halts the envelope mid-batch, the tool then walks the responses, identifies any prior-posted JEs (by `requestID` → `TxnID`), and issues a `TxnDelRq` per posted entry IN REVERSE POST ORDER. If every rollback delete succeeds, the batch is reported as fully atomic (`rolledBack: true`). If any rollback delete fails, the tool surfaces the affected JE as `orphaned` with the surviving `TxnID` so the operator can clean up manually via `qb_journal_entry_delete`.
+
+**Why:** Real QB does NOT atomically roll back already-posted JEs when a later JE in the same envelope fails under stopOnError — the wire-level contract is "halt further processing," not "undo earlier work." The operator's CC-batch workflow is the canonical use case (50–150 JEs/month against the AmEx feed): partial postings would be a reconciliation nightmare, since a partial month's CC charges would land in QB and the operator's downstream scripts would not know which entries to retry vs which to skip. Compensating delete brings the failure mode back to "all or none" for the overwhelmingly common case (rollback delete succeeds), and degrades gracefully to "all or N orphans, with TxnIDs surfaced loudly" when it doesn't. An "atomic by default, opt-out via flag" toggle was considered but rejected for v1: there is no current operator workflow that wants partial-batch semantics, so adding the flag would just enlarge surface area without unblocking work.
+
+100-entry per-batch cap is a guardrail against oversized envelopes (QBXMLRP2 has been observed to time out on >~200-block envelopes; well under that cap is conservative). Bigger batches should be split at the caller layer rather than the tool retrying — the tool's job is to give clean atomicity to a bounded batch, not to manage chunked retry.
+
+**Alternatives rejected:**
+- **Document the gap; ship without rollback.** Aligns with QB's wire-level semantics literally. Rejected because the tool's name says "batch_create" — a caller reading "atomic batch JE" reasonably expects the tool to deliver atomicity, not surface a leaky abstraction. The CC-batch workflow specifically would be unusable.
+- **Sequential per-JE creates with mid-failure stop.** Same observable behavior as a multi-request envelope — but loses the wire-level efficiency of one round trip and forces the tool to carry session-management complexity for the partial-mutation window. Multi-request envelope is simpler and idiomatic to QBXML.
+- **`atomic: false` opt-out flag for partial-batch posting.** No present workflow needs it; defer until #58 (batch invoice/SR) or a real operator request justifies the flag.
+- **Lift batch into a generic `qb_batch({ requests: [...] })` cross-type tool.** Cross-type batching is genuinely useful (e.g., create a customer + invoice + payment in one go) but the validation and rollback semantics differ wildly per type — invoices touch AR balance, payments apply to invoices, deletes have entity-specific cascade rules, etc. A per-type batch tool keeps each tool's atomicity contract precise; a generic batch would either weaken every contract or carry a giant per-type adapter. Defer.
+
+**Tradeoffs / consequences:**
+- **Rollback is best-effort, not transactional.** A delete that fails after a successful post leaves the JE on the books. The tool surfaces the orphan loudly (`status: "orphaned"`, `txnId`, `rollbackError` in the per-entry payload AND a top-level `summary.orphaned` array), but the operator IS responsible for deciding whether to delete via `qb_journal_entry_delete` or leave it. The `rolledBack: false` top-level flag distinguishes this case from full success.
+- **Reverse-order rollback is the safer default but not provably correct.** Deleting JE #N before JE #N-1 minimizes the chance that QB's internal cascade machinery (e.g., audit-log linking, period-close interactions on rare seeds) invalidates an earlier delete. Empirically untestable without a live QB instance, but has no observed downside.
+- **Generalizes the multi-request plumbing for all future batch tools.** [src/session/simulation-store.ts](src/session/simulation-store.ts) `processRequest` now walks array-valued request keys and honors `onError="stopOnError"`; [src/qbxml/parser.ts](src/qbxml/parser.ts) captures `@_requestID` per response; [src/session/manager.ts](src/session/manager.ts) `executeBatchAdd` is reusable. #58 (batch invoice/SR) reuses all of this.
+- **Schema bound is hardcoded at 100, not configurable.** A future operator workflow may need 200+. Bumping the cap is a one-line zod change; revisit if needed.
+- **Test coverage covers the simulation-side rollback path only.** Live-mode mid-batch failure can't be reproduced without an unbalanced JE actually reaching live QB; the orphan path is exercised via `vi.spyOn(session, "deleteEntity")` mock injection. Reasonable trade given that the rollback delete itself is just `session.deleteEntity` (well-covered elsewhere).
+
+**Revisit when:** #58 lands (batch invoice/SR) — the same pattern should be reused; if the new path needs different atomicity semantics (e.g., invoices have AR-balance side effects per post that complicate rollback), break out the shared core. Or when an operator request lands for `atomic: false` partial-batch behavior.
+
+---
+
 ## 2026-05-09 — qb_balance_summary sources AS/LI/EQ from BalanceSheetStandard and INC/EXP from ProfitAndLossStandard
 
 **Chosen:** Phase 9 #38 reroutes [src/tools/reports.ts](src/tools/reports.ts) `qb_balance_summary` from a direct `Account.Balance` snapshot read to two `runReport` calls: `BalanceSheetStandard` (toDate=asOfDate) for asset/liability/equity figures, and `ProfitAndLossStandard` (lifetime through asOfDate) for income/expense figures. The resulting per-account totals are bucketed back into the 16-way canonical `AccountType` order via a name→type lookup populated from a single `AccountQuery`. NonPosting accounts (estimates, POs, sales orders) — absent from both reports — fall back to `Account.Balance`. The old `fromDate` / `toDate` params are replaced with `asOfDate` + `basis`; the misleading `asOfNote` is dropped.

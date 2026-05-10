@@ -200,6 +200,237 @@ export function registerJournalEntryTools(
   );
 
   server.tool(
+    "qb_journal_entry_batch_create",
+    "Create multiple journal entries atomically in a single QBXML envelope (onError=stopOnError). Each entry follows the same shape as qb_journal_entry_create — a balanced debits + credits set. Validation runs upfront (per-entry sum(debits) === sum(credits) within $0.005, ≥1 debit + ≥1 credit, ≤100 entries per batch); a single bad entry rejects the whole batch BEFORE any wire I/O so no posting happens. ATOMICITY: the QBXML wire itself does NOT roll back — stopOnError halts the envelope on the first wire-side failure but leaves prior-posted JEs in place. This tool covers that gap by automatically deleting any already-posted JEs when a later one fails (TxnDelRq per posted TxnID). The response carries per-entry status: 'posted' (committed), 'rolled-back' (was posted then auto-deleted), 'orphaned' (was posted but rollback delete itself failed — operator must clean up manually using qb_journal_entry_delete with the surfaced TxnID), 'failed' (rejected on wire), 'skipped' (never ran post-stopOnError). On full success the response carries success=true plus the array of posted TxnIDs. Use this for monthly credit-card batches, payroll splits, accruals, etc. — anywhere you need ALL OR NONE semantics across multiple entries.",
+    {
+      entries: z
+        .array(
+          z.object({
+            txnDate: z.string().regex(ISO_DATE_RE).optional()
+              .describe("Entry date (YYYY-MM-DD, default today)"),
+            refNumber: z.string().optional().describe("Reference / entry number"),
+            memo: z.string().optional().describe("Header memo"),
+            isAdjustment: z.boolean().optional().describe("Mark as an adjusting entry"),
+            debits: z.array(journalLineSchema).min(1)
+              .describe("Debit-side lines for this entry. At least one required."),
+            credits: z.array(journalLineSchema).min(1)
+              .describe("Credit-side lines for this entry. At least one required."),
+          })
+        )
+        .min(1)
+        .max(100)
+        .describe("Array of journal entries to post atomically (1–100). Each entry's debits must equal credits to the cent."),
+    },
+    async (args) => {
+      // Upfront per-entry balance validation. Bailing here keeps the envelope
+      // off the wire entirely on obvious caller errors so no compensating
+      // delete is needed and no QB session state is touched.
+      const balanceErrors: Array<{ index: number; error: string }> = [];
+      for (let i = 0; i < args.entries.length; i++) {
+        const e = args.entries[i];
+        const debitSum = e.debits.reduce((a, l) => a + l.amount, 0);
+        const creditSum = e.credits.reduce((a, l) => a + l.amount, 0);
+        if (Math.abs(debitSum - creditSum) > 0.005) {
+          balanceErrors.push({
+            index: i,
+            error: `Entry ${i + 1}: debits (${debitSum.toFixed(2)}) must equal credits (${creditSum.toFixed(2)})`,
+          });
+        }
+      }
+      if (balanceErrors.length > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 3030,
+              statusMessage: "One or more entries are unbalanced",
+              humanReadable: qbStatusCodeMessage(3030),
+              balanceErrors,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      const session = getSession();
+
+      const dataList = args.entries.map((e) => {
+        const data: Record<string, unknown> = {};
+        if (e.txnDate) data.TxnDate = e.txnDate;
+        if (e.refNumber) data.RefNumber = e.refNumber;
+        if (e.memo) data.Memo = e.memo;
+        if (e.isAdjustment !== undefined) data.IsAdjustment = e.isAdjustment;
+        data.JournalDebitLineAdd = e.debits.map(buildJELineAdd);
+        data.JournalCreditLineAdd = e.credits.map(buildJELineAdd);
+        return data;
+      });
+
+      let results;
+      try {
+        results = await session.executeBatchAdd("JournalEntry", dataList);
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "Batch JournalEntryAddRq envelope failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const allPosted = results.every((r) => r.status === "posted");
+      if (allPosted) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              count: results.length,
+              entries: results.map((r, i) => {
+                const ret = (r as { entity: Record<string, unknown> }).entity;
+                return {
+                  index: i,
+                  requestID: r.requestID,
+                  status: "posted",
+                  txnId: String(ret.TxnID ?? ""),
+                  refNumber: args.entries[i].refNumber,
+                };
+              }),
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Partial-failure path — find the first wire-side failure, identify
+      // earlier posted entries, attempt a compensating delete on each.
+      const failedIdx = results.findIndex((r) => r.status === "failed");
+      const failedResult = failedIdx >= 0
+        ? results[failedIdx] as { statusCode: number; statusMessage: string }
+        : undefined;
+
+      const postedTxnIds: { index: number; txnId: string }[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "posted") {
+          const entity = (results[i] as { entity: Record<string, unknown> }).entity;
+          const txnId = String(entity.TxnID ?? "");
+          if (txnId) postedTxnIds.push({ index: i, txnId });
+        }
+      }
+
+      // Best-effort compensating delete. Delete in REVERSE post order so the
+      // most-recent JE goes first — minimizes the chance that any cascading
+      // bookkeeping QB performs invalidates an earlier delete.
+      const rollbackOutcomes = new Map<
+        string,
+        { ok: true } | { ok: false; error: string }
+      >();
+      for (const { txnId } of [...postedTxnIds].reverse()) {
+        try {
+          await session.deleteEntity("JournalEntry", txnId);
+          rollbackOutcomes.set(txnId, { ok: true });
+        } catch (err) {
+          const e = err as { message?: string };
+          rollbackOutcomes.set(txnId, {
+            ok: false,
+            error: e.message ?? "Compensating TxnDelRq failed",
+          });
+        }
+      }
+
+      const rolledBackTxnIds: string[] = [];
+      const orphanedEntries: Array<{ txnId: string; reason: string }> = [];
+      for (const { txnId } of postedTxnIds) {
+        const outcome = rollbackOutcomes.get(txnId);
+        if (outcome?.ok) rolledBackTxnIds.push(txnId);
+        else orphanedEntries.push({
+          txnId,
+          reason: outcome?.ok === false ? outcome.error : "Unknown rollback failure",
+        });
+      }
+
+      const entriesPayload = results.map((r, i) => {
+        const refNumber = args.entries[i].refNumber;
+        if (r.status === "posted") {
+          const entity = (r as { entity: Record<string, unknown> }).entity;
+          const txnId = String(entity.TxnID ?? "");
+          const outcome = rollbackOutcomes.get(txnId);
+          if (outcome?.ok) {
+            return {
+              index: i,
+              requestID: r.requestID,
+              status: "rolled-back" as const,
+              originalTxnId: txnId,
+              refNumber,
+            };
+          }
+          return {
+            index: i,
+            requestID: r.requestID,
+            status: "orphaned" as const,
+            txnId,
+            refNumber,
+            rollbackError: outcome?.ok === false ? outcome.error : "Unknown rollback failure",
+          };
+        }
+        if (r.status === "failed") {
+          return {
+            index: i,
+            requestID: r.requestID,
+            status: "failed" as const,
+            refNumber,
+            statusCode: r.statusCode,
+            statusMessage: r.statusMessage,
+            ...(qbStatusCodeMessage(r.statusCode)
+              ? { humanReadable: qbStatusCodeMessage(r.statusCode) }
+              : {}),
+          };
+        }
+        return {
+          index: i,
+          requestID: r.requestID,
+          status: "skipped" as const,
+          refNumber,
+        };
+      });
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            atomic: true,
+            rolledBack: orphanedEntries.length === 0,
+            failedAt: failedIdx >= 0 ? failedIdx : undefined,
+            failedReason: failedResult ? {
+              statusCode: failedResult.statusCode,
+              statusMessage: failedResult.statusMessage,
+              humanReadable: qbStatusCodeMessage(failedResult.statusCode) || undefined,
+            } : undefined,
+            summary: {
+              posted: 0,
+              failed: results.filter((r) => r.status === "failed").length,
+              skipped: results.filter((r) => r.status === "skipped").length,
+              rolledBack: rolledBackTxnIds.length,
+              rolledBackTxnIds,
+              ...(orphanedEntries.length > 0 ? { orphaned: orphanedEntries } : {}),
+            },
+            entries: entriesPayload,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+  );
+
+  server.tool(
     "qb_journal_entry_update",
     "Modify an existing journal entry. Pass txnId + editSequence (from a prior qb_journal_entry_list) plus any header fields and/or replacement `debits` / `credits` arrays. When debits or credits is provided it REPLACES that side wholesale — list every line you want kept on that side. A line with a txnLineID matching an existing line preserves that TxnLineID and merges any fields you pass over the existing values; a line without txnLineID (or with '-1') is added as new. The post-mod sum(debits) must still equal sum(credits) or the mod is rejected with statusCode 3030 and nothing is persisted. A stale editSequence rejects with statusCode 3170. Note: passing only debits (or only credits) is allowed but the unmodified side must still balance against the new side.",
     {

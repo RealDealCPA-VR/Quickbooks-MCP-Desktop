@@ -198,6 +198,7 @@ export function registerReportTools(
             text: JSON.stringify({
               connected: session.isConnected(),
               simulationMode: session.isSimulation(),
+              readOnly: session.isReadOnly(),
               companyFile: sessionData?.companyFile ?? null,
               sessionTicket: sessionData?.ticket ?? null,
               openedAt: sessionData?.openedAt?.toISOString() ?? null,
@@ -786,10 +787,13 @@ export function registerReportTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_session_connect",
-    "Open a session with QuickBooks Desktop. Must be called before other operations (auto-connects if needed).",
-    {},
-    async () => {
+    "Open a session with QuickBooks Desktop. Must be called before other operations (auto-connects if needed). Pass readOnly:true to gate every *_add / *_update / *_delete / *_apply / *_pay / *_make_inactive / *_convert_to_invoice / batch_create tool against accidental mutation — those tools will fail-fast with statusCode 9001 BEFORE any QBXML envelope is built. Pass readOnly:false (or omit) for normal read+write access. The flag toggles immediately on call: it's safe to flip mid-conversation without disconnecting.",
+    {
+      readOnly: z.boolean().optional().describe("When true, every mutation helper (addEntity / modifyEntity / deleteEntity / executeBatchAdd) throws QBReadOnlyError (statusCode 9001) before building XML. Reads (queries, reports, qb_raw_query) are unaffected. Defaults to false on every call — passing nothing equals passing false, so a fresh `qb_session_connect()` always re-enables writes."),
+    },
+    async ({ readOnly }) => {
       const session = getSession();
+      session.setReadOnly(readOnly === true);
       const qbSession = await session.openSession();
       return {
         content: [{
@@ -800,6 +804,7 @@ export function registerReportTools(
             companyFile: qbSession.companyFile,
             openedAt: qbSession.openedAt.toISOString(),
             simulationMode: session.isSimulation(),
+            readOnly: session.isReadOnly(),
           }, null, 2),
         }],
       };

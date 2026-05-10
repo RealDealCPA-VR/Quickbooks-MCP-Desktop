@@ -22,6 +22,11 @@ const TABLE: Record<number, string> = {
   3120: "Required field missing or invalid value",
   3170: "Modify rejected — record was changed since last read (stale EditSequence)",
   3260: "Insufficient permission — the operation is blocked (commonly: cannot delete a record with transaction history)",
+  // 9001 — synthetic, client-side. Distinct from QB-server-side 3260
+  // ("insufficient permission") so agents can tell read-only-mode rejections
+  // apart from real QB role-permission denials. Issued by QBReadOnlyError
+  // in src/session/manager.ts (Phase 10 #42).
+  9001: "Read-only session — mutation blocked by client gate. Reconnect with qb_session_connect({ readOnly: false }) to re-enable writes.",
 };
 
 export function qbStatusCodeMessage(statusCode: number): string | undefined {

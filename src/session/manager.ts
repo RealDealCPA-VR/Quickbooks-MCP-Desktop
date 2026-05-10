@@ -59,6 +59,37 @@ const RP2_CONNECTION_TYPE_LOCAL_QBD = 1;
 const RP2_FILE_MODE_DONT_CARE = 2;
 
 // ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by the session manager when a mutation is attempted against a session
+ * that was opened with `readOnly: true`. Carries `statusCode 9001` (synthetic
+ * sentinel — outside the QB SDK's 0/1/3xxx/5xx range) so the existing tool-side
+ * error wrapper (the Item 25 catch) surfaces it as a structured `isError: true`
+ * response with a humanReadable message via qb-status-codes.ts. Caught and
+ * re-thrown unchanged by the typed mutation helpers (addEntity, modifyEntity,
+ * deleteEntity, executeBatchAdd) — they don't unwrap it.
+ *
+ * Statuscode is deliberately distinct from QB-server-side `3260` ("insufficient
+ * permission"); the latter is a real wire response, this is a CLIENT-SIDE gate
+ * that never reaches QB. Distinguishing them in the surface lets agents tell
+ * "I'm in read-only mode" apart from "QB rejected my user role".
+ */
+export class QBReadOnlyError extends Error {
+  statusCode: number;
+  constructor(operation: string) {
+    super(
+      `Read-only session: ${operation} rejected. The session was opened with ` +
+      `readOnly: true. Reconnect with qb_session_connect({ readOnly: false }) ` +
+      `to re-enable mutations.`
+    );
+    this.name = "QBReadOnlyError";
+    this.statusCode = 9001;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Session manager
 // ---------------------------------------------------------------------------
 
@@ -93,6 +124,16 @@ export class QBSessionManager {
    * request in a session. Null in simulation mode and after `closeSession`.
    */
   private rp: ComDispatchObject | null = null;
+  /**
+   * Read-only flag (Phase 10 #42). Set via `setReadOnly(true)` (typically on
+   * `qb_session_connect({ readOnly: true })`); when true, every mutation
+   * helper (`addEntity`, `modifyEntity`, `deleteEntity`, `executeBatchAdd`)
+   * throws `QBReadOnlyError` BEFORE building XML or hitting the wire.
+   * Persists across `openSession`/`closeSession` so the flag survives an
+   * auto-reconnect; only `setReadOnly(false)` (or restarting the process)
+   * clears it.
+   */
+  private readOnly: boolean = false;
 
   constructor(config: QBConnectionConfig) {
     this.config = config;
@@ -236,6 +277,38 @@ export class QBSessionManager {
 
   isSimulation(): boolean {
     return this.simulationMode;
+  }
+
+  /**
+   * Whether the session is currently gated against mutations. Surfaced by
+   * `qb_session_connect` / `qb_company_info` so agents can probe before
+   * attempting a write.
+   */
+  isReadOnly(): boolean {
+    return this.readOnly;
+  }
+
+  /**
+   * Toggle the read-only gate. Takes effect immediately for the next mutation
+   * call — does NOT require a re-connect. Idempotent. The gate runs in BOTH
+   * live and simulation mode (the value is intercepted at the typed-mutation
+   * helpers, before any envelope is built or wire I/O happens).
+   */
+  setReadOnly(value: boolean): void {
+    this.readOnly = value;
+  }
+
+  /**
+   * Internal: throw QBReadOnlyError if the session is read-only. Called at
+   * the entry of every mutation helper — keeps the gate in one place rather
+   * than at each tool's `session.{add,modify,delete}Entity` call site (47
+   * callers, see grep). The thrown error carries `statusCode 9001` which
+   * the existing `qb-status-codes.ts` table maps to a human-readable
+   * message; the existing tool error wrappers (Item 25 catch) surface it as
+   * `isError: true` without modification.
+   */
+  private assertWritable(operation: string): void {
+    if (this.readOnly) throw new QBReadOnlyError(operation);
   }
 
   /**
@@ -418,6 +491,7 @@ export class QBSessionManager {
     entityType: string,
     data: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
+    this.assertWritable(`addEntity(${entityType})`);
     const xml = buildAddRequest(entityType, data, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
     const respData = extractResponseData(response, `${entityType}AddRs`);
@@ -433,6 +507,7 @@ export class QBSessionManager {
     entityType: string,
     data: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
+    this.assertWritable(`modifyEntity(${entityType})`);
     const xml = buildModRequest(entityType, data, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
     const respData = extractResponseData(response, `${entityType}ModRs`);
@@ -444,10 +519,122 @@ export class QBSessionManager {
     return entities[0] ?? respData;
   }
 
+  /**
+   * Batch-add N entities of the same type in a single QBXML envelope under
+   * <QBXMLMsgsRq onError="stopOnError">. The envelope carries N <{Type}AddRq>
+   * blocks each with a sequential requestID="1".."N"; the response carries
+   * one <{Type}AddRs> per request that actually ran (stopOnError halts after
+   * the first error, so failures past the first never produce response blocks).
+   *
+   * Returns positionally-aligned results by mapping the requestID attribute
+   * each response carries back to the input index. Indices with no
+   * corresponding response are reported as "skipped" (post-stopOnError).
+   *
+   * Caller is responsible for upfront input validation (per-entry shape) and
+   * compensating-rollback semantics. This method just runs the wire I/O and
+   * partitions the output by status. Used by Phase 10 #43 (batch JE create);
+   * the same pattern reused by #58 (batch invoice/SR) when wired.
+   */
+  async executeBatchAdd(
+    entityType: string,
+    entries: Record<string, unknown>[]
+  ): Promise<
+    Array<
+      | {
+          requestID: string;
+          status: "posted";
+          entity: Record<string, unknown>;
+        }
+      | {
+          requestID: string;
+          status: "failed";
+          statusCode: number;
+          statusMessage: string;
+        }
+      | { requestID: string; status: "skipped" }
+    >
+  > {
+    if (entries.length === 0) return [];
+    this.assertWritable(`executeBatchAdd(${entityType}, n=${entries.length})`);
+
+    const rqType = `${entityType}AddRq`;
+    const rsType = `${entityType}AddRs`;
+    const retName = `${entityType}Ret`;
+    const addKey = `${entityType}Add`;
+
+    // Build N request bodies, each with an explicit sequential requestID.
+    // Builder would auto-assign these if omitted, but we set them explicitly
+    // so the contract between input index and response requestID is unambiguous.
+    const requests = entries.map((data, i) => ({
+      type: rqType,
+      requestID: String(i + 1),
+      body: { [addKey]: data },
+    }));
+
+    const xml = buildQBXMLRequest({
+      version: this.config.qbxmlVersion ?? "16.0",
+      requests,
+    });
+    const response = await this.sendRequest(xml);
+
+    // Initialize positionally-aligned result slots as "skipped". Every input
+    // entry gets a slot; responses fill in posted/failed by requestID match.
+    type Result =
+      | {
+          requestID: string;
+          status: "posted";
+          entity: Record<string, unknown>;
+        }
+      | {
+          requestID: string;
+          status: "failed";
+          statusCode: number;
+          statusMessage: string;
+        }
+      | { requestID: string; status: "skipped" };
+    const results: Result[] = entries.map((_, i) => ({
+      requestID: String(i + 1),
+      status: "skipped" as const,
+    }));
+
+    for (const rs of response.responses) {
+      if (rs.type !== rsType) continue;
+      const rid = rs.requestID;
+      if (rid === undefined) continue;
+      const idx = Number(rid) - 1;
+      if (idx < 0 || idx >= results.length) continue;
+
+      if (rs.statusCode === 0) {
+        // Pull the entity out of the response data block. AddRs returns
+        // { {entityType}Ret: <entity> } (single object, not array).
+        const data = rs.data as Record<string, unknown>;
+        const ret = data[retName];
+        const entity = (Array.isArray(ret) ? ret[0] : ret) as
+          | Record<string, unknown>
+          | undefined;
+        results[idx] = {
+          requestID: rid,
+          status: "posted",
+          entity: entity ?? {},
+        };
+      } else {
+        results[idx] = {
+          requestID: rid,
+          status: "failed",
+          statusCode: rs.statusCode,
+          statusMessage: rs.statusMessage,
+        };
+      }
+    }
+
+    return results;
+  }
+
   async deleteEntity(
     entityType: string,
     listIdOrTxnId: string
   ): Promise<Record<string, unknown>> {
+    this.assertWritable(`deleteEntity(${entityType})`);
     const xml = buildDeleteRequest(entityType, listIdOrTxnId, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
     const isTransaction = [

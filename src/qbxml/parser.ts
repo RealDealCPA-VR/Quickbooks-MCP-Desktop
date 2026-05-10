@@ -115,6 +115,13 @@ export function parseQBXMLResponse(xml: string): QBXMLResponse {
       const statusCode = Number(entryObj["@_statusCode"] ?? -1);
       const statusSeverity = String(entryObj["@_statusSeverity"] ?? "Error");
       const statusMessage = String(entryObj["@_statusMessage"] ?? "Unknown error");
+      // The requestID attribute QB echoes back on every *Rs element. Used by
+      // batch callers (Phase 10 #43) to align N responses to N input requests
+      // when they share a *Rs name.
+      const requestID =
+        entryObj["@_requestID"] !== undefined
+          ? String(entryObj["@_requestID"])
+          : undefined;
 
       // Extract the data payload (everything that's not a status attribute)
       const data: Record<string, unknown> = {};
@@ -143,6 +150,7 @@ export function parseQBXMLResponse(xml: string): QBXMLResponse {
         statusSeverity,
         statusMessage,
         data: Object.keys(data).length > 0 ? data : {},
+        ...(requestID !== undefined ? { requestID } : {}),
         ...(iteratorRemainingCount !== undefined ? { iteratorRemainingCount } : {}),
         ...(iteratorID !== undefined ? { iteratorID } : {}),
       });
