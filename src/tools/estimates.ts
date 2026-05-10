@@ -129,6 +129,7 @@ export function registerEstimateTools(
       memo: z.string().optional().describe("Memo"),
       lines: z.array(estimateLineSchema).optional()
         .describe("Estimate line items"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate estimate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -173,11 +174,17 @@ export function registerEstimateTools(
       }
 
       try {
-        const result = await session.addEntity("Estimate", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Estimate", data, args.idempotencyKey)
+          : { entity: await session.addEntity("Estimate", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, estimate: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              estimate: result,
+            }, null, 2),
           }],
         };
       } catch (err) {
@@ -325,6 +332,7 @@ export function registerEstimateTools(
         .describe("Reference number for the new invoice. Default: estimate's RefNumber if present."),
       invoiceMemo: z.string().optional()
         .describe("Memo for the new invoice. Default: 'Converted from estimate <ref>'."),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original invoice without creating a duplicate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open. Note: only the InvoiceAdd half of this tool is keyed; the IsAccepted flip on the source estimate is not (a replay returns the original invoice without re-attempting the flip)."),
     },
     async (args) => {
       const session = getSession();
@@ -435,8 +443,19 @@ export function registerEstimateTools(
       }
 
       let invoice: Record<string, unknown>;
+      let invoiceReplayed = false;
       try {
-        invoice = await session.addEntity("Invoice", invoiceData);
+        if (args.idempotencyKey) {
+          const out = await session.addEntityIdempotent(
+            "Invoice",
+            invoiceData,
+            args.idempotencyKey,
+          );
+          invoice = out.entity;
+          invoiceReplayed = out.replayed;
+        } else {
+          invoice = await session.addEntity("Invoice", invoiceData);
+        }
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
         const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
@@ -457,7 +476,11 @@ export function registerEstimateTools(
       // Mark accepted AFTER successful invoice creation (default behavior).
       // If markAccepted=false, leave the estimate untouched (operator may be
       // doing a partial conversion and wants to convert again later).
-      const shouldMarkAccepted = args.markAccepted !== false;
+      // On idempotent replay, skip the mark step — the original call already
+      // ran it (or was told not to). Re-running would either be a no-op (idempotent
+      // success) or worse, fail with statusCode 3170 because the EditSequence
+      // we read above is now stale relative to the prior mark. Skipping is safe.
+      const shouldMarkAccepted = args.markAccepted !== false && !invoiceReplayed;
       let estimateMarked = false;
       let markError: { statusCode: number; statusMessage: string; humanReadable?: string } | null = null;
 
@@ -487,6 +510,7 @@ export function registerEstimateTools(
           type: "text" as const,
           text: JSON.stringify({
             success: true,
+            ...(invoiceReplayed ? { idempotentReplay: true } : {}),
             invoice,
             estimateMarkedAccepted: estimateMarked,
             ...(markError ? { markAcceptedError: markError } : {}),

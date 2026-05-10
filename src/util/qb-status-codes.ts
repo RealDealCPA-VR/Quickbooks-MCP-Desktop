@@ -27,6 +27,12 @@ const TABLE: Record<number, string> = {
   // apart from real QB role-permission denials. Issued by QBReadOnlyError
   // in src/session/manager.ts (Phase 10 #42).
   9001: "Read-only session — mutation blocked by client gate. Reconnect with qb_session_connect({ readOnly: false }) to re-enable writes.",
+  // 9002 — synthetic, client-side. Issued by QBIdempotencyKeyConflictError
+  // in src/session/manager.ts (Phase 10 #47) when a previously-seen
+  // idempotency key is reused with a DIFFERENT request payload. Replaying
+  // with the exact original payload returns the cached result silently;
+  // diverging payloads under the same key is treated as a caller bug.
+  9002: "Idempotency key conflict — a different request was already processed under this key. Use a fresh idempotency key, or replay with the exact original payload.",
 };
 
 export function qbStatusCodeMessage(statusCode: number): string | undefined {

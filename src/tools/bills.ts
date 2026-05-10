@@ -202,6 +202,7 @@ export function registerBillTools(
         .describe("Expense-account lines — each posts Amount to AccountRef"),
       itemLines: z.array(itemLineSchema).optional()
         .describe("Item lines — each posts (quantity * cost) to ItemRef's expense account"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate bill (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -277,11 +278,17 @@ export function registerBillTools(
       }
 
       try {
-        const result = await session.addEntity("Bill", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Bill", data, args.idempotencyKey)
+          : { entity: await session.addEntity("Bill", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, bill: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              bill: result,
+            }, null, 2),
           }],
         };
       } catch (err) {
@@ -454,6 +461,7 @@ export function registerBillTools(
         .describe("Credit card account full name (BillPaymentCreditCard only — ignored for check)"),
       apAccountName: z.string().optional()
         .describe("Accounts Payable account full name (defaults to the operator's standard AP account)"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate bill payment (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -510,11 +518,17 @@ export function registerBillTools(
           : "BillPaymentCreditCard";
 
       try {
-        const result = await session.addEntity(entityType, data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent(entityType, data, args.idempotencyKey)
+          : { entity: await session.addEntity(entityType, data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, billPayment: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              billPayment: result,
+            }, null, 2),
           }],
         };
       } catch (err) {

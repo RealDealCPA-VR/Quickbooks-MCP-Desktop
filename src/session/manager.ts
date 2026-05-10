@@ -15,6 +15,7 @@
  *      testing, and non-Windows environments
  */
 
+import { createHash } from "node:crypto";
 import {
   buildQBXMLRequest,
   buildQueryRequest,
@@ -89,6 +90,83 @@ export class QBReadOnlyError extends Error {
   }
 }
 
+/**
+ * Thrown by `addEntityIdempotent` / `executeBatchAddIdempotent` when an
+ * idempotency key has been seen before AGAINST A DIFFERENT REQUEST PAYLOAD.
+ * Carries `statusCode 9002` (synthetic sentinel — distinct from the 9001
+ * read-only sentinel and outside QB's 0/1/3xxx/5xx range) so the existing
+ * tool-side error wrapper surfaces it as a structured `isError: true` with
+ * humanReadable from qb-status-codes.ts.
+ *
+ * Why we reject instead of silently overwriting: a key collision against a
+ * different payload almost always indicates a bug in the caller (recycling a
+ * key, racing two concurrent agents on the same key, etc.). Returning the
+ * stale cached result for a different payload is dangerous; rejecting and
+ * forcing the operator to use a fresh key is safe. Stripe's idempotency
+ * model is the same.
+ */
+export class QBIdempotencyKeyConflictError extends Error {
+  statusCode: number;
+  idempotencyKey: string;
+  entityType: string;
+  constructor(idempotencyKey: string, entityType: string) {
+    super(
+      `Idempotency key conflict: '${idempotencyKey}' was previously used for a ` +
+      `${entityType} create with a different request payload. Use a fresh key ` +
+      `for new requests, or replay with the exact original payload to retrieve ` +
+      `the cached result.`
+    );
+    this.name = "QBIdempotencyKeyConflictError";
+    this.statusCode = 9002;
+    this.idempotencyKey = idempotencyKey;
+    this.entityType = entityType;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency cache helpers
+// ---------------------------------------------------------------------------
+
+interface IdempotencyCacheEntry {
+  entityType: string;
+  payloadFingerprint: string;
+  result: unknown;
+  createdAt: number;
+}
+
+/**
+ * Stable-order JSON stringification — recursively sorts object keys so that
+ * `{a:1, b:2}` and `{b:2, a:1}` produce the same string. Used as the input
+ * to the SHA-256 fingerprint that protects against same-key/different-payload
+ * collisions.
+ *
+ * Arrays preserve order (line ordering is semantically meaningful in QB —
+ * line[0] vs line[1] map to different TxnLineIDs after persist). `undefined`
+ * is dropped during serialization (matches JSON.stringify behavior).
+ */
+function canonicalizeJson(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalizeJson).join(",") + "]";
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return (
+    "{" +
+    keys
+      .map((k) => JSON.stringify(k) + ":" + canonicalizeJson(obj[k]))
+      .join(",") +
+    "}"
+  );
+}
+
+function fingerprintPayload(entityType: string, payload: unknown): string {
+  return createHash("sha256")
+    .update(entityType + ":" + canonicalizeJson(payload))
+    .digest("hex");
+}
+
 // ---------------------------------------------------------------------------
 // Session manager
 // ---------------------------------------------------------------------------
@@ -134,6 +212,27 @@ export class QBSessionManager {
    * clears it.
    */
   private readOnly: boolean = false;
+
+  /**
+   * Idempotency cache (Phase 10 #47). Maps idempotencyKey → cached result.
+   * Scoped per-companyFile — `switchCompanyFile` clears it. FIFO-bounded by
+   * `MAX_IDEMPOTENCY_CACHE_SIZE`; the oldest entry is evicted when capacity
+   * is exceeded. Map's insertion-order iteration gives FIFO for free.
+   *
+   * Only successful creates are cached — a thrown error from `addEntity` /
+   * `executeBatchAdd` leaves the key unset so the next retry can fix the
+   * underlying problem without being shadowed by a stale failure.
+   */
+  private idempotencyCache: Map<string, IdempotencyCacheEntry> = new Map();
+
+  /**
+   * Cap on the per-companyFile idempotency cache. Sized for a long-running
+   * agent session (typical agent runs post < 100 mutations); 1000 leaves
+   * generous headroom without unbounded memory growth. FIFO eviction is
+   * fine — we only need recent retries to hit; very old keys aging out is
+   * the correct behavior, not a bug.
+   */
+  private static readonly MAX_IDEMPOTENCY_CACHE_SIZE = 1000;
 
   constructor(config: QBConnectionConfig) {
     this.config = config;
@@ -342,6 +441,13 @@ export class QBSessionManager {
     if (this.simulationMode) {
       this.store = new SimulationStore();
     }
+    // Idempotency cache is per-companyFile — a TxnID issued under company A
+    // would be meaningless under company B even if the same key were retried.
+    // Reset it on every switch so we never serve a cached result that was
+    // produced against a different file. Cleared in BOTH live and sim modes
+    // (live QB does persist across switches, but the in-memory cache here
+    // only holds keys observed in this process).
+    this.idempotencyCache.clear();
     return this.openSession();
   }
 
@@ -503,6 +609,88 @@ export class QBSessionManager {
     return entities[0] ?? respData;
   }
 
+  /**
+   * Idempotent variant of `addEntity` (Phase 10 #47). Wrapping a single create
+   * with `idempotencyKey` makes a retry of the same call return the original
+   * result instead of duplicating the QB record.
+   *
+   * Semantics (Stripe-style):
+   *   - Miss → execute `addEntity`; on success, cache `{entityType, fingerprint, result}`.
+   *   - Hit + same fingerprint → return cached result with `replayed: true`.
+   *     No wire I/O, no second QB record, no balance side-effect.
+   *   - Hit + different fingerprint → throw `QBIdempotencyKeyConflictError`.
+   *     Caller is expected to use a fresh key for new requests.
+   *
+   * The fingerprint hashes `(entityType, canonicalized(data))` — key order
+   * within `data` is normalized so `{Name:"X", Phone:"Y"}` and `{Phone:"Y",
+   * Name:"X"}` collide intentionally (they ARE the same request). Array
+   * order IS preserved (line[0] vs line[1] are different requests in QB).
+   *
+   * Failed creates do NOT poison the cache — the key remains unset so the
+   * next retry can succeed. This matches the operator's mental model:
+   * idempotency protects against accidental duplicates of *successful*
+   * writes; failures should be retryable until they succeed (and only then
+   * become idempotent).
+   *
+   * Called BEFORE assertWritable, so a read-only session also rejects with
+   * QBReadOnlyError (the gate is in `addEntity`).
+   */
+  async addEntityIdempotent(
+    entityType: string,
+    data: Record<string, unknown>,
+    idempotencyKey: string
+  ): Promise<{ entity: Record<string, unknown>; replayed: boolean }> {
+    const fingerprint = fingerprintPayload(entityType, data);
+    const cached = this.idempotencyCache.get(idempotencyKey);
+    if (cached) {
+      if (
+        cached.entityType === entityType &&
+        cached.payloadFingerprint === fingerprint
+      ) {
+        return {
+          entity: cached.result as Record<string, unknown>,
+          replayed: true,
+        };
+      }
+      throw new QBIdempotencyKeyConflictError(idempotencyKey, entityType);
+    }
+    const entity = await this.addEntity(entityType, data);
+    this.cacheIdempotencyResult(idempotencyKey, {
+      entityType,
+      payloadFingerprint: fingerprint,
+      result: entity,
+      createdAt: Date.now(),
+    });
+    return { entity, replayed: false };
+  }
+
+  /**
+   * Insert a new idempotency cache entry, FIFO-evicting the oldest when over
+   * capacity. JS Map iteration order is insertion order, so `keys().next()`
+   * reliably returns the oldest key.
+   *
+   * Mirrors the `addEntityIdempotent` / `executeBatchAddIdempotent` happy
+   * path; only those methods should call this. Centralizing the eviction
+   * logic here keeps the size invariant in one place.
+   */
+  private cacheIdempotencyResult(key: string, entry: IdempotencyCacheEntry): void {
+    if (
+      this.idempotencyCache.size >= QBSessionManager.MAX_IDEMPOTENCY_CACHE_SIZE
+    ) {
+      const oldest = this.idempotencyCache.keys().next().value;
+      if (oldest !== undefined) this.idempotencyCache.delete(oldest);
+    }
+    this.idempotencyCache.set(key, entry);
+  }
+
+  /**
+   * Test/diagnostic accessor — current size of the idempotency cache.
+   * Production code shouldn't depend on this; eviction-bound tests do.
+   */
+  idempotencyCacheSize(): number {
+    return this.idempotencyCache.size;
+  }
+
   async modifyEntity(
     entityType: string,
     data: Record<string, unknown>
@@ -628,6 +816,79 @@ export class QBSessionManager {
     }
 
     return results;
+  }
+
+  /**
+   * Idempotent variant of `executeBatchAdd` (Phase 10 #47). Same semantics as
+   * `addEntityIdempotent` but the cached result is the entire batch outcome
+   * array (mix of posted/failed/skipped slots). Replay returns the same array
+   * verbatim WITHOUT re-running compensating-delete logic — the batch
+   * tool's caller is expected to inspect the cached outcome the same way it
+   * inspected the original.
+   *
+   * Cache key fingerprint hashes the FULL entries list — adding/removing/
+   * reordering entries makes the request a different request (collides with
+   * the conflict-error path). This is safer than fingerprinting per-entry:
+   * a partially-overlapping batch with the same key should NOT replay; it's
+   * a different operation.
+   *
+   * IMPORTANT — only fully-successful batches are cached. A partial-failure
+   * outcome is NOT cached, by design:
+   *   - The batch tool's compensating-delete logic runs AFTER this method
+   *     returns. Caching the pre-rollback wire outcome and replaying it
+   *     would cause the rollback path to re-attempt deleting TxnIDs that
+   *     were already removed by the original call — observable thrash and
+   *     a different response shape than the first call.
+   *   - On a partial failure, the original rollback either fully succeeded
+   *     (system is clean — fresh retry is safe) or orphaned some entries
+   *     (already surfaced to the operator with TxnIDs to clean up — the
+   *     operator should reconcile before retrying). Caching the pre-rollback
+   *     outcome adds no value to either branch.
+   *
+   * If `executeBatchAdd` itself throws (envelope build error, network mid-
+   * flight, QB rejected the entire envelope upfront), the key also remains
+   * unset so the next retry can fix the underlying problem.
+   */
+  async executeBatchAddIdempotent(
+    entityType: string,
+    entries: Record<string, unknown>[],
+    idempotencyKey: string
+  ): Promise<{
+    results: Array<
+      | { requestID: string; status: "posted"; entity: Record<string, unknown> }
+      | { requestID: string; status: "failed"; statusCode: number; statusMessage: string }
+      | { requestID: string; status: "skipped" }
+    >;
+    replayed: boolean;
+  }> {
+    const cacheEntityType = `Batch:${entityType}`;
+    const fingerprint = fingerprintPayload(cacheEntityType, entries);
+    const cached = this.idempotencyCache.get(idempotencyKey);
+    if (cached) {
+      if (
+        cached.entityType === cacheEntityType &&
+        cached.payloadFingerprint === fingerprint
+      ) {
+        return {
+          results: cached.result as Awaited<
+            ReturnType<QBSessionManager["executeBatchAdd"]>
+          >,
+          replayed: true,
+        };
+      }
+      throw new QBIdempotencyKeyConflictError(idempotencyKey, cacheEntityType);
+    }
+    const results = await this.executeBatchAdd(entityType, entries);
+    const allPosted = results.every((r) => r.status === "posted");
+    if (allPosted) {
+      this.cacheIdempotencyResult(idempotencyKey, {
+        entityType: cacheEntityType,
+        payloadFingerprint: fingerprint,
+        result: results,
+        createdAt: Date.now(),
+      });
+    }
+    return { results, replayed: false };
   }
 
   async deleteEntity(

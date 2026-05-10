@@ -38,6 +38,7 @@ export function registerPaymentTools(
       depositToAccountName: z.string().optional().describe("Account to deposit payment into"),
       appliedTo: z.array(appliedToSchema).optional()
         .describe("Optional invoice applications. Each entry closes out part or all of an invoice's BalanceRemaining. sum(appliedTo.amount) must be <= totalAmount; the difference becomes UnusedPayment (a customer credit)."),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate payment (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -107,11 +108,17 @@ export function registerPaymentTools(
       }
 
       try {
-        const result = await session.addEntity("ReceivePayment", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("ReceivePayment", data, args.idempotencyKey)
+          : { entity: await session.addEntity("ReceivePayment", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, payment: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              payment: result,
+            }, null, 2),
           }],
         };
       } catch (err) {

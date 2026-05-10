@@ -134,6 +134,7 @@ export function registerCustomerTools(
       billCountry: z.string().optional().describe("Billing country"),
       accountNumber: z.string().optional().describe("Account number for the customer"),
       notes: z.string().optional().describe("Notes about the customer"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate QB record (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -158,11 +159,17 @@ export function registerCustomerTools(
       }
 
       try {
-        const result = await session.addEntity("Customer", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Customer", data, args.idempotencyKey)
+          : { entity: await session.addEntity("Customer", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, customer: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              customer: result,
+            }, null, 2),
           }],
         };
       } catch (err) {

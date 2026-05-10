@@ -148,6 +148,7 @@ export function registerPurchaseOrderTools(
         .describe("Mark the PO closed regardless of receipt activity. Default false."),
       lines: z.array(purchaseOrderLineSchema).min(1)
         .describe("PO line items. At least one required."),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate PO (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -194,11 +195,17 @@ export function registerPurchaseOrderTools(
       });
 
       try {
-        const result = await session.addEntity("PurchaseOrder", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("PurchaseOrder", data, args.idempotencyKey)
+          : { entity: await session.addEntity("PurchaseOrder", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, purchaseOrder: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              purchaseOrder: result,
+            }, null, 2),
           }],
         };
       } catch (err) {

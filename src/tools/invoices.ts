@@ -163,6 +163,7 @@ export function registerInvoiceTools(
       memo: z.string().optional().describe("Memo for the invoice"),
       lines: z.array(invoiceLineSchema).optional()
         .describe("Invoice line items"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate invoice (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -210,11 +211,17 @@ export function registerInvoiceTools(
       }
 
       try {
-        const result = await session.addEntity("Invoice", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Invoice", data, args.idempotencyKey)
+          : { entity: await session.addEntity("Invoice", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, invoice: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              invoice: result,
+            }, null, 2),
           }],
         };
       } catch (err) {

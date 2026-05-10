@@ -67,6 +67,7 @@ export function registerEmployeeTools(
       phone: z.string().regex(PHONE_RE).optional().describe("Phone number"),
       email: z.string().regex(EMAIL_RE).optional().describe("Email address"),
       hiredDate: z.string().regex(ISO_DATE_RE).optional().describe("Hire date (YYYY-MM-DD)"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate QB record (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -81,11 +82,17 @@ export function registerEmployeeTools(
       if (args.hiredDate) data.HiredDate = args.hiredDate;
 
       try {
-        const result = await session.addEntity("Employee", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Employee", data, args.idempotencyKey)
+          : { entity: await session.addEntity("Employee", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, employee: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              employee: result,
+            }, null, 2),
           }],
         };
       } catch (err) {

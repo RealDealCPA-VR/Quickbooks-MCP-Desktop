@@ -74,6 +74,7 @@ export function registerVendorTools(
       state: z.string().optional().describe("State"),
       postalCode: z.string().regex(POSTAL_RE).optional().describe("Postal code"),
       notes: z.string().optional().describe("Notes about the vendor"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate QB record (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -97,11 +98,17 @@ export function registerVendorTools(
       }
 
       try {
-        const result = await session.addEntity("Vendor", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Vendor", data, args.idempotencyKey)
+          : { entity: await session.addEntity("Vendor", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, vendor: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              vendor: result,
+            }, null, 2),
           }],
         };
       } catch (err) {

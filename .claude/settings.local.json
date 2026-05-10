@@ -7,7 +7,9 @@
       "Bash(npm test *)",
       "PowerShell($out = \"\" | & node dist/index.js 2>&1; \"EXIT=$LASTEXITCODE\"; $out | Select-Object -Last 6)",
       "PowerShell(\"\" | & node dist/index.js; Write-Output \"ExitCode=$LASTEXITCODE\")",
-      "Bash(npm view *)"
+      "Bash(npm view *)",
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 10; Write-Output \"EXIT=$LASTEXITCODE\")",
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-String -Pattern \"Mode:|tool|running\" | Select-Object -First 10; Write-Output \"EXIT=$LASTEXITCODE\")"
     ]
   }
 }

@@ -29,6 +29,43 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-10 — Idempotency cache lives at QBSessionManager, fingerprint-matches on replay, only caches successful creates
+
+**Chosen:** Phase 10 #47 ships as a single chokepoint inside `QBSessionManager` mirroring the #42 read-only gate template — new `addEntityIdempotent(entityType, data, key)` and `executeBatchAddIdempotent(entityType, entries, key)` methods that delegate to the existing `addEntity` / `executeBatchAdd` and return `{entity|results, replayed}`. Cache state (`Map<key, {entityType, payloadFingerprint, result, createdAt}>`) is per-`QBSessionManager` instance, FIFO-bounded at 1000 entries, and explicitly cleared on `switchCompanyFile`. Fingerprint is SHA-256 of canonicalized JSON (recursive sorted-key normalization so `{a, b}` and `{b, a}` collide; arrays preserve order so `[line1, line2]` and `[line2, line1]` don't). Same key + matching fingerprint → return cached with `replayed: true`. Same key + different fingerprint → throw `QBIdempotencyKeyConflictError` (synthetic statusCode 9002). Tool surface: every `*_create` / `*_add` tool gains optional `idempotencyKey: z.string().min(1).optional()`; on replay the response carries `idempotentReplay: true`.
+
+**Why:** Five reasons.
+
+1. **Single chokepoint matches #42 architecture.** The read-only gate sets the precedent that policy concerns affecting every mutation belong in `QBSessionManager`, not duplicated across 47 tool call sites. Idempotency is the same shape of concern. Putting the cache in the manager means the next mutation tool added (#75 banking primitives, #76 sales orders, etc.) inherits idempotency for free if it routes through `addEntityIdempotent`.
+
+2. **Stripe-style payload-fingerprint matching is the safe default.** A bare key-only cache would silently overwrite cached results when an agent recycled keys with a different payload — that's a correctness hazard. Forcing fingerprint match (and rejecting mismatches with 9002) catches caller bugs and matches what experienced operators expect from idempotency systems.
+
+3. **Per-companyFile scoping prevents cross-tenant leaks.** A TxnID issued under company A is meaningless under company B even with the same key. Clearing on `switchCompanyFile` is the right invariant. Documented loudly because the failure mode (returning a stale TxnID from a different company) would be silent and dangerous.
+
+4. **Failed creates don't poison the cache.** The operator's mental model: idempotency protects against *successful* duplicates, not against retrying *failed* writes. If the first call throws (validation, network, QB rejection), the next retry should be allowed to fix the underlying problem. Caching the failure would leave the operator stuck.
+
+5. **Batch idempotency only caches full success — by design.** A partial-failure batch runs compensating-delete at the tool layer AFTER `executeBatchAdd` returns. Caching the pre-rollback wire outcome and replaying it would re-attempt deletes against TxnIDs the original call already removed — observable thrash and a divergent response shape from the first call. The simpler and correct semantic: cache only when every entry posted, otherwise let the retry build a fresh envelope (rollback already cleaned up the originally-posted entries; if rollback orphaned anything, that was already surfaced to the operator with TxnIDs to clean up manually).
+
+**Alternatives rejected:**
+
+- **Cache at the tool layer (per-tool registry).** Would have meant 16 copies of the cache + lookup logic across 14 tool files. The read-only gate experiment proved that policy concerns belong in the manager — the same argument applies here.
+- **Surface `replayed` as an out-parameter or session-scoped accessor (`getLastIdempotencyResult()`).** Action-at-a-distance; the tool would have to read it after every call and risk forgetting. Returning `{entity, replayed}` from a new method makes the contract explicit at the call site without breaking the existing `addEntity` signature (no churn in the 16 callers that don't pass a key).
+- **Bare key-only cache (no fingerprint).** Tempting because the schema is simpler, but accepting any payload under a previously-seen key is too dangerous — silently returning a stale result for a different operation is the worst possible failure mode.
+- **TTL-based cache eviction.** Would require a `setTimeout` infrastructure and clock dependence in tests. FIFO at 1000 entries handles the realistic workload (agent runs post < 100 mutations, so the cache is far under cap on every realistic session) without temporal complexity. If memory pressure ever becomes real, swap to a different policy without changing the public interface.
+- **Cache full tool response for batches (so partial-failure replays return identical structure).** Would require moving the cache logic out of the manager and into the batch tool handler. Possible, but the partial-failure replay use case is narrow (operator specifically retrying a failed batch with the same key) and the current "fresh retry" semantic is defensible: rollback either cleared everything (retry safe) or surfaced orphans (operator should reconcile before retry).
+
+**Tradeoffs / consequences:**
+
+- **The cache is ephemeral.** Restarting the MCP server clears it. An agent that retries across a server crash gets a duplicate. That's acceptable for personal use; a shared multi-process deployment would need persistent storage (Redis, SQLite). Not required for this codebase.
+- **Memory bound is hard-coded at 1000 entries.** If a future workflow generates more than 1000 keyed creates per company-file session (unlikely in a CPA practice — even January 1099 prep posts at most a few hundred bills), older keys age out silently. Document in the manager docstring; revisit if real workloads ever push past it.
+- **Conflict semantics may surprise agents that recycle keys.** A naive agent that sets `idempotencyKey: "monthly-rent"` for every monthly post would trip the conflict gate the second month. The fix is on the agent side (use a date-suffixed key like `monthly-rent-2026-05`), not server-side. Tool descriptions document the per-create scope explicitly.
+- **`qb_estimate_convert_to_invoice` skips the IsAccepted flip on idempotent replay.** The convert tool is a two-step composite (Invoice add + Estimate IsAccepted modify); only the InvoiceAdd half is keyed. On replay, re-running the EstimateMod with the original `editSequence` would either be a no-op (if already accepted) or fail with `statusCode 3170` (stale editSequence after the original mark). Skipping is safe and matches the operator's mental model: "the conversion already happened, give me back the invoice."
+
+**Revisit when:**
+- If a multi-process deployment is ever needed, swap the in-memory `Map` for a persistent backend (interface stays the same).
+- If batch partial-failure replay becomes a hot operator request, reconsider option (C) above (cache full tool response).
+
+---
+
 ## 2026-05-10 — qb_1099_summary / qb_1099_detail aggregate from typed Bill + Check queries, not Form1099QueryRq
 
 **Chosen:** Phase 10 #44 ships as `qb_1099_summary` + `qb_1099_detail`, both implemented as a tool-side aggregation over the existing typed `Bill` + `Check` stores via `session.queryEntity`. No new wire request type is added. Vendor classification is driven by two fields on the `Vendor` record: `IsVendorEligibleFor1099 === true` selects which vendors participate, and `Vendor1099Type === 'MISC'` opts a vendor into 1099-MISC (default is 1099-NEC, the modern default for nonemployee compensation post the IRS 2020 split). Threshold defaults to $600 (the IRS general TY2024+ threshold for both 1099-NEC and 1099-MISC); `qb_1099_summary` accepts a `threshold` arg for the rare special-box cases ($10 royalties).

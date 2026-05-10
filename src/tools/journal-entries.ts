@@ -159,6 +159,7 @@ export function registerJournalEntryTools(
         .describe("Debit-side lines. At least one required. sum(debits.amount) must equal sum(credits.amount)."),
       credits: z.array(journalLineSchema).min(1)
         .describe("Credit-side lines. At least one required. sum(credits.amount) must equal sum(debits.amount)."),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate journal entry (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -173,11 +174,17 @@ export function registerJournalEntryTools(
       data.JournalCreditLineAdd = args.credits.map(buildJELineAdd);
 
       try {
-        const result = await session.addEntity("JournalEntry", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("JournalEntry", data, args.idempotencyKey)
+          : { entity: await session.addEntity("JournalEntry", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, journalEntry: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              journalEntry: result,
+            }, null, 2),
           }],
         };
       } catch (err) {
@@ -220,6 +227,7 @@ export function registerJournalEntryTools(
         .min(1)
         .max(100)
         .describe("Array of journal entries to post atomically (1–100). Each entry's debits must equal credits to the cent."),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key for the WHOLE BATCH. Retrying with the same key + identical entries list returns the original batch outcome without re-running the wire envelope (response carries idempotentReplay: true). Reordering, adding, or removing entries makes the request a different request — that returns statusCode 9002 (use a fresh key). Cache is per company file and clears on qb_company_open. CAVEAT: only fully-successful batches are cached. The upfront balance-validation gate runs before the idempotency check (unbalanced batches are rejected and not cached regardless of key); partial-failure batches are also not cached — fresh retry is the correct recovery (rollback already cleaned up the originally-posted entries; orphans, if any, are surfaced to the operator on the failing call)."),
     },
     async (args) => {
       // Upfront per-entry balance validation. Bailing here keeps the envelope
@@ -267,8 +275,19 @@ export function registerJournalEntryTools(
       });
 
       let results;
+      let batchReplayed = false;
       try {
-        results = await session.executeBatchAdd("JournalEntry", dataList);
+        if (args.idempotencyKey) {
+          const out = await session.executeBatchAddIdempotent(
+            "JournalEntry",
+            dataList,
+            args.idempotencyKey,
+          );
+          results = out.results;
+          batchReplayed = out.replayed;
+        } else {
+          results = await session.executeBatchAdd("JournalEntry", dataList);
+        }
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
         const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
@@ -293,6 +312,7 @@ export function registerJournalEntryTools(
             type: "text" as const,
             text: JSON.stringify({
               success: true,
+              ...(batchReplayed ? { idempotentReplay: true } : {}),
               count: results.length,
               entries: results.map((r, i) => {
                 const ret = (r as { entity: Record<string, unknown> }).entity;

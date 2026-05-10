@@ -133,6 +133,7 @@ export function registerSalesReceiptTools(
       depositToAccountListId: z.string().optional().describe("Deposit account ListID (alternative to depositToAccountName)"),
       lines: z.array(salesReceiptLineSchema).optional()
         .describe("Sales receipt line items"),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate sales receipt (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
     },
     async (args) => {
       const session = getSession();
@@ -185,11 +186,17 @@ export function registerSalesReceiptTools(
       }
 
       try {
-        const result = await session.addEntity("SalesReceipt", data);
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("SalesReceipt", data, args.idempotencyKey)
+          : { entity: await session.addEntity("SalesReceipt", data), replayed: false };
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ success: true, salesReceipt: result }, null, 2),
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              salesReceipt: result,
+            }, null, 2),
           }],
         };
       } catch (err) {
