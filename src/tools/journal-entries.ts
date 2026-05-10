@@ -86,7 +86,7 @@ export function registerJournalEntryTools(
 ): void {
   server.tool(
     "qb_journal_entry_list",
-    "List or search journal entries in QuickBooks Desktop. Each entry carries JournalDebitLineRet + JournalCreditLineRet arrays plus TotalDebit / TotalCredit (always equal — the balance invariant is enforced at write time).",
+    "List or search journal entries in QuickBooks Desktop. By default each row carries header totals only (TotalDebit / TotalCredit, always equal); pass includeLineItems:true to also surface JournalDebitLineRet + JournalCreditLineRet (per-line account, amount, optional Customer/Vendor entity, ClassRef).",
     {
       txnId: z.string().optional().describe("Fetch a specific JE by TxnID"),
       refNumber: z.string().optional().describe("Filter by reference/entry number"),
@@ -94,6 +94,7 @@ export function registerJournalEntryTools(
       toDate: z.string().regex(ISO_DATE_RE).optional().describe("End TxnDate (YYYY-MM-DD)"),
       modifiedFrom: z.string().optional().describe("Modified date lower bound (ISO timestamp)"),
       modifiedTo: z.string().optional().describe("Modified date upper bound (ISO timestamp)"),
+      includeLineItems: z.boolean().optional().describe("When true, each JE row carries its JournalDebitLineRet + JournalCreditLineRet arrays. Default false — header totals only, matching real QB's JournalEntryQueryRq default behavior."),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -101,7 +102,7 @@ export function registerJournalEntryTools(
       const filters: Record<string, unknown> = {};
       // JournalEntryQueryRq schema-required child order (see invoices.ts):
       // selectors → MaxReturned → ModifiedDateRangeFilter → TxnDateRangeFilter
-      // → (entity/account/ref filters).
+      // → (entity/account/ref filters) → IncludeLineItems → IncludeLinkedTxns.
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
@@ -117,6 +118,7 @@ export function registerJournalEntryTools(
           ToTxnDate: args.toDate,
         };
       }
+      if (args.includeLineItems) filters.IncludeLineItems = true;
 
       try {
         const journalEntries = await session.queryEntity("JournalEntry", filters);

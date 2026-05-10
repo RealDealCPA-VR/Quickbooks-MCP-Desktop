@@ -65,6 +65,12 @@ _(Items 23 + 25 + 26 + 27 + 28 + 29 done — see Completed below. Phase 6 fully 
 
 ---
 
+## Phase 9 — Critical bug fixes
+
+_(All Phase 9 items closed. Item 37 done 2026-05-09 — schema-order + live-adapter fix landed without an ACCEPTANCE_CRITERIA entry; the canonical regression sits in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts) and [tests/report-adapter.test.ts](tests/report-adapter.test.ts). Items 38 + 39 done 2026-05-09 — see Completed below.)_
+
+---
+
 _(Don't pre-write criteria for distant tasks — they tend to drift before implementation, and writing them up-front wastes effort if priorities shift.)_
 
 ---
@@ -72,6 +78,189 @@ _(Don't pre-write criteria for distant tasks — they tend to drift before imple
 ## Completed
 
 _(Move entries here when criteria are satisfied. Keep the criteria list intact — it's the historical record of what "done" meant for that task.)_
+
+---
+
+### Item 41 — Line-level detail in `*_list` responses (`includeLineItems`) _(Phase 10)_ — done 2026-05-09
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] Optional `includeLineItems: boolean` arg added to seven list tools — `qb_invoice_list`, `qb_bill_list`, `qb_sales_receipt_list`, `qb_credit_memo_list`, `qb_purchase_order_list`, `qb_estimate_list`, `qb_journal_entry_list`. Default `false`. Scope expanded from the HANDOFF's six-tool plan to include `qb_journal_entry_list` because the existing JE tool description already promised lines on every row, which conflicted with the strip-by-default behavior — adding the JE opt-in keeps the description honest.
+- [x] When the arg is omitted or `false`, list responses return header fields only — matches real QB's `*QueryRq` default behavior. Each row carries `TxnID`, `RefNumber`, `TxnDate`, `CustomerRef` / `VendorRef`, `Subtotal` / `AmountDue` / `BalanceRemaining` / `IsPaid` (where applicable), `EditSequence`, but no `*LineRet` arrays.
+- [x] When the arg is `true`, list responses surface the type-specific `*LineRet` array(s) on each row: `InvoiceLineRet`, `ExpenseLineRet` + `ItemLineRet` (Bill carries both), `SalesReceiptLineRet`, `CreditMemoLineRet`, `PurchaseOrderLineRet`, `EstimateLineRet`, `JournalDebitLineRet` + `JournalCreditLineRet`. Each `*LineRet` row carries `TxnLineID` + `Amount` + entity-type-specific fields per Item 17.
+- [x] Tool layer threads `IncludeLineItems = true` into the filter dict at the schema-required position (after every other filter the tool emits, before the implicit `IncludeLinkedTxns` slot). Pinned at the wire level in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts) for InvoiceQueryRq, BillQueryRq, JournalEntryQueryRq, and (looped) Estimate / SalesReceipt / CreditMemo / PurchaseOrder QueryRqs.
+- [x] Tool layer threads `IncludeLineItems` ONLY when the arg is truthy — `includeLineItems: false` (explicit) and `undefined` both omit the wire flag. Pinned via `vi.spyOn(session, "queryEntity")` reading `Object.keys(filters)` in [tests/include-line-items.test.ts](tests/include-line-items.test.ts).
+- [x] Sim `handleQuery` strips `*LineRet` / `*LinesRet` keys from each result entity by default (regex `/Line(s?)Ret$/`). When the request body carries `IncludeLineItems` truthy (boolean `true` for in-process callers, string `"true"` for the wire form after a fast-xml-parser round trip), the strip is skipped. Both shapes pinned in [tests/include-line-items.test.ts](tests/include-line-items.test.ts).
+- [x] Header-level fields computed FROM lines (`Subtotal`, `AmountDue`, `BalanceRemaining`, `IsPaid`, `TotalDebit`, `TotalCredit`, `AppliedAmount`, `TotalAmount`) survive the strip — those are header fields, not line fields, even though they're derived from the line set.
+- [x] `AppliedToTxnRet` (the credit-memo / payment-application relationship array) survives the strip — its key does not match the regex (no "Line" segment). Confirmed via tests. The strip is line-data-specific, not relationship-data-generic.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `qb_estimate_convert_to_invoice` ([src/tools/estimates.ts](src/tools/estimates.ts)) reads `EstimateLineRet` from a `queryEntity` response to map onto `InvoiceLineAdd`. Updated to internally pass `IncludeLineItems: true` so the strip-by-default doesn't break the convert flow. Pinned in [tests/include-line-items.test.ts](tests/include-line-items.test.ts) — convert preserves the source estimate's line amounts on the new invoice (4×125 + 2×200 ≡ 500 + 400).
+- [x] AR / AP aging (`qb_ar_aging` / `qb_ap_aging` in [src/tools/reports.ts](src/tools/reports.ts)) call `queryEntity("Invoice", {})` / `queryEntity("Bill", {})` for header-only data (`IsPaid`, `BalanceRemaining`, `DueDate`, `CustomerRef` / `VendorRef`). Unaffected by the strip — never read line data.
+- [x] Report walks (`buildPnLReport`, `buildBalanceSheetReport`, `buildBalanceSummary`, `handleTransactionQuery`) read entities directly via `getStore` — they bypass `handleQuery` entirely. The strip-by-default change does not touch the report path.
+- [x] Add-side response (the entity returned from `addEntity`) is unchanged — `*LineRet` arrays still appear on the create response since `addEntity` doesn't route through `handleQuery`. Existing simulation-store tests (`Item 17 — InvoiceLineAdd → InvoiceLineRet conversion`) still pass.
+- [x] Iterator tests still pass — iterator state on the request element (`@_iterator` / `@_iteratorID` attributes) is unaffected by the IncludeLineItems gate.
+- [x] `npm run build` clean. `npm test` → 11 files / 286 tests passed (was 10 / 244; +1 file `include-line-items.test.ts` with 39 new tests + 3 new tests in `builder-emit-order.test.ts`).
+
+**Documentation criteria**:
+- [x] Tool descriptions on all seven list tools updated to surface the `includeLineItems` arg + its default-off behavior. Per-arg `.describe()` strings mirror the description language for consistency.
+- [x] No `instructions` block change in [src/index.ts](src/index.ts) — `includeLineItems` is a per-tool ergonomics layer, not a new top-level surface.
+- [x] No `DECISIONS.md` change — matches established Phase 6 patterns (default-off opt-in args). The line-strip-by-default behavior matches real QB exactly, so there's no novel sim-fidelity tradeoff to document.
+- [x] No `ARCHITECTURE.md` / `REQUIREMENTS.md` change — this enriches an existing tool surface; no boundary moved, no product behavior redefined.
+- [x] No README tool-count bump — #41 enriches existing tools rather than adding new ones. Tool count remains 75.
+
+**Verification commands**:
+```bash
+npm run build              # TypeScript clean
+npm test                   # 286/286 (incl. 42 net new across include-line-items.test.ts + builder-emit-order.test.ts)
+"" | & node dist/index.js  # Server startup; tool list unchanged at 75
+# Live (Windows + QB) — pending live exercise:
+# Through Claude Desktop: qb_invoice_list({ fromDate: "2024-01-01", toDate: "2024-12-31", includeLineItems: true })
+# Expect: rows from FY2024 invoices each carrying an InvoiceLineRet array with item / qty / rate / amount / TxnLineID per line. Default call without includeLineItems returns same row count, header-only.
+```
+
+**Notes**:
+- Behavior change for any pre-#41 caller that relied on the sim returning lines on `qb_*_list` without the flag: those callers now get header-only by default. The fix is one-line: add `includeLineItems: true` to the call. This is acceptable because (a) live QB had this contract all along — pre-#41 callers in live mode were already getting header-only, (b) the sim was the outlier silently leaking line data, and (c) the personal-tool standard (CLAUDE.md) doesn't require backwards-compatibility shims.
+- The vi.spyOn pattern (now used in 3 test files: iterator.test.ts Layer 8, transaction-list.test.ts, include-line-items.test.ts) is the canonical way to assert tool-layer transformations on the args before they hit the manager. Cleaner than asserting on built XML or sim behavior because it isolates the tool contract.
+- The `JournalEntry` opt-in is a minor scope expansion vs the HANDOFF's six-tool plan. Without it the JE tool description ("Each entry carries JournalDebitLineRet + JournalCreditLineRet arrays") would have become a lie in sim mode (and was already a lie in live mode). Adding the opt-in keeps the contract honest in both modes for trivial extra cost.
+- Per-tool tests live in [tests/include-line-items.test.ts](tests/include-line-items.test.ts) under three describe blocks: (1) sim contract (header-only by default, lines on opt-in), (2) tool layer filter dict (omits / includes / explicit-false handling), (3) sim gate truthy semantics (boolean true, wire string "true", missing). Plus a separate block pinning the `qb_estimate_convert_to_invoice` regression.
+- Wire-level schema-order pins live in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts) — InvoiceQueryRq + BillQueryRq each get their own test (PaidStatus is in the sequence, IncludeLineItems sits after it); JournalEntryQueryRq gets its own (no PaidStatus, IncludeLineItems sits after TxnDateRangeFilter); the four no-PaidStatus types (Estimate / SalesReceipt / CreditMemo / PurchaseOrder) share a looped test because their tail position is identical.
+
+---
+
+### Item 40 — `qb_transaction_list_by_account` _(Phase 10)_ — done 2026-05-09
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] New tool `qb_transaction_list_by_account` registered alongside the rest in [src/tools/transactions.ts](src/tools/transactions.ts) (new file). Wired in [src/index.ts](src/index.ts); tool 75. Top-level `instructions` block documents the surface explicitly (sign convention + sim line-level limitation).
+- [x] Required input: either `accountName` (FullName) or `accountListId`. Calling without either returns `{ success: false, error: "Either accountName or accountListId is required" }` with `isError: true` — does NOT round-trip to the sim / live wire.
+- [x] Optional inputs: `fromDate` / `toDate` (ISO `YYYY-MM-DD`, schema-validated), `maxReturned` (number), `includeRunningBalance` (boolean, default true).
+- [x] Tool layer populates filters in TransactionQueryRq schema-required child order: `MaxReturned → TxnDateRangeFilter → AccountFilter`. Pinned in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts) and verified at the tool layer via `vi.spyOn(session, "queryTransactions")` reading `Object.keys(filters)`.
+- [x] Manager exposes `queryTransactions(filters)` as a thin wrapper over `queryEntity("Transaction", filters)` — keeps the "tools never construct QBXML directly" rule intact (CLAUDE.md). Returns `Record<string, unknown>[]` (TransactionRet rows).
+- [x] Simulation handler `handleTransactionQuery` in [src/session/simulation-store.ts](src/session/simulation-store.ts) routed via `key === "TransactionQueryRq"` (NOT the generic `handleQuery` per-type path, which would hit a non-existent "Transaction" store and return empty). Fans out across Invoice / SalesReceipt / CreditMemo (income via item resolution) + Bill / Check (expense+item lines) + JournalEntry (debit + credit lines with account-natural-direction sign convention). Emits one TransactionRet per matching line with `{ TxnID, TxnType, TxnDate, Account: { FullName }, Amount (signed), RefNumber?, Memo?, Entity: { FullName }?, TimeCreated, TimeModified }`. Sorted by TxnDate ascending with TimeCreated tiebreaker.
+- [x] Sign convention: positive Amount = increases the target account's natural balance. Bill ExpenseLine on Rent Expense (natural-debit) → +Amount. CreditMemo line on Sales Revenue (natural-credit) → -Amount. JE debit on natural-debit account → +Amount; JE debit on natural-credit account → -Amount. Pinned in [tests/transaction-list.test.ts](tests/transaction-list.test.ts).
+- [x] AccountFilter resolves both shapes — `{ FullName }` direct, `{ ListID }` canonicalized to FullName via the Account store. Missing AccountFilter rejects with `statusCode 3120` ("There is a missing element: AccountFilter").
+- [x] Response shape: `{ count, account, fromDate, toDate, currentBalance?, openingBalance?, runningBalanceError?, transactions: TransactionRet[] }`. When `includeRunningBalance` is unset/true and the AccountQueryRq succeeds, every row carries `RunningBalance` in addition to `Amount`.
+- [x] Running-balance math (per HANDOFF guidance): `openingBalance = currentBalance − Σ period postings`, walks forward per row. Exact when `toDate ≥ now`; approximate (overstated by post-period postings) for historical windows — documented limitation in tool description and code comment. `includeRunningBalance: false` opts out of the AccountQueryRq round trip; response then omits `currentBalance` / `openingBalance` / per-row `RunningBalance`.
+- [x] Empty result (no matching rows) returns `{ count: 0, transactions: [] }` (NOT an error) so callers can distinguish "no activity" from "request failed."
+- [x] Tool wraps `queryTransactions` + the optional `queryEntity("Account", ...)` in try/catch translating `QBXMLResponseError` → `{ success: false, statusCode, statusMessage, humanReadable? }` with `isError: true` (Item 25 reference shape). Running-balance failures (e.g. account lookup throws) are caught separately and surfaced as `runningBalanceError` in the otherwise-successful response — the row list is preserved.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] Parser registers `TransactionRet` in `arrayElements` so single-row responses parse as `TransactionRet: [...]` (consistent with every other entity Ret). No other parser change.
+- [x] Generic per-type query path (`handleQuery`) is untouched — the routing change is `if (key === "TransactionQueryRq") handleTransactionQuery else handleQuery`. Per-type list tools (`qb_invoice_list`, `qb_bill_list`, etc.) work identically.
+- [x] The seed snapshot semantics are preserved — `handleAdd` does NOT mutate `Account.Balance` (matches real QB, where `Account.Balance` is computed from posting history rather than incremented in-place). The running-balance test exploits this: after 3 postings totaling +4600 to Rent Expense (seed Balance 24000), the closing RunningBalance walks back to exactly 24000 — confirming opening was correctly computed as `24000 − 4600 = 19400`.
+- [x] `npm run build` clean. `npm test` → 10 files / 244 tests passed (was 9 / 228; +1 file `transaction-list.test.ts` with 15 new tests + 1 new test in `builder-emit-order.test.ts` Layer for the schema-order pin = 16 net additions).
+
+**Documentation criteria**:
+- [x] README "Reports & Queries" table gets a new `qb_transaction_list_by_account` row covering the running-balance algorithm, sign convention, sim line-level limitation, and arg surface. Tool count bumped from 70 → 75 (count was stale by 4 prior tools too — corrected on this change).
+- [x] `instructions` block in [src/index.ts](src/index.ts) gets a dedicated bullet — sits above the Reports section since it's a cross-type query rather than a summary report.
+- [x] No `DECISIONS.md` entry — the cross-type-fanout sim-fidelity tradeoff (line-level only, no implicit AR/AP counter-postings) is documented inline in the tool description and `handleTransactionQuery` jsdoc, not as a sweeping architectural decision. If/when we extend sim to surface implicit counter-postings (Phase 17 banking primitives might force this), a DECISIONS entry will land then.
+- [x] No `ARCHITECTURE.md` change — `queryTransactions` slots alongside `queryEntity` / `queryEntityPaginated` as another method on QBSessionManager; no new layer or boundary introduced.
+- [x] No `REQUIREMENTS.md` change — this exposes existing QB capability rather than redefining product behavior.
+
+**Verification commands**:
+```bash
+npm run build              # TypeScript clean
+npm test                   # 244/244 (incl. 16 net new across transaction-list.test.ts + builder-emit-order.test.ts)
+"" | & node dist/index.js  # Server startup; tool list now includes qb_transaction_list_by_account
+# Live (Windows + QB) — pending live exercise:
+# Through Claude Desktop: qb_transaction_list_by_account({ accountName: "Rent Expense", fromDate: "2024-01-01", toDate: "2024-12-31" })
+# Expect: rows from Bill / Check / JE that posted to Rent Expense in FY2024, sorted by TxnDate, with RunningBalance walking from openingBalance to a value within ±0.01 of the account's current Balance.
+```
+
+**Notes**:
+- Sim emits LINE-LEVEL postings only — the documented first-cut limitation. Filtering the sim by AR / AP / Bank / CC returns empty unless you explicitly post to those accounts via JournalEntry (which DOES carry direct AccountRef). Live QB returns the full posting tree without this limitation. Operators using the sim for dev should populate test scenarios via JE if they need balance-sheet-account postings to surface in this view.
+- The HANDOFF math (`opening = currentBalance − periodSum`) is exact when `toDate ≥ now`. For historical period queries with subsequent postings, the alternative (fetch full history, slice in tool) trades a wider round trip for exact values — deferred. Tool description tells operators to omit `toDate` to skip the approximation.
+- `queryTransactions` is the first cross-type query method on QBSessionManager. If Phase 16 #72 (`qb_transaction_list({ types: [...], filters })`) lands, the same method underlies it — just with `TransactionTypeFilter` populated. Schema-order is already pinned for that future extension.
+- 16 net new tests vs 244 total. The vi.spyOn pattern from #39 (assert filter-dict order before it hits the builder) carries forward — used here to pin TransactionQueryRq schema order at the tool layer in addition to the wire-level pin in builder-emit-order.test.ts.
+
+---
+
+### Item 39 — Pagination DX: default `maxReturned=500` when `paginate: true` _(Phase 9)_ — done 2026-05-09
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] Calling any list tool with `paginate: true` and no `maxReturned` no longer requires the caller to also pass `maxReturned`. The tool layer coalesces an unset `maxReturned` to 500 (QB's effective per-batch cap) before calling `session.queryEntityPaginated`.
+- [x] Default-coalesce applies to all four tools that expose `paginate`: `qb_customer_list`, `qb_invoice_list`, `qb_bill_list`, `qb_item_list`.
+- [x] An explicit `maxReturned` value still wins — `paginate: true, maxReturned: 50` sends `<MaxReturned>50</MaxReturned>`, NOT 500.
+- [x] `iteratorID` alone (without `paginate: true`) also implies pagination, so the same default applies — a Continue call with no `maxReturned` gets 500.
+- [x] Non-paginated calls are untouched — `qb_customer_list({})` still calls `session.queryEntity` with no `MaxReturned` filter (would be a regression to silently inject 500 into the legacy path).
+- [x] Tool descriptions surface the default — `paginate` description ends with "Auto-defaults maxReturned to 500 if unset." and `maxReturned` description notes "Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `qb_customer_list({})` without paginate → no `MaxReturned` filter set; legacy path through `queryEntity` unchanged.
+- [x] `qb_invoice_list({ maxReturned: 25 })` without paginate → `MaxReturned=25` passes through unchanged.
+- [x] `qb_item_list({ paginate: true })` (no `itemType`) still refuses with the structured `{ success: false, error: "..." }` shape from Item 27 — pagination still requires `itemType` regardless of the new default.
+- [x] Schema-required child order in the QBXML envelope is preserved — `MaxReturned` still emits at position 2 (after `TxnID` / `RefNumber` selectors), per the `<xs:sequence>` order pinned in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts).
+- [x] Layer 5 + Layer 6 iterator tool tests in [tests/iterator.test.ts](tests/iterator.test.ts) still pass — pagination Start → Continue → exhausted loop unchanged.
+- [x] `npm run build` passes. `npm test` → 9 files / 228 tests passed (was 9 / 214; +14 new in the new "Layer 8" describe block).
+
+**Documentation criteria**:
+- [x] Tool descriptions on all four tools (`qb_customer_list`, `qb_invoice_list`, `qb_bill_list`, `qb_item_list`) updated to surface the 500 default — both the top-level tool description and the per-arg `paginate` / `maxReturned` `.describe()` strings.
+- [x] No README change needed — pagination cap was already documented as "real QB caps each *QueryRq response at ~500 rows" in the Item 27 entry; the new default just makes that the visible behavior of the tool surface.
+- [x] No `instructions` block update in [src/index.ts](src/index.ts) needed — pagination remains a per-tool ergonomics layer.
+- [x] No `ARCHITECTURE.md` / `DECISIONS.md` / `REQUIREMENTS.md` change — this is a default-value tweak inside an established pattern, no new tradeoff or product behavior.
+
+**Verification commands**:
+```bash
+npm run build              # TypeScript clean
+npm test                   # 228/228 (incl. 14 new in iterator.test.ts Layer 8)
+"" | & node dist/index.js  # Server startup; tool list still includes all four list tools
+```
+
+**Notes**:
+- The "missing element: MaxReturned" error message rewrite (overlapping with Item 65 — better error surfaces) was scoped out of #39 deliberately. With the default in place, callers who pass `paginate: true` alone never hit the error in the first place. Item 65 will still address the error-rewrite for callers who explicitly pass `paginate: true, maxReturned: 0` or otherwise manage to trigger the original QB rejection.
+- Five files touched: [src/tools/customers.ts](src/tools/customers.ts), [src/tools/invoices.ts](src/tools/invoices.ts), [src/tools/bills.ts](src/tools/bills.ts), [src/tools/items.ts](src/tools/items.ts), [tests/iterator.test.ts](tests/iterator.test.ts). No production logic moved between layers — the coalesce sits at the tool handler, NOT at the manager / builder layer, so other paths into `queryEntityPaginated` (e.g. future tools, direct manager use in tests) get explicit control over `MaxReturned` rather than inheriting the default.
+- Phase 9 fully closed with #39. Phase 10 #40 (`qb_transaction_list_by_account`) is the next biggest operator ask and would close out the P0 surface before Phase 11 reports.
+
+---
+
+### Item 38 — `qb_balance_summary` `asOfDate` honored via BS + P&L reports _(Phase 9)_ — done 2026-05-09
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] Tool params replaced: dropped `fromDate` / `toDate` (both were silently ignored pre-#38). New params: `asOfDate` (optional, ISO `YYYY-MM-DD`, defaults to today UTC) + `basis` (optional `"Accrual" | "Cash"`, defaults to `"Accrual"`). Schema still rejects `MM/DD/YYYY` and `YYYY/MM/DD`.
+- [x] Tool sources Asset / Liability / Equity per-account totals from `runReport("BalanceSheetStandard", { toDate: asOfDate, basis })`. Sources Income / Expense per-account totals from `runReport("ProfitAndLossStandard", { toDate: asOfDate, basis })` (no `fromDate` — lifetime through `asOfDate`). Calls are sequential (QBXMLRP2 serializes COM calls; sequential avoids parallel-openSession races in live mode).
+- [x] AccountQuery still runs (single call) to populate the name → AccountType lookup. The 16-way canonical bucketing (Bank → AccountsReceivable → ... → Equity → Income → ... → NonPosting) is preserved by joining the BS / P&L per-account totals back to the chart-of-accounts type.
+- [x] BS Equity synthetic rows (`Net Income`, `Balancing Adjustment (simulation seed gap)`) are filtered out of `balanceSummary` to avoid double-counting. They're already accounted for in `subtotals.netIncome` / `subtotals.equity`.
+- [x] NonPosting accounts (estimates, POs, sales orders) — absent from BS and P&L because they don't post to GL — fall back to `Account.Balance`. Same signal QB itself surfaces on the chart of accounts for these account types.
+- [x] Subtotals come from the report Totals blocks: `assets = bsTotals.TotalAssets`, `liabilities = bsTotals.TotalLiabilities`, `equity = bsTotals.TotalEquity`, `income = pnlTotals.TotalIncome`, `expenses = pnlTotals.TotalExpenses`, `netIncome = pnlTotals.NetIncome`.
+- [x] Response shape: `{ asOfDate, reportBasis, balanceSummary: [{ accountType, accounts, total }], subtotals, totalAccounts }`. The misleading `asOfNote` and `asOfDateRange` from Item 21 are gone.
+- [x] Bucket logic extracted as exported `buildBalanceSummary` in [src/tools/reports.ts](src/tools/reports.ts) for direct unit testing (same pattern as `adaptLiveReportRet`).
+- [x] Tool wrapped in try/catch translating `QBXMLResponseError` → `{ success: false, statusCode, statusMessage, humanReadable? }` with `isError: true` (Item 25 reference shape).
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `qb_balance_summary` (no args) on fresh seed: Bank bucket first, total 165000 (Checking 45k + Savings 120k), AR bucket present @ 26700, AP bucket present @ 3700. `subtotals.assets === 191700`, `subtotals.liabilities === 3700`. Pinned in [tests/balance-summary.test.ts](tests/balance-summary.test.ts).
+- [x] `qb_balance_summary` `subtotals.income / .expenses / .netIncome` now reflect the actual P&L walk. With seed (which carries no invoice / bill line arrays) all three are 0. **Supersedes Item 21's regression criterion of `subtotals.netIncome === -22800`** — that number was read from arbitrary seeded `Account.Balance` fields not backed by transactions; the new value is the truthful walk. [scripts/verify-pickup-2026-04-27.mjs](scripts/verify-pickup-2026-04-27.mjs) updated to assert the new contract (Bank-first @ 165000, `asOfDate` present).
+- [x] `qb_balance_sheet_report` and `qb_pnl_report` unchanged — the new tool composes them rather than replacing them. The 2026-05-09 row-tree adapter ([src/qbxml/parser.ts](src/qbxml/parser.ts) `adaptLiveReportRet`) is now exercised on every `qb_balance_summary` call in live mode.
+- [x] `qb_ar_aging` / `qb_ap_aging` / `qb_company_info` / `qb_account_list` paths unchanged — only `qb_balance_summary` rerouted.
+- [x] `npm run build` passes. `npm test` → 9 files / 214 tests passed (was 8 / 199; +1 file `balance-summary.test.ts` with 15 new tests).
+
+**Documentation criteria**:
+- [x] README "Reports & Queries" table updated — `qb_balance_summary` row reflects the BS + P&L sourcing and the new `asOfDate` / `basis` params.
+- [x] `instructions` block in [src/index.ts](src/index.ts) updated — the `qb_balance_summary / qb_ar_aging / qb_ap_aging` line covers the new BS + P&L composition path explicitly.
+- [x] [DECISIONS.md](DECISIONS.md) entry — "qb_balance_summary sources AS/LI/EQ from BalanceSheetStandard and INC/EXP from ProfitAndLossStandard" — covers the two-report compose, alternatives rejected (drop INC/EXP / sim-only walk / keep `fromDate`), tradeoffs (sim asOfDate advisory for AS/LI/EQ; INC/EXP buckets disappear when P&L empty; two reports per call), and revisit trigger (Item 68 `qb_trial_balance_export`).
+- [x] No `ARCHITECTURE.md` change — the report path was already established (Item 20 + 2026-05-09 adapter). #38 just composes existing primitives.
+
+**Verification commands**:
+```bash
+npm run build              # TypeScript clean
+npm test                   # 214/214 (incl. 15 new in balance-summary.test.ts)
+"" | & node dist/index.js  # Server startup; tool list still includes qb_balance_summary
+# Live (Windows + QB):
+"C:/nvm4w/nodejs/node.exe" scripts/exercise-mcp-live.mjs  # 28/28 read-only tools (was 25/25; +3 balance_summary probes)
+```
+
+**Notes**:
+- Sim caveat preserved: BalanceSheetStandard reads `Account.Balance` for AS/LI/EQ in simulation (snapshot — `asOfDate` is advisory there). The P&L walk IS date-bounded in both modes. Same caveat `qb_balance_sheet_report` already documents.
+- The sim's seeded `Account.Balance` for income / expense accounts (Sales Revenue=185000, Consulting Revenue=72000, etc.) is now ignored by `qb_balance_summary`. The seeded invoices have `Subtotal` but no line arrays — so the P&L walk yields 0. This is the intended truthful behavior; the "phantom AR" $26,700 - the seed gap that the BS Balancing-Adjustment row reconciles - shows up in `subtotals.equity` (188000 = 191700 assets − 3700 liabilities + 0 net income) rather than disappearing silently.
+- Item 39 (`paginate: true` defaulting `maxReturned=500`) is the next quick win after #38; queued in `todo.md`.
+
+---
 
 ### Item 27 — IteratorID / IteratorRemainingCount support on large queries _(Phase 6)_ — done 2026-04-27
 
@@ -424,9 +613,9 @@ node verify_item19.mjs   # 54/54 PASS — see HANDOFF.md "Last Session Summary" 
 
 ---
 
-### Item 21 — `qb_balance_summary` canonical ordering + subtotals + advisory date range _(Phase 5)_ — done 2026-04-26
+### Item 21 — `qb_balance_summary` canonical ordering + subtotals + advisory date range _(Phase 5)_ — done 2026-04-26 — _superseded 2026-05-09 by Item 38_
 
-**Status:** done
+**Status:** done (superseded — `fromDate` / `toDate` were ignored; replaced by Item 38's `asOfDate` + BS / P&L sourcing. The canonical-order bucket contract DOES carry forward; only the data source and date-param shape changed.)
 
 **Behavioral criteria** _(observable, testable, no ambiguity)_:
 - [x] `qb_balance_summary` (no args) returns `balanceSummary` as an **array** (not an object) of `{ accountType, accounts, total }` entries.

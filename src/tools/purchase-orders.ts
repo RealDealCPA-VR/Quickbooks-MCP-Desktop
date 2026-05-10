@@ -71,7 +71,7 @@ export function registerPurchaseOrderTools(
 ): void {
   server.tool(
     "qb_purchase_order_list",
-    "List or search purchase orders in QuickBooks Desktop. POs are non-posting — TotalAmount on each row reflects the committed cost of the line set, not an AP balance (vendor balance only moves when bills are entered against received items).",
+    "List or search purchase orders in QuickBooks Desktop. POs are non-posting — TotalAmount on each row reflects the committed cost of the line set, not an AP balance (vendor balance only moves when bills are entered against received items). By default each row carries header totals only; pass includeLineItems:true to also surface PurchaseOrderLineRet (item, qty, cost, amount, TxnLineID per line).",
     {
       vendorName: z.string().optional().describe("Filter by vendor name"),
       vendorListId: z.string().optional().describe("Filter by vendor ListID"),
@@ -79,6 +79,7 @@ export function registerPurchaseOrderTools(
       refNumber: z.string().optional().describe("Filter by reference/PO number"),
       fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
       toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
+      includeLineItems: z.boolean().optional().describe("When true, each PO row carries its PurchaseOrderLineRet array. Default false — header totals only, matching real QB's *QueryRq default behavior."),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -86,6 +87,8 @@ export function registerPurchaseOrderTools(
       const filters: Record<string, unknown> = {};
 
       // PurchaseOrderQueryRq schema-required child order (see invoices.ts).
+      // IncludeLineItems sits at the tail (after EntityFilter, before
+      // IncludeLinkedTxns).
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
@@ -100,6 +103,7 @@ export function registerPurchaseOrderTools(
       } else if (args.vendorName) {
         filters.EntityFilter = { FullName: args.vendorName };
       }
+      if (args.includeLineItems) filters.IncludeLineItems = true;
 
       try {
         const purchaseOrders = await session.queryEntity("PurchaseOrder", filters);

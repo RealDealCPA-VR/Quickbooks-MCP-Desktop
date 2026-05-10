@@ -57,7 +57,7 @@ export function registerEstimateTools(
 ): void {
   server.tool(
     "qb_estimate_list",
-    "List or search estimates/quotes in QuickBooks Desktop.",
+    "List or search estimates/quotes in QuickBooks Desktop. By default each row carries header totals only; pass includeLineItems:true to also surface EstimateLineRet (item, qty, rate, amount, TxnLineID per line).",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
       customerListId: z.string().optional().describe("Filter by customer ListID"),
@@ -65,6 +65,7 @@ export function registerEstimateTools(
       refNumber: z.string().optional().describe("Filter by reference/estimate number"),
       fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
       toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
+      includeLineItems: z.boolean().optional().describe("When true, each estimate row carries its EstimateLineRet array. Default false — header totals only, matching real QB's *QueryRq default behavior."),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -72,6 +73,8 @@ export function registerEstimateTools(
       const filters: Record<string, unknown> = {};
 
       // EstimateQueryRq schema-required child order (see invoices.ts).
+      // IncludeLineItems sits at the tail (after EntityFilter, before
+      // IncludeLinkedTxns).
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
@@ -86,6 +89,7 @@ export function registerEstimateTools(
       } else if (args.customerName) {
         filters.EntityFilter = { FullName: args.customerName };
       }
+      if (args.includeLineItems) filters.IncludeLineItems = true;
 
       try {
         const estimates = await session.queryEntity("Estimate", filters);
@@ -327,7 +331,13 @@ export function registerEstimateTools(
 
       let matches: Record<string, unknown>[];
       try {
-        matches = await session.queryEntity("Estimate", { TxnID: args.estimateTxnId });
+        // Phase 10 #41 changed *QueryRq to strip *LineRet by default; this
+        // tool reads EstimateLineRet to map onto InvoiceLineAdd, so it must
+        // opt back in explicitly via IncludeLineItems.
+        matches = await session.queryEntity("Estimate", {
+          TxnID: args.estimateTxnId,
+          IncludeLineItems: true,
+        });
       } catch (err) {
         const e = err as { message?: string; statusCode?: number };
         const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);

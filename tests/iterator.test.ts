@@ -7,7 +7,7 @@
 // to verify the source tree directly. Both must pass — they're complementary,
 // not redundant.
 
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import { z } from "zod";
 import { QBSessionManager } from "../src/session/manager.js";
 import {
@@ -330,5 +330,89 @@ describe("Layer 7 — wire-level round-trip (the load-bearing assertion)", () =>
     expect(rs!.statusCode).toBe(1);
     expect("iteratorRemainingCount" in rs!).toBe(false);
     expect("iteratorID" in rs!).toBe(false);
+  });
+});
+
+describe("Layer 8 — Phase 9 #39: maxReturned defaults to 500 when paginate is enabled", () => {
+  // Pre-#39, calling any list tool with `paginate: true` and no `maxReturned`
+  // produced "There is a missing element: MaxReturned" from QB. The tool layer
+  // now coalesces an unset maxReturned to 500 (QB's effective per-batch cap)
+  // whenever pagination is requested. These tests assert the coalesce fires
+  // for every tool that exposes paginate, that an explicit value still wins,
+  // and that the non-paginated path is untouched.
+  //
+  // Asserted via spy on session.queryEntityPaginated so we can read the
+  // `filters` object the manager would have built MaxReturned from. Spying at
+  // the manager layer keeps these tests single-purpose: they pin the tool
+  // contract without depending on builder XML serialization or sim behavior.
+
+  const expectMaxReturned = async (
+    toolName: string,
+    args: Record<string, unknown>,
+    expected: number | undefined,
+  ) => {
+    const spy = vi
+      .spyOn(session, "queryEntityPaginated")
+      .mockResolvedValueOnce({ entities: [] });
+    await callTool(toolName, args);
+    expect(spy).toHaveBeenCalledTimes(1);
+    const filters = spy.mock.calls[0][1] as Record<string, unknown> | undefined;
+    if (expected === undefined) {
+      expect(filters?.MaxReturned).toBeUndefined();
+    } else {
+      expect(filters?.MaxReturned).toBe(expected);
+    }
+    spy.mockRestore();
+  };
+
+  for (const tool of [
+    { name: "qb_customer_list", paginateArgs: { paginate: true } },
+    { name: "qb_invoice_list", paginateArgs: { paginate: true } },
+    { name: "qb_bill_list", paginateArgs: { paginate: true } },
+    { name: "qb_item_list", paginateArgs: { paginate: true, itemType: "Service" } },
+  ]) {
+    it(`${tool.name} paginate:true with no maxReturned → MaxReturned defaults to 500`, async () => {
+      await expectMaxReturned(tool.name, tool.paginateArgs, 500);
+    });
+
+    it(`${tool.name} paginate:true with explicit maxReturned:50 → explicit value wins`, async () => {
+      await expectMaxReturned(tool.name, { ...tool.paginateArgs, maxReturned: 50 }, 50);
+    });
+
+    it(`${tool.name} iteratorID alone (implies paginate) defaults MaxReturned to 500`, async () => {
+      // iteratorID without paginate:true still triggers pagination — the tool
+      // treats iteratorID's presence as the caller being mid-pagination, so
+      // the same MaxReturned default must apply.
+      const args = tool.name === "qb_item_list"
+        ? { iteratorID: "SIM-ITER-test", itemType: "Service" }
+        : { iteratorID: "SIM-ITER-test" };
+      await expectMaxReturned(tool.name, args, 500);
+    });
+  }
+
+  // The non-paginated path goes through session.queryEntity (NOT
+  // queryEntityPaginated), so the spy never fires. We verify this by spying
+  // on queryEntity and confirming filters.MaxReturned was NOT auto-set.
+  it("qb_customer_list without paginate has no MaxReturned default (regression)", async () => {
+    const spy = vi
+      .spyOn(session, "queryEntity")
+      .mockResolvedValueOnce([]);
+    await callTool("qb_customer_list", {});
+    expect(spy).toHaveBeenCalledTimes(1);
+    const filters = spy.mock.calls[0][1] as Record<string, unknown> | undefined;
+    expect(filters?.MaxReturned).toBeUndefined();
+    spy.mockRestore();
+  });
+
+  it("qb_invoice_list without paginate, explicit maxReturned:25 → 25 passes through", async () => {
+    // Sanity: the non-paginated path still honors an explicit maxReturned —
+    // we didn't accidentally rewrite that branch.
+    const spy = vi
+      .spyOn(session, "queryEntity")
+      .mockResolvedValueOnce([]);
+    await callTool("qb_invoice_list", { maxReturned: 25 });
+    const filters = spy.mock.calls[0][1] as Record<string, unknown> | undefined;
+    expect(filters?.MaxReturned).toBe(25);
+    spy.mockRestore();
   });
 });

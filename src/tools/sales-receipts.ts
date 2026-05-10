@@ -58,7 +58,7 @@ export function registerSalesReceiptTools(
 ): void {
   server.tool(
     "qb_sales_receipt_list",
-    "List or search sales receipts (cash sales) in QuickBooks Desktop.",
+    "List or search sales receipts (cash sales) in QuickBooks Desktop. By default each row carries header totals only; pass includeLineItems:true to also surface SalesReceiptLineRet (the per-line breakdown — item, qty, rate, amount, TxnLineID per line).",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
       customerListId: z.string().optional().describe("Filter by customer ListID"),
@@ -66,6 +66,7 @@ export function registerSalesReceiptTools(
       refNumber: z.string().optional().describe("Filter by reference/sales receipt number"),
       fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
       toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
+      includeLineItems: z.boolean().optional().describe("When true, each sales receipt row carries its SalesReceiptLineRet array. Default false — header totals only, matching real QB's *QueryRq default behavior."),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -73,6 +74,8 @@ export function registerSalesReceiptTools(
       const filters: Record<string, unknown> = {};
 
       // SalesReceiptQueryRq schema-required child order (see invoices.ts).
+      // IncludeLineItems sits at the tail (after EntityFilter, before
+      // IncludeLinkedTxns) — SR has no PaidStatus filter.
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
@@ -87,6 +90,7 @@ export function registerSalesReceiptTools(
       } else if (args.customerName) {
         filters.EntityFilter = { FullName: args.customerName };
       }
+      if (args.includeLineItems) filters.IncludeLineItems = true;
 
       try {
         const salesReceipts = await session.queryEntity("SalesReceipt", filters);

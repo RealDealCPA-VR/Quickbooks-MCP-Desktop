@@ -14,7 +14,7 @@
 // to schema-compliant XML.
 
 import { describe, it, expect } from "vitest";
-import { buildQueryRequest } from "../src/qbxml/builder.js";
+import { buildQueryRequest, buildReportRequest } from "../src/qbxml/builder.js";
 
 // Returns the names of `candidates` that appear inside the given request
 // element, sorted by their position in the emitted XML.
@@ -100,6 +100,7 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
       RefNumberFilter: { MatchCriterion: "Contains", RefNumber: "INV" },
       CurrencyFilter: { ListID: "80000010-USD" },
       PaidStatus: "NotPaidOnly",
+      IncludeLineItems: true,
     });
 
     const order = emittedChildOrder(xml, "InvoiceQueryRq", [
@@ -112,6 +113,7 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
       "RefNumberFilter",
       "CurrencyFilter",
       "PaidStatus",
+      "IncludeLineItems",
     ]);
 
     expect(order).toEqual([
@@ -124,6 +126,204 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
       "RefNumberFilter",
       "CurrencyFilter",
       "PaidStatus",
+      "IncludeLineItems",
+    ]);
+  });
+
+  it("BillQueryRq: IncludeLineItems sits at the tail after PaidStatus", () => {
+    // Canonical BillQueryRq <xs:sequence> tail (Phase 10 #41 — pinning the
+    // IncludeLineItems position so a future filter-dict edit in
+    // src/tools/bills.ts cannot silently slot IncludeLineItems before
+    // PaidStatus / EntityFilter and re-introduce the schema-order bug class
+    // for the bill list path.
+    const xml = buildQueryRequest("Bill", {
+      MaxReturned: 100,
+      TxnDateRangeFilter: {
+        FromTxnDate: "2026-01-01",
+        ToTxnDate: "2026-12-31",
+      },
+      EntityFilter: { FullName: "Acme Vendor" },
+      PaidStatus: "NotPaidOnly",
+      IncludeLineItems: true,
+    });
+
+    const order = emittedChildOrder(xml, "BillQueryRq", [
+      "MaxReturned",
+      "TxnDateRangeFilter",
+      "EntityFilter",
+      "PaidStatus",
+      "IncludeLineItems",
+    ]);
+
+    expect(order).toEqual([
+      "MaxReturned",
+      "TxnDateRangeFilter",
+      "EntityFilter",
+      "PaidStatus",
+      "IncludeLineItems",
+    ]);
+  });
+
+  it("EstimateQueryRq / SalesReceiptQueryRq / CreditMemoQueryRq / PurchaseOrderQueryRq: IncludeLineItems sits after EntityFilter (no PaidStatus in the sequence)", () => {
+    // The four no-PaidStatus transaction queries share the same tail position
+    // for IncludeLineItems: after EntityFilter, before IncludeLinkedTxns.
+    // Looped because the body of each test is identical — the schema-order
+    // contract is shared, and one regression suite per shape would just be
+    // four near-duplicate cases.
+    const types = [
+      "Estimate",
+      "SalesReceipt",
+      "CreditMemo",
+      "PurchaseOrder",
+    ] as const;
+    for (const type of types) {
+      const xml = buildQueryRequest(type, {
+        TxnID: "ABC-123",
+        RefNumber: "REF-1",
+        MaxReturned: 50,
+        TxnDateRangeFilter: {
+          FromTxnDate: "2026-01-01",
+          ToTxnDate: "2026-12-31",
+        },
+        EntityFilter: { FullName: "Acme" },
+        IncludeLineItems: true,
+      });
+
+      const order = emittedChildOrder(xml, `${type}QueryRq`, [
+        "TxnID",
+        "RefNumber",
+        "MaxReturned",
+        "TxnDateRangeFilter",
+        "EntityFilter",
+        "IncludeLineItems",
+      ]);
+
+      expect(order, `schema order broken for ${type}QueryRq`).toEqual([
+        "TxnID",
+        "RefNumber",
+        "MaxReturned",
+        "TxnDateRangeFilter",
+        "EntityFilter",
+        "IncludeLineItems",
+      ]);
+    }
+  });
+
+  it("JournalEntryQueryRq: IncludeLineItems sits after TxnDateRangeFilter", () => {
+    // JournalEntryQueryRq tail order (per QBXML 16.0 schema):
+    //   selectors → MaxReturned → ModifiedDateRangeFilter →
+    //   TxnDateRangeFilter → EntityFilter → AccountFilter → RefNumberFilter
+    //   → IncludeLineItems → IncludeLinkedTxns.
+    // src/tools/journal-entries.ts emits the subset MaxReturned →
+    // ModifiedDateRangeFilter → TxnDateRangeFilter → IncludeLineItems —
+    // this test pins it.
+    const xml = buildQueryRequest("JournalEntry", {
+      TxnID: "JE-1",
+      MaxReturned: 50,
+      ModifiedDateRangeFilter: {
+        FromModifiedDate: "2026-01-01T00:00:00",
+        ToModifiedDate: "2026-12-31T23:59:59",
+      },
+      TxnDateRangeFilter: {
+        FromTxnDate: "2026-01-01",
+        ToTxnDate: "2026-12-31",
+      },
+      IncludeLineItems: true,
+    });
+
+    const order = emittedChildOrder(xml, "JournalEntryQueryRq", [
+      "TxnID",
+      "MaxReturned",
+      "ModifiedDateRangeFilter",
+      "TxnDateRangeFilter",
+      "IncludeLineItems",
+    ]);
+
+    expect(order).toEqual([
+      "TxnID",
+      "MaxReturned",
+      "ModifiedDateRangeFilter",
+      "TxnDateRangeFilter",
+      "IncludeLineItems",
+    ]);
+  });
+
+  it("GeneralSummaryReportQueryRq: GeneralSummaryReportType → ReportPeriod → SummarizeColumnsBy → IncludeSubcolumns → ReportBasis", () => {
+    // Canonical GeneralSummaryReportQueryRq <xs:sequence> order, position
+    // numbers per the QBXML 16.0 SDK schema:
+    //   1. GeneralSummaryReportType
+    //   3. ReportPeriod
+    //   13. SummarizeColumnsBy
+    //   14. IncludeSubcolumns
+    //   15. ReportBasis
+    // Operator hit this on 2026-05-09: every qb_pnl_report call returned
+    // statusCode -1 "QuickBooks found an error when parsing the provided XML
+    // text stream" because buildReportRequest emitted ReportBasis at position
+    // 3 — out of order, before SummarizeColumnsBy and IncludeSubcolumns.
+    // Sim never re-emits XML so the regression was invisible until live.
+    const xml = buildReportRequest({
+      reportType: "ProfitAndLossStandard",
+      fromDate: "2026-01-01",
+      toDate: "2026-12-31",
+      basis: "Accrual",
+    });
+
+    const order = emittedChildOrder(xml, "GeneralSummaryReportQueryRq", [
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+
+    expect(order).toEqual([
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+  });
+
+  it("TransactionQueryRq: MaxReturned → TxnDateRangeFilter → AccountFilter", () => {
+    // Canonical TransactionQueryRq <xs:sequence> order, position numbers per
+    // the QBXML 16.0 SDK schema:
+    //   1.  TxnID/TxnIDList (selectors)
+    //   2.  RefNumber / RefNumberCaseSensitive
+    //   3.  MaxReturned
+    //   4.  ModifiedDateRangeFilter
+    //   5.  TxnDateRangeFilter
+    //   6.  EntityFilter
+    //   7.  AccountFilter
+    //   8.  RefNumberFilter
+    //   9.  TransactionTypeFilter
+    //   10. PostedFilter
+    //   11. DetailLevel
+    // src/tools/transactions.ts populates the filter dict in this exact order
+    // (MaxReturned → TxnDateRangeFilter → AccountFilter for the subset it
+    // exposes). This pins that the builder will emit it that way so future
+    // edits cannot silently re-introduce the 2026-05-09 schema-order class
+    // of bug — Phase 9 #37 was the same shape (ReportBasis at child position
+    // 3 instead of 15).
+    const xml = buildQueryRequest("Transaction", {
+      MaxReturned: 500,
+      TxnDateRangeFilter: {
+        FromTxnDate: "2026-01-01",
+        ToTxnDate: "2026-12-31",
+      },
+      AccountFilter: { FullName: "Rent Expense" },
+    });
+
+    const order = emittedChildOrder(xml, "TransactionQueryRq", [
+      "MaxReturned",
+      "TxnDateRangeFilter",
+      "AccountFilter",
+    ]);
+
+    expect(order).toEqual([
+      "MaxReturned",
+      "TxnDateRangeFilter",
+      "AccountFilter",
     ]);
   });
 

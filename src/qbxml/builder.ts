@@ -144,6 +144,18 @@ export function buildModRequest(
  * children rather than the entity-filter shape buildQueryRequest emits — so
  * they get their own builder rather than overloading buildQueryRequest.
  *
+ * Canonical GeneralSummaryReportQueryRq <xs:sequence> order (children that
+ * land on the wire today, position numbers per the QBXML SDK schema):
+ *   1.  GeneralSummaryReportType
+ *   3.  ReportPeriod (FromReportDate, ToReportDate)
+ *   13. SummarizeColumnsBy
+ *   14. IncludeSubcolumns
+ *   15. ReportBasis
+ * Emitting ReportBasis BEFORE SummarizeColumnsBy/IncludeSubcolumns trips
+ * QBXMLRP2 with statusCode -1 "found an error when parsing the provided XML
+ * text stream" — same class as the 2026-05-09 Customer/Invoice schema-order
+ * bugs. Pinned in tests/builder-emit-order.test.ts.
+ *
  * `params` shape:
  *   { reportType, fromDate?, toDate?, basis? }
  * P&L uses fromDate + toDate. Balance Sheet treats toDate as the asOfDate
@@ -171,9 +183,9 @@ export function buildReportRequest(
     body.ReportPeriod = reportPeriod;
   }
 
-  body.ReportBasis = params.basis ?? "Accrual";
   body.SummarizeColumnsBy = "TotalOnly";
   body.IncludeSubcolumns = 0;
+  body.ReportBasis = params.basis ?? "Accrual";
 
   return buildSingleRequest("GeneralSummaryReportQueryRq", body, version);
 }

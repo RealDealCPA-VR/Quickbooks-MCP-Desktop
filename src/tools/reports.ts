@@ -59,6 +59,121 @@ const dateUTC = (s: string): number => {
 const daysBetween = (asOfDate: string, dueDate: string): number =>
   Math.floor((dateUTC(asOfDate) - dateUTC(dueDate)) / 86400000);
 
+// ---------------------------------------------------------------------------
+// Balance summary helper (qb_balance_summary)
+// ---------------------------------------------------------------------------
+
+export type BalanceSummaryReportInput = {
+  Sections?: Array<{ Name?: string; Accounts?: Array<{ Name?: string; Total?: number }> }>;
+  Totals?: Record<string, unknown>;
+};
+
+export type BalanceSummaryAccount = { ListID?: string; FullName?: string; Name?: string; AccountType?: string; Balance?: number };
+
+export type BalanceSummaryOutput = {
+  balanceSummary: Array<{ accountType: string; accounts: string[]; total: number }>;
+  subtotals: { assets: number; liabilities: number; equity: number; income: number; expenses: number; netIncome: number };
+};
+
+// Synthetic rows that BalanceSheetStandard injects for accounting-identity
+// reconciliation — already captured in subtotals; including them in
+// balanceSummary would double-count.
+const BALANCE_SUMMARY_SYNTHETIC_ROWS = new Set([
+  "Net Income",
+  "Balancing Adjustment (simulation seed gap)",
+]);
+
+/**
+ * Bucket BalanceSheetStandard + ProfitAndLossStandard report output into the
+ * 16-way canonical-AccountType shape qb_balance_summary surfaces. Pure
+ * function so the bucket/round/fallback logic can be unit-tested without
+ * spinning up an MCP transport. NonPosting accounts fall back to
+ * Account.Balance (not in either report — they don't post to GL); BS Equity
+ * "Net Income" / "Balancing Adjustment" pseudo-rows are filtered (already
+ * accounted for in subtotals).
+ */
+export function buildBalanceSummary(
+  accounts: ReadonlyArray<BalanceSummaryAccount | Record<string, unknown>>,
+  bsRet: BalanceSummaryReportInput,
+  pnlRet: BalanceSummaryReportInput
+): BalanceSummaryOutput {
+  const typeByName = new Map<string, string>();
+  for (const a of accounts) {
+    const rec = a as Record<string, unknown>;
+    const name = String(rec.FullName ?? rec.Name ?? "");
+    if (name) typeByName.set(name, String(rec.AccountType ?? ""));
+  }
+
+  const bsSections = bsRet.Sections ?? [];
+  const pnlSections = pnlRet.Sections ?? [];
+  const bsTotals = bsRet.Totals ?? {};
+  const pnlTotals = pnlRet.Totals ?? {};
+
+  const buckets = new Map<string, { name: string; balance: number }[]>();
+  const addToBucket = (type: string, name: string, balance: number): void => {
+    const list = buckets.get(type);
+    if (list) list.push({ name, balance });
+    else buckets.set(type, [{ name, balance }]);
+  };
+
+  for (const section of [...bsSections, ...pnlSections]) {
+    if (!section?.Accounts) continue;
+    for (const acct of section.Accounts) {
+      const name = String(acct?.Name ?? "");
+      if (!name || BALANCE_SUMMARY_SYNTHETIC_ROWS.has(name)) continue;
+      const type = typeByName.get(name) ?? "Unknown";
+      addToBucket(type, name, Number(acct?.Total ?? 0));
+    }
+  }
+
+  // NonPosting accounts (estimates / POs / sales orders) don't post to GL
+  // and don't appear in BS or P&L. Source from Account.Balance — same
+  // signal QB itself surfaces on the chart of accounts for these types.
+  for (const a of accounts) {
+    const rec = a as Record<string, unknown>;
+    if (String(rec.AccountType ?? "") !== "NonPosting") continue;
+    const name = String(rec.FullName ?? rec.Name ?? "");
+    if (!name) continue;
+    addToBucket("NonPosting", name, Number(rec.Balance ?? 0));
+  }
+
+  const balanceSummary: BalanceSummaryOutput["balanceSummary"] = [];
+  const usedTypes = new Set<string>();
+  for (const type of CANONICAL_ACCOUNT_TYPES) {
+    const items = buckets.get(type);
+    if (!items || items.length === 0) continue;
+    usedTypes.add(type);
+    balanceSummary.push({
+      accountType: type,
+      accounts: items.map((i) => i.name),
+      total: round2(items.reduce((s, i) => s + i.balance, 0)),
+    });
+  }
+
+  const otherAccounts: string[] = [];
+  let otherTotal = 0;
+  for (const [type, items] of buckets) {
+    if (usedTypes.has(type)) continue;
+    for (const i of items) otherAccounts.push(`${i.name} [${type}]`);
+    otherTotal += items.reduce((s, i) => s + i.balance, 0);
+  }
+  if (otherAccounts.length > 0) {
+    balanceSummary.push({ accountType: "Other", accounts: otherAccounts, total: round2(otherTotal) });
+  }
+
+  return {
+    balanceSummary,
+    subtotals: {
+      assets: round2(Number(bsTotals.TotalAssets ?? 0)),
+      liabilities: round2(Number(bsTotals.TotalLiabilities ?? 0)),
+      equity: round2(Number(bsTotals.TotalEquity ?? 0)),
+      income: round2(Number(pnlTotals.TotalIncome ?? 0)),
+      expenses: round2(Number(pnlTotals.TotalExpenses ?? 0)),
+      netIncome: round2(Number(pnlTotals.NetIncome ?? 0)),
+    },
+  };
+}
+
 export function registerReportTools(
   server: McpServer,
   getSession: () => QBSessionManager
@@ -248,80 +363,61 @@ export function registerReportTools(
   // -----------------------------------------------------------------------
   // Balance summary
   // -----------------------------------------------------------------------
+  // asOfDate is honored end-to-end: AS/LI/EQ figures come from
+  // BalanceSheetStandard (toDate=asOfDate) and INC/EXP figures come from
+  // ProfitAndLossStandard (lifetime → asOfDate). Both reports already work
+  // in live mode via the row-tree adapter (see DECISIONS.md 2026-05-09).
+  // The 16-way canonical AccountType bucketing is preserved by joining the
+  // BS/P&L per-account totals back to AccountType via a name → type lookup
+  // populated from a single AccountQuery — BS only emits 3 sections
+  // (Assets/Liabilities/Equity) so the join is required to surface the
+  // sub-types (Bank, AccountsReceivable, FixedAsset, …) the tool promises.
+  //
+  // Simulation caveat: sim's BS draws AS/LI/EQ from Account.Balance (a
+  // snapshot — see qb_balance_sheet_report jsdoc) so asOfDate is advisory
+  // for those buckets in sim. The P&L walk IS date-bounded in both modes.
+  // NonPosting accounts (estimates, POs, sales orders) don't appear in BS
+  // or P&L so they're sourced from Account.Balance directly — that's the
+  // only signal available, and matches how QB itself reports them on the
+  // chart of accounts.
   server.tool(
     "qb_balance_summary",
-    "Get a balance summary across all accounts, grouped by AccountType in canonical QB order (Assets → Liabilities → Equity → Income → Expenses → NonPosting) with category subtotals (assets, liabilities, equity, income, expenses, netIncome). Optional fromDate/toDate are advisory in simulation mode (the seeded Balance is a current snapshot — historical reconstruction lands with the P&L / Balance Sheet work).",
+    "Balance summary across all accounts as of a specified date, grouped by AccountType in canonical QB order (Assets → Liabilities → Equity → Income → Expenses → NonPosting) with category subtotals (assets, liabilities, equity, income, expenses, netIncome). Asset/Liability/Equity figures are sourced from BalanceSheetStandard (toDate=asOfDate); Income/Expense figures are sourced from ProfitAndLossStandard (lifetime through asOfDate). NonPosting accounts fall back to Account.Balance (the only available signal — they don't post to GL). Note: in simulation mode, BalanceSheetStandard reads Account.Balance for AS/LI/EQ (a snapshot, so asOfDate is advisory for those buckets); the P&L walk IS date-bounded in both modes.",
     {
-      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Optional start of reporting window (YYYY-MM-DD). Advisory in simulation mode — see asOfNote in the response."),
-      toDate: z.string().regex(ISO_DATE_RE).optional().describe("Optional end of reporting window (YYYY-MM-DD). Advisory in simulation mode — see asOfNote in the response."),
+      asOfDate: z.string().regex(ISO_DATE_RE).optional().describe("As-of date (YYYY-MM-DD). Defaults to today. Used as toDate for both the BalanceSheetStandard run and the lifetime-through-asOfDate P&L walk."),
+      basis: z.enum(["Accrual", "Cash"]).optional().describe("Accounting basis. Defaults to Accrual."),
     },
-    async ({ fromDate, toDate }) => {
+    async ({ asOfDate, basis }) => {
       const session = getSession();
       try {
+        const effectiveAsOf = asOfDate ?? new Date().toISOString().split("T")[0];
+        const effectiveBasis = basis ?? "Accrual";
+
         const accounts = await session.queryEntity("Account", {});
 
-        const buckets = new Map<string, { name: string; balance: number }[]>();
-        for (const acct of accounts) {
-          const type = String(acct.AccountType ?? "Unknown");
-          const entry = {
-            name: String(acct.FullName ?? acct.Name ?? ""),
-            balance: Number(acct.Balance ?? 0),
-          };
-          const list = buckets.get(type);
-          if (list) list.push(entry);
-          else buckets.set(type, [entry]);
-        }
+        // BS first, then P&L (sequential — QBXMLRP2 serializes COM calls
+        // anyway, and avoiding parallel openSession races in live mode).
+        const bsRet = await session.runReport("BalanceSheetStandard", {
+          toDate: effectiveAsOf,
+          basis: effectiveBasis,
+        });
+        const pnlRet = await session.runReport("ProfitAndLossStandard", {
+          toDate: effectiveAsOf,
+          basis: effectiveBasis,
+        });
 
-        const balanceSummary: { accountType: string; accounts: string[]; total: number }[] = [];
-        const usedTypes = new Set<string>();
-        for (const type of CANONICAL_ACCOUNT_TYPES) {
-          const items = buckets.get(type);
-          if (!items || items.length === 0) continue;
-          usedTypes.add(type);
-          balanceSummary.push({
-            accountType: type,
-            accounts: items.map((i) => i.name),
-            total: round2(items.reduce((s, i) => s + i.balance, 0)),
-          });
-        }
-
-        const otherAccounts: string[] = [];
-        let otherTotal = 0;
-        for (const [type, items] of buckets) {
-          if (usedTypes.has(type)) continue;
-          for (const i of items) otherAccounts.push(`${i.name} [${type}]`);
-          otherTotal += items.reduce((s, i) => s + i.balance, 0);
-        }
-        if (otherAccounts.length > 0) {
-          balanceSummary.push({ accountType: "Other", accounts: otherAccounts, total: round2(otherTotal) });
-        }
-
-        const sumOf = (types: readonly string[]) =>
-          types.reduce((s, t) => s + (buckets.get(t)?.reduce((ss, i) => ss + i.balance, 0) ?? 0), 0);
-
-        const income = sumOf(INCOME_TYPES);
-        const expenses = sumOf(EXPENSE_TYPES);
-        const subtotals = {
-          assets: round2(sumOf(ASSET_TYPES)),
-          liabilities: round2(sumOf(LIABILITY_TYPES)),
-          equity: round2(sumOf(EQUITY_TYPES)),
-          income: round2(income),
-          expenses: round2(expenses),
-          netIncome: round2(income - expenses),
-        };
-
-        const dateRangeRequested = Boolean(fromDate || toDate);
-        const asOfDateRange = dateRangeRequested ? { from: fromDate ?? null, to: toDate ?? null } : null;
-        const asOfNote = dateRangeRequested
-          ? "Simulation mode: Balance reflects current snapshot, not the requested date range. Historical reconstruction requires walking transactions per account — pending Phase 5 P&L / Balance Sheet work."
-          : undefined;
+        const { balanceSummary, subtotals } = buildBalanceSummary(
+          accounts as BalanceSummaryAccount[],
+          bsRet as BalanceSummaryReportInput,
+          pnlRet as BalanceSummaryReportInput
+        );
 
         return {
           content: [{
             type: "text" as const,
             text: JSON.stringify({
-              asOfDateRange,
-              asOfNote,
+              asOfDate: effectiveAsOf,
+              reportBasis: effectiveBasis,
               balanceSummary,
               subtotals,
               totalAccounts: accounts.length,
@@ -337,7 +433,7 @@ export function registerReportTools(
             text: JSON.stringify({
               success: false,
               statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "AccountQueryRq failed",
+              statusMessage: e.message ?? "qb_balance_summary failed",
               ...(humanReadable ? { humanReadable } : {}),
             }),
           }],

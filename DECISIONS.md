@@ -29,6 +29,58 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-09 — qb_balance_summary sources AS/LI/EQ from BalanceSheetStandard and INC/EXP from ProfitAndLossStandard
+
+**Chosen:** Phase 9 #38 reroutes [src/tools/reports.ts](src/tools/reports.ts) `qb_balance_summary` from a direct `Account.Balance` snapshot read to two `runReport` calls: `BalanceSheetStandard` (toDate=asOfDate) for asset/liability/equity figures, and `ProfitAndLossStandard` (lifetime through asOfDate) for income/expense figures. The resulting per-account totals are bucketed back into the 16-way canonical `AccountType` order via a name→type lookup populated from a single `AccountQuery`. NonPosting accounts (estimates, POs, sales orders) — absent from both reports — fall back to `Account.Balance`. The old `fromDate` / `toDate` params are replaced with `asOfDate` + `basis`; the misleading `asOfNote` is dropped.
+
+**Why:** The pre-#38 implementation accepted `fromDate` / `toDate` and silently ignored them, returning a current-snapshot `Account.Balance` rollup with an `asOfNote` admitting the gap ("Balance reflects current snapshot, not the requested date range. Historical reconstruction requires walking transactions per account — pending Phase 5 P&L / Balance Sheet work."). That admission shipped 2026-04-26 because per-account historical reconstruction was unbuilt. The 2026-05-09 row-tree adapter (DECISIONS.md entry above) made the BS + P&L reports reliable in live mode end-to-end, so the unblocker for `asOfDate` had landed — the tool just needed to be rerouted through the same path. Operator-reported P0 (live data was wrong without warning).
+
+The 16-way canonical bucketing (Bank, AccountsReceivable, OtherCurrentAsset, … Equity, Income, COGS, Expense, NonPosting) is preserved by joining the BS/P&L per-account totals to the chart-of-accounts type via a single `AccountQuery` snapshot. BS only emits 3 sections (Assets/Liabilities/Equity) so the join is required to surface the sub-types the tool's contract promises.
+
+**Alternatives rejected:**
+- **Walk transactions per account in simulation mode, defer fully-correct historical balances to live.** Doubles the surface — sim-only path is its own walker; live path uses BS report anyway. Cleaner conceptually but two reconciliation regimes is one more than necessary now that the live-mode BS adapter exists.
+- **Drop the income/expense buckets entirely.** Pure BS-only output would simplify the implementation by half. Rejected because the existing tool surface includes `subtotals.income` / `subtotals.expenses` / `subtotals.netIncome` and consumers expect them. P&L is an extra `runReport` call but cheap (QBXMLRP2 serializes COM calls anyway, so the wire pipeline is unchanged).
+- **Keep `fromDate` / `toDate` for back-compat.** The old params returned wrong data, so callers that passed them were already getting an incorrect response; renaming to `asOfDate` makes the new contract explicit and prevents the schema-permissive "I passed a date and the tool answered, so it must be honored" failure mode.
+
+**Tradeoffs / consequences:**
+- **Sim asOfDate is partially advisory.** Sim `BalanceSheetStandard` reads `Account.Balance` for AS/LI/EQ — same caveat `qb_balance_sheet_report` already documents. The P&L walk IS date-bounded in both modes. The tool description and the sim integration tests in [tests/balance-summary.test.ts](tests/balance-summary.test.ts) both note this.
+- **Income/Expense buckets disappear when the P&L walk yields no leaves.** Pre-#38 the buckets were always populated from `Account.Balance` (often arbitrary seed numbers). Post-#38 they reflect actual transaction activity, so an empty seed produces no Income/Expense buckets and `subtotals.netIncome === 0`. This is the intended truthful signal — but an existing pickup-script regression (`scripts/verify-pickup-2026-04-27.mjs` was checking `netIncome === -22800`) was updated to assert the new contract (Bank-first @ 165000, `asOfDate` present).
+- **Two reports per call** (vs one `AccountQuery` previously). On a real QB box this is two extra QBXMLRP2 round trips. Acceptable — `qb_balance_sheet_report` and `qb_pnl_report` already do this in two separate calls if the operator wants both, so no new latency floor.
+- **`Net Income` / `Balancing Adjustment (simulation seed gap)` rows from BS Equity** are filtered out of `balanceSummary` (they'd otherwise land under the "Unknown" → "Other" bucket). They're already accounted for in `subtotals.netIncome` and `subtotals.equity`; surfacing them as account rows would double-count.
+- **Bucket logic is extracted as exported `buildBalanceSummary`** in [src/tools/reports.ts](src/tools/reports.ts) and unit-tested directly in [tests/balance-summary.test.ts](tests/balance-summary.test.ts). Same pattern as `adaptLiveReportRet` — pure function, fixture-driven tests, no MCP transport spin-up.
+
+**Revisit when:** Item 68 (`qb_trial_balance_export`) lands. Trial Balance is the more complete report (debit/credit per account as of a date, including Income/Expense as period totals). Once it ships, `qb_balance_summary` may be a thin wrapper over it, or merge entirely.
+
+---
+
+## 2026-05-09 — Live report shape adapted at the parser layer, not at each tool
+
+**Chosen:** Live QB returns reports as a row tree (`TextRow` / `DataRow` / `SubtotalRow` / `TotalRow` under `<ReportData>`); simulation emits a flat `{ Sections, Totals }` shape directly. Both are now normalized to the same flat shape inside [src/qbxml/parser.ts](src/qbxml/parser.ts) `extractReportData` via a new `adaptLiveReportRet` helper. Tool handlers (`qb_pnl_report`, `qb_balance_sheet_report`) read identical shapes regardless of mode.
+
+**Why:** Two halves of a 2026-05-09 P&L bug:
+1. Schema-order: `buildReportRequest` emitted `ReportBasis` at child position 3, but QB's `<xs:sequence>` requires it at position 15 (after `SummarizeColumnsBy` + `IncludeSubcolumns`). Same regression class as the May-9 Customer/Invoice bugs. Fixed in builder + pinned in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts).
+2. Adapter: even after the parse error cleared, live returned the row tree instead of `{Sections, Totals}` so every report came back empty. The parser's docstring had flagged this as deferred ("lands with the COM wiring") but it never landed.
+
+The adapter lives at the parser layer (one place, both reports benefit) rather than per-tool (would have meant duplicating row-walking logic in two tools and any future report tool). Detection is intrinsic — `ReportData` present + `Sections` absent → live shape; otherwise pass through. No mode-aware branching required at the call sites.
+
+The adapter trusts QB's labelled subtotals (`Total Income`, `TOTAL ASSETS`, `Net Income`, etc.) rather than recomputing from the leaves it surfaces. This preserves QB's accounting semantics — most importantly `GrossProfit = Income − COGS` (NOT including Other Income), which the simulation gets wrong (sim sums Income + Other Income for `TotalIncome` and uses that in GrossProfit). Treating QB's labels as authoritative means live output reflects what an operator sees in QB Desktop, even where that diverges from sim's computed values.
+
+Live section names ("Expense", "Other Expense") are normalized to sim's plural ("Expenses", "Other Expenses") so the two modes produce identical Section.Name values. The architectural rule — "live and simulation should produce QBXML responses with the same shape" — extends to field-value contracts where reasonable.
+
+**Alternatives rejected:**
+- **Adapt at each tool.** Would have put two near-identical row-walking functions in [src/tools/reports.ts](src/tools/reports.ts). Future report tools (sales-by-customer, GL, etc., Phase 11) would each need their own. Parser-layer adapter is the single seam.
+- **Make sim emit the row-tree shape too.** Cleaner symmetry, but a much larger sim refactor (every section becomes a TextRow + n DataRows + closing SubtotalRow; sim has no notion of row numbers). Out of proportion to the bug.
+- **Recompute totals from leaf sums.** Tempting, but real QB's `Gross Profit` and `Net Ordinary Income` are derived using accounting conventions (which classes of "Other" income/expense to include) that aren't trivially re-derivable. Trusting QB's labelled values means we ship correct values today; the day a derivation diverges from QB's, the leaves are still there for the consumer to inspect.
+
+**Tradeoffs / consequences:**
+- The simulation's `GrossProfit` formula is now known-wrong relative to live (sim: `TotalIncome − TotalCOGS` where `TotalIncome` includes Other Income; live: `Income − COGS` only). Filed as a sim-fidelity gap (Phase 11+, not blocking).
+- The adapter detects report kind (P&L vs BS) by inspecting which canonical TextRow labels appear, not by `ReportTitle` (which varies by QB locale). Adding new report kinds (Cash Flow, GL, etc.) means extending `PNL_SECTION_NAMES` / `BS_SECTION_NAMES` or introducing a new map.
+- `TextRow` labels QB emits in non-English locales would not match the canonical-name maps. Acceptable for a single-operator US-edition tool; future internationalization would require a label-resolution layer.
+
+**Revisit when:** Phase 11 lands the next report (`qb_general_ledger`, `qb_sales_by_customer_summary`, etc.) and the adapter pattern needs to scale beyond two report kinds.
+
+---
+
 ## 2026-05-09 — Company switching reseeds the simulation store
 
 **Chosen:** `QBSessionManager.switchCompanyFile(path)` (driving `qb_company_open`) ALWAYS instantiates a fresh `SimulationStore` when running in simulation mode, even when the new path matches a previously-opened path. Mutations made against company A while the sim was active are unrecoverable once the session switches to B and back to A.

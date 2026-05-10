@@ -78,6 +78,12 @@ export class SimulationStore {
 
       if (key === "GeneralSummaryReportQueryRq") {
         responses.push(this.handleReportQuery(key, reqData));
+      } else if (key === "TransactionQueryRq") {
+        // TransactionQueryRq is a CROSS-TYPE query — fans out across every
+        // transaction store and emits per-line postings as TransactionRet.
+        // The generic handleQuery would treat it as a per-type query against
+        // a "Transaction" store (which doesn't exist) and return empty.
+        responses.push(this.handleTransactionQuery(key, reqData));
       } else if (key.endsWith("QueryRq")) {
         responses.push(this.handleQuery(key, reqData));
       } else if (key.endsWith("AddRq")) {
@@ -264,6 +270,22 @@ export class SimulationStore {
       results = results.slice(0, Number(reqData.MaxReturned));
     }
 
+    // IncludeLineItems gate (Phase 10 #41). Real QB strips *LineRet from
+    // *QueryRq responses unless <IncludeLineItems>true</IncludeLineItems> is
+    // present on the request. The simulation stores entities with their full
+    // *LineRet arrays (handleAdd populates them), so we mirror QB's strip
+    // here — no-op on list entities (Customer/Vendor/Item don't carry *LineRet
+    // keys), behavioral on transaction entities (Invoice/Bill/SR/CM/PO/Estimate).
+    // Truthy check accepts both boolean true (in-process tests passing the
+    // filter dict directly) and the string "true" (the wire form after a
+    // round trip through the parser).
+    const includeLineItems =
+      reqData.IncludeLineItems === true ||
+      String(reqData.IncludeLineItems ?? "").toLowerCase() === "true";
+    if (!includeLineItems) {
+      results = results.map((e) => this.stripLineRetKeys(e));
+    }
+
     if (results.length === 0) {
       const empty: QBXMLResponseBody = {
         type: rsType,
@@ -380,6 +402,228 @@ export class SimulationStore {
       statusSeverity: "Info",
       statusMessage: "Status OK",
       data: { ReportRet: reportRet },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Cross-type transaction query — TransactionQueryRq
+  // -----------------------------------------------------------------------
+
+  // Synthesizes per-line postings as TransactionRet rows. Real QB returns one
+  // TransactionRet per posting line filtered by AccountFilter; the simulation
+  // mirrors that contract by fanning out across every transaction store and
+  // emitting rows whose resolved line-level account matches the target.
+  //
+  // Sign convention: positive Amount = increases the target account's natural
+  // balance, negative = decreases. For income/expense lines this collapses to
+  // the txn-type sign (Invoice/SR/Bill +; CreditMemo -); for JE lines the sign
+  // depends on the account's natural direction (debit on a natural-debit
+  // account vs credit on a natural-credit account).
+  //
+  // First-cut limitation (sim only — live QB returns full posting detail):
+  // emits LINE-LEVEL postings only. Implicit counter-postings (AR side of an
+  // invoice, AP side of a bill, Bank side of a check, DepositTo side of a
+  // ReceivePayment, etc.) are NOT surfaced. This means filtering the sim by
+  // a balance-sheet account (AR / AP / Bank / CC) returns empty even when
+  // those accounts have real activity. Operators relying on live QB get the
+  // full picture; operators using the sim for dev should populate via JE if
+  // they need balance-sheet account postings to surface in this view.
+  private handleTransactionQuery(
+    reqType: string,
+    reqData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const rsType = "TransactionQueryRs";
+
+    // AccountFilter is required (real QB rejects with statusCode 3120 if
+    // missing) — mirror that. Other filters are all optional.
+    const accountFilter = (reqData.AccountFilter ?? null) as
+      | Record<string, unknown>
+      | null;
+    if (!accountFilter || (!accountFilter.FullName && !accountFilter.ListID)) {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage:
+          "There is a missing element: AccountFilter (TransactionQueryRq requires AccountFilter)",
+        data: {},
+      };
+    }
+
+    // Lines store account by FullName (resolveLineAccount returns FullName);
+    // canonicalize ListID → FullName via the Account store before matching.
+    let targetName: string | null = null;
+    if (accountFilter.FullName) {
+      targetName = String(accountFilter.FullName);
+    } else if (accountFilter.ListID) {
+      const acct = this.getStore("Account").get(String(accountFilter.ListID));
+      if (acct) targetName = String(acct.FullName ?? acct.Name ?? "");
+    }
+    if (!targetName) {
+      return {
+        type: rsType,
+        statusCode: 1,
+        statusSeverity: "Info",
+        statusMessage:
+          "A query request did not find a matching object in QuickBooks",
+        data: {},
+      };
+    }
+
+    const dr = reqData.TxnDateRangeFilter as
+      | Record<string, unknown>
+      | undefined;
+    const fromDate = dr?.FromTxnDate ? String(dr.FromTxnDate) : null;
+    const toDate = dr?.ToTxnDate ? String(dr.ToTxnDate) : null;
+    const inDateWindow = (txnDate: string): boolean => {
+      if (fromDate && txnDate < fromDate) return false;
+      if (toDate && txnDate > toDate) return false;
+      return true;
+    };
+
+    // JE sign lookup — natural-debit accounts post +debit/-credit; natural-
+    // credit accounts post +credit/-debit. Cached once per query.
+    const accountStore = this.getStore("Account");
+    const accountTypeByName = new Map<string, string>();
+    for (const a of accountStore.values()) {
+      const name = String(a.FullName ?? a.Name ?? "");
+      if (name) accountTypeByName.set(name, String(a.AccountType ?? ""));
+    }
+    const NATURAL_DEBIT = new Set([
+      "Bank", "AccountsReceivable", "OtherCurrentAsset", "Inventory",
+      "FixedAsset", "OtherAsset", "CostOfGoodsSold", "Expense", "OtherExpense",
+    ]);
+    const targetType = accountTypeByName.get(targetName) ?? "";
+    const targetIsNaturalDebit = NATURAL_DEBIT.has(targetType);
+
+    const rows: StoredEntity[] = [];
+
+    const emit = (
+      txn: StoredEntity,
+      txnType: string,
+      amount: number,
+      memo?: string
+    ): void => {
+      if (!Number.isFinite(amount) || amount === 0) return;
+      const txnDate = String(txn.TxnDate ?? "");
+      if (!inDateWindow(txnDate)) return;
+      const entityRef = (txn.CustomerRef ?? txn.VendorRef ?? txn.EntityRef) as
+        | Record<string, unknown>
+        | undefined;
+      const row: StoredEntity = {
+        TxnID: String(txn.TxnID ?? ""),
+        TxnType: txnType,
+        TxnDate: txnDate,
+        Account: { FullName: targetName! },
+        Amount: Math.round(amount * 100) / 100,
+        ...(txn.RefNumber !== undefined ? { RefNumber: String(txn.RefNumber) } : {}),
+        ...(memo !== undefined
+          ? { Memo: memo }
+          : txn.Memo !== undefined
+            ? { Memo: String(txn.Memo) }
+            : {}),
+        ...(entityRef?.FullName
+          ? { Entity: { FullName: String(entityRef.FullName) } }
+          : {}),
+        ...(txn.TimeCreated !== undefined
+          ? { TimeCreated: String(txn.TimeCreated) }
+          : {}),
+        ...(txn.TimeModified !== undefined
+          ? { TimeModified: String(txn.TimeModified) }
+          : {}),
+      };
+      rows.push(row);
+    };
+
+    const walkLines = (
+      storeName: string,
+      txnType: string,
+      lineKey: string,
+      direction: "income" | "expense",
+      sign: 1 | -1
+    ): void => {
+      for (const txn of this.getStore(storeName).values()) {
+        const lines = txn[lineKey];
+        if (!Array.isArray(lines)) continue;
+        for (const line of lines as Record<string, unknown>[]) {
+          const accountName = this.resolveLineAccount(line, direction);
+          if (accountName !== targetName) continue;
+          const amt = Number(line.Amount ?? 0);
+          if (!Number.isFinite(amt) || amt === 0) continue;
+          emit(txn, txnType, sign * amt, line.Memo ? String(line.Memo) : undefined);
+        }
+      }
+    };
+
+    // Income side — Invoice/SR positive, CreditMemo negative.
+    walkLines("Invoice", "Invoice", "InvoiceLineRet", "income", 1);
+    walkLines("SalesReceipt", "SalesReceipt", "SalesReceiptLineRet", "income", 1);
+    walkLines("CreditMemo", "CreditMemo", "CreditMemoLineRet", "income", -1);
+
+    // Expense side — Bill/Check expense AND item lines.
+    walkLines("Bill", "Bill", "ExpenseLineRet", "expense", 1);
+    walkLines("Bill", "Bill", "ItemLineRet", "expense", 1);
+    walkLines("Check", "Check", "ExpenseLineRet", "expense", 1);
+    walkLines("Check", "Check", "ItemLineRet", "expense", 1);
+
+    // Journal entries — line.AccountRef.FullName matches target; sign is the
+    // account's natural direction (debit on a natural-debit account = +).
+    for (const je of this.getStore("JournalEntry").values()) {
+      const debitLines = Array.isArray(je.JournalDebitLineRet)
+        ? (je.JournalDebitLineRet as Record<string, unknown>[])
+        : [];
+      const creditLines = Array.isArray(je.JournalCreditLineRet)
+        ? (je.JournalCreditLineRet as Record<string, unknown>[])
+        : [];
+      for (const line of debitLines) {
+        const ref = line.AccountRef as Record<string, unknown> | undefined;
+        if (!ref || String(ref.FullName ?? "") !== targetName) continue;
+        const amt = Number(line.Amount ?? 0);
+        if (!Number.isFinite(amt) || amt === 0) continue;
+        const sign = targetIsNaturalDebit ? 1 : -1;
+        emit(je, "JournalEntry", sign * amt, line.Memo ? String(line.Memo) : undefined);
+      }
+      for (const line of creditLines) {
+        const ref = line.AccountRef as Record<string, unknown> | undefined;
+        if (!ref || String(ref.FullName ?? "") !== targetName) continue;
+        const amt = Number(line.Amount ?? 0);
+        if (!Number.isFinite(amt) || amt === 0) continue;
+        const sign = targetIsNaturalDebit ? -1 : 1;
+        emit(je, "JournalEntry", sign * amt, line.Memo ? String(line.Memo) : undefined);
+      }
+    }
+
+    // Stable chronological ordering — TxnDate ascending, TimeCreated as the
+    // tiebreaker so same-date postings walk in insertion order.
+    rows.sort((a, b) => {
+      const ad = String(a.TxnDate ?? "");
+      const bd = String(b.TxnDate ?? "");
+      if (ad !== bd) return ad < bd ? -1 : 1;
+      const at = String(a.TimeCreated ?? "");
+      const bt = String(b.TimeCreated ?? "");
+      return at < bt ? -1 : at > bt ? 1 : 0;
+    });
+
+    const max = reqData.MaxReturned ? Number(reqData.MaxReturned) : null;
+    const trimmed = max && max > 0 ? rows.slice(0, max) : rows;
+
+    if (trimmed.length === 0) {
+      return {
+        type: rsType,
+        statusCode: 1,
+        statusSeverity: "Info",
+        statusMessage:
+          "A query request did not find a matching object in QuickBooks",
+        data: {},
+      };
+    }
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { TransactionRet: trimmed },
     };
   }
 
@@ -2107,6 +2351,26 @@ export class SimulationStore {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(data)) {
       if (!keys.has(k)) out[k] = v;
+    }
+    return out;
+  }
+
+  // Drops *LineRet / *LinesRet keys from a stored transaction entity.
+  // Used by handleQuery to enforce the IncludeLineItems contract: real QB
+  // omits line arrays from *QueryRq responses unless explicitly requested.
+  // Header-level totals (Subtotal / AmountDue / BalanceRemaining / IsPaid)
+  // stay — those are computed from the lines but are HEADER fields. JE
+  // posting lines (JournalDebitLineRet / JournalCreditLineRet) are also
+  // dropped: they match the *LineRet pattern via the regex. AppliedToTxnRet
+  // does NOT match (no "Line" segment) and is preserved — appliedTo is a
+  // header-level relationship, not a line breakdown.
+  private stripLineRetKeys(
+    entity: StoredEntity
+  ): StoredEntity {
+    const out: StoredEntity = {};
+    for (const [k, v] of Object.entries(entity)) {
+      if (/Line(s?)Ret$/.test(k)) continue;
+      out[k] = v;
     }
     return out;
   }

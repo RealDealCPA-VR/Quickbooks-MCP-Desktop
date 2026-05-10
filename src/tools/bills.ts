@@ -99,7 +99,7 @@ export function registerBillTools(
 ): void {
   server.tool(
     "qb_bill_list",
-    "List or search bills (accounts payable) in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0.",
+    "List or search bills (accounts payable) in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface ExpenseLineRet + ItemLineRet (account/amount on the expense lines, item/qty/cost on item lines).",
     {
       vendorName: z.string().optional().describe("Filter by vendor name"),
       vendorListId: z.string().optional().describe("Filter by vendor ListID"),
@@ -108,17 +108,26 @@ export function registerBillTools(
       toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date filter (YYYY-MM-DD)"),
       paidStatus: z.enum(["All", "PaidOnly", "NotPaidOnly"]).optional()
         .describe("Filter by payment status"),
-      maxReturned: z.number().optional().describe("Maximum results"),
-      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID."),
+      includeLineItems: z.boolean().optional().describe("When true, each bill row carries its ExpenseLineRet + ItemLineRet arrays. Default false — header totals only, matching real QB's *QueryRq default behavior."),
+      maxReturned: z.number().optional().describe("Maximum results. Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
       iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
     },
     async (args) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Pagination requires MaxReturned — QB rejects iterator requests without it
+      // ("There is a missing element: MaxReturned"). Default to 500 (QB's
+      // effective per-batch cap) when paginate is on but no value was supplied.
+      const effectiveMaxReturned =
+        args.maxReturned ?? (args.paginate || args.iteratorID ? 500 : undefined);
+
       // BillQueryRq schema-required child order (see invoices.ts).
+      // IncludeLineItems sits at the tail of the sequence (after PaidStatus,
+      // before IncludeLinkedTxns).
       if (args.txnId) filters.TxnID = args.txnId;
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (effectiveMaxReturned) filters.MaxReturned = effectiveMaxReturned;
       if (args.fromDate || args.toDate) {
         filters.TxnDateRangeFilter = { FromTxnDate: args.fromDate, ToTxnDate: args.toDate };
       }
@@ -128,6 +137,7 @@ export function registerBillTools(
         filters.EntityFilter = { FullName: args.vendorName };
       }
       if (args.paidStatus) filters.PaidStatus = args.paidStatus;
+      if (args.includeLineItems) filters.IncludeLineItems = true;
 
       try {
         if (args.paginate || args.iteratorID) {

@@ -144,6 +144,24 @@ try {
     ["qb_journal_entry_list", { fromDate: "2019-01-01", toDate: "2026-12-31", maxReturned: 5 }, "TxnDateRange+MaxReturned"],
     ["qb_payment_list", { fromDate: "2019-01-01", toDate: "2026-12-31", maxReturned: 5 }, "DateRange+MaxReturned"],
     ["qb_bill_payment_list", { fromDate: "2019-01-01", toDate: "2026-12-31", maxReturned: 5 }, "DateRange+MaxReturned"],
+
+    // Report tools — GeneralSummaryReportQueryRq schema-sequence probes.
+    // Same class of bug as the txn-list filters above: an out-of-order child
+    // returns the cryptic statusCode -1 "found an error when parsing the
+    // provided XML text stream" against live QBXMLRP2 only. Item 37 (P&L)
+    // hit this on 2026-05-09 — ReportBasis was at position 3 instead of
+    // position 15 (after SummarizeColumnsBy + IncludeSubcolumns).
+    ["qb_pnl_report", {}, "no params"],
+    ["qb_pnl_report", { fromDate: "2024-01-01", toDate: "2024-12-31" }, "DateRange"],
+    ["qb_pnl_report", { fromDate: "2024-01-01", toDate: "2024-12-31", basis: "Cash" }, "DateRange+Cash"],
+    ["qb_balance_sheet_report", {}, "no params"],
+    ["qb_balance_sheet_report", { asOfDate: "2024-12-31" }, "asOfDate"],
+    // Phase 9 #38 — qb_balance_summary now sources AS/LI/EQ from
+    // BalanceSheetStandard and INC/EXP from ProfitAndLossStandard, so it
+    // exercises the row-tree adapter on both reports in one call.
+    ["qb_balance_summary", {}, "no params"],
+    ["qb_balance_summary", { asOfDate: "2024-12-31" }, "asOfDate"],
+    ["qb_balance_summary", { asOfDate: "2024-12-31", basis: "Cash" }, "asOfDate+Cash"],
   ];
   let failures = 0;
   for (const [name, args, label] of checks) {

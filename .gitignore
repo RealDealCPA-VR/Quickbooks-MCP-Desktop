@@ -4,3 +4,6 @@ dist/
 .env
 .env.local
 .DS_Store
+# Live-capture diagnostic dumps from scripts/capture-pnl-shape.mjs and
+# similar — contain real company financial data, never commit.
+scripts/.*-dump.json

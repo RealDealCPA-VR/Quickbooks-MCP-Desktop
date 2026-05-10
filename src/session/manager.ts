@@ -391,6 +391,29 @@ export class QBSessionManager {
     };
   }
 
+  /**
+   * Cross-type transaction query (TransactionQueryRq). Distinct from queryEntity
+   * because TransactionQueryRq is NOT a per-type query — one envelope returns
+   * postings from any transaction type (Invoice, Bill, Check, JournalEntry, …)
+   * filtered primarily by AccountFilter. Real QB returns one TransactionRet per
+   * posting line, with TxnType discriminating which underlying transaction
+   * shape produced it.
+   *
+   * Schema-required filter sequence per QBXML 16.0 SDK:
+   *   TxnID? → MaxReturned? → ModifiedDateRangeFilter? → TxnDateRangeFilter? →
+   *   EntityFilter? → AccountFilter → RefNumberFilter? → TransactionTypeFilter? →
+   *   PostedFilter? → DetailLevel? → IncludeRetElement? → OwnerID?
+   * Callers MUST populate the filter dict in this order — buildQueryRequest
+   * preserves insertion order (pinned by tests/builder-emit-order.test.ts), so
+   * out-of-order keys would surface as the live "found an error when parsing"
+   * statusCode -1 class of bug.
+   */
+  async queryTransactions(
+    filters: Record<string, unknown> = {}
+  ): Promise<Record<string, unknown>[]> {
+    return this.queryEntity("Transaction", filters);
+  }
+
   async addEntity(
     entityType: string,
     data: Record<string, unknown>

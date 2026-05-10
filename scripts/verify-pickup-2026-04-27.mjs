@@ -103,19 +103,27 @@ const log = (label, pass, detail = "") => {
   );
 }
 
-// 4. qb_balance_summary regression — netIncome === -22800
+// 4. qb_balance_summary regression — Bank first @ 165000, asOfDate honored
+//    Pre-Phase-9-#38 (2026-05-09) this asserted netIncome === -22800 read
+//    from seeded Account.Balance fields. Post-#38 the tool sources INC/EXP
+//    from a P&L walk (the seeded invoices carry no line arrays, so the
+//    walk yields 0). The new contract: Bank is first, totals to 165000,
+//    and the response carries asOfDate (defaulted to today) instead of
+//    the old asOfNote/asOfDateRange.
 {
   const r = await call("qb_balance_summary", {});
   const b = r.body;
   const groups = Array.isArray(b.balanceSummary) ? b.balanceSummary.map((g) => g.accountType) : [];
+  const bank = b.balanceSummary?.find?.((g) => g.accountType === "Bank");
   const ok =
     !r.isError &&
-    b.subtotals?.netIncome === -22800 &&
-    groups[0] === "Bank";
+    bank?.total === 165000 &&
+    groups[0] === "Bank" &&
+    typeof b.asOfDate === "string";
   log(
     "qb_balance_summary regression",
     ok,
-    `netIncome=${b.subtotals?.netIncome} firstGroup=${groups[0]} groupCount=${groups.length}`
+    `bankTotal=${bank?.total} firstGroup=${groups[0]} asOfDate=${b.asOfDate}`
   );
 }
 

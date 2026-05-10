@@ -53,7 +53,7 @@ export function registerInvoiceTools(
 ): void {
   server.tool(
     "qb_invoice_list",
-    "List or search invoices in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0.",
+    "List or search invoices in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface InvoiceLineRet (the per-line breakdown — item, qty, rate, amount, TxnLineID).",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
       customerListId: z.string().optional().describe("Filter by customer ListID"),
@@ -63,23 +63,31 @@ export function registerInvoiceTools(
       toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date filter (YYYY-MM-DD)"),
       paidStatus: z.enum(["All", "PaidOnly", "NotPaidOnly"]).optional()
         .describe("Filter by payment status"),
-      maxReturned: z.number().optional().describe("Maximum results"),
-      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID."),
+      includeLineItems: z.boolean().optional().describe("When true, each invoice row carries its InvoiceLineRet array (item, qty, rate, amount, TxnLineID per line). Default false — header totals only, matching real QB's *QueryRq default behavior."),
+      maxReturned: z.number().optional().describe("Maximum results. Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
       iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
     },
     async (args) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
+      // Pagination requires MaxReturned — QB rejects iterator requests without it
+      // ("There is a missing element: MaxReturned"). Default to 500 (QB's
+      // effective per-batch cap) when paginate is on but no value was supplied.
+      const effectiveMaxReturned =
+        args.maxReturned ?? (args.paginate || args.iteratorID ? 500 : undefined);
+
       // InvoiceQueryRq schema-required child order (see DECISIONS.md
       // 2026-05-09): TxnID/RefNumber selectors → MaxReturned →
       // ModifiedDateRangeFilter → TxnDateRangeFilter → EntityFilter →
-      // AccountFilter → RefNumberFilter → CurrencyFilter → PaidStatus.
-      // Out-of-order children get rejected with the cryptic "QuickBooks
-      // found an error when parsing the provided XML text stream".
+      // AccountFilter → RefNumberFilter → CurrencyFilter → PaidStatus →
+      // IncludeLineItems → IncludeLinkedTxns. Out-of-order children get
+      // rejected with the cryptic "QuickBooks found an error when parsing
+      // the provided XML text stream".
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
-      if (args.maxReturned) filters.MaxReturned = args.maxReturned;
+      if (effectiveMaxReturned) filters.MaxReturned = effectiveMaxReturned;
       if (args.fromDate || args.toDate) {
         filters.TxnDateRangeFilter = {
           FromTxnDate: args.fromDate,
@@ -92,6 +100,7 @@ export function registerInvoiceTools(
         filters.EntityFilter = { FullName: args.customerName };
       }
       if (args.paidStatus) filters.PaidStatus = args.paidStatus;
+      if (args.includeLineItems) filters.IncludeLineItems = true;
 
       try {
         if (args.paginate || args.iteratorID) {

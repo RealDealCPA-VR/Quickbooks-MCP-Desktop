@@ -77,7 +77,7 @@ export function registerCreditMemoTools(
 ): void {
   server.tool(
     "qb_credit_memo_list",
-    "List or search credit memos in QuickBooks Desktop. Each row carries TotalAmount (the credit's face value), AppliedAmount (the portion already applied to invoices), and RemainingValue = TotalAmount − AppliedAmount (the unapplied credit available to apply via qb_credit_memo_apply).",
+    "List or search credit memos in QuickBooks Desktop. Each row carries TotalAmount (the credit's face value), AppliedAmount (the portion already applied to invoices), and RemainingValue = TotalAmount − AppliedAmount (the unapplied credit available to apply via qb_credit_memo_apply). By default each row carries header totals only; pass includeLineItems:true to also surface CreditMemoLineRet (the per-line breakdown).",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
       customerListId: z.string().optional().describe("Filter by customer ListID"),
@@ -85,6 +85,7 @@ export function registerCreditMemoTools(
       refNumber: z.string().optional().describe("Filter by reference/credit memo number"),
       fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start date (YYYY-MM-DD)"),
       toDate: z.string().regex(ISO_DATE_RE).optional().describe("End date (YYYY-MM-DD)"),
+      includeLineItems: z.boolean().optional().describe("When true, each credit memo row carries its CreditMemoLineRet array. Default false — header totals only, matching real QB's *QueryRq default behavior."),
       maxReturned: z.number().optional().describe("Maximum results"),
     },
     async (args) => {
@@ -92,6 +93,8 @@ export function registerCreditMemoTools(
       const filters: Record<string, unknown> = {};
 
       // CreditMemoQueryRq schema-required child order (see invoices.ts).
+      // IncludeLineItems sits at the tail (after EntityFilter, before
+      // IncludeLinkedTxns) — CM has no PaidStatus filter.
       if (args.txnId) filters.TxnID = args.txnId;
       if (args.refNumber) filters.RefNumber = args.refNumber;
       if (args.maxReturned) filters.MaxReturned = args.maxReturned;
@@ -106,6 +109,7 @@ export function registerCreditMemoTools(
       } else if (args.customerName) {
         filters.EntityFilter = { FullName: args.customerName };
       }
+      if (args.includeLineItems) filters.IncludeLineItems = true;
 
       try {
         const creditMemos = await session.queryEntity("CreditMemo", filters);

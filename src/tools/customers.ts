@@ -19,18 +19,25 @@ export function registerCustomerTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_customer_list",
-    "List or search customers in QuickBooks. Returns customer records matching filters. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0.",
+    "List or search customers in QuickBooks. Returns customer records matching filters. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset.",
     {
       nameFilter: z.string().optional().describe("Filter customers by name (partial match)"),
       activeOnly: z.boolean().optional().describe("Only return active customers (default true)"),
-      maxReturned: z.number().optional().describe("Maximum number of results (default 100)"),
+      maxReturned: z.number().optional().describe("Maximum number of results. Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."),
       listId: z.string().optional().describe("Fetch a specific customer by ListID"),
-      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID."),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
       iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
     },
     async ({ nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
+
+      // Pagination requires MaxReturned — QB rejects iterator requests without it
+      // ("There is a missing element: MaxReturned"). Default to 500 (QB's
+      // effective per-batch cap) when the caller flips paginate on but doesn't
+      // specify a value, so `paginate: true` alone is a usable contract.
+      const effectiveMaxReturned =
+        maxReturned ?? (paginate || iteratorID ? 500 : undefined);
 
       // QBXML schema for CustomerQueryRq (and every other *QueryRq with the
       // standard filter sequence) requires children in this order, per the
@@ -45,8 +52,8 @@ export function registerCustomerTools(
       if (listId) {
         filters.ListID = listId;
       }
-      if (maxReturned) {
-        filters.MaxReturned = maxReturned;
+      if (effectiveMaxReturned) {
+        filters.MaxReturned = effectiveMaxReturned;
       }
       if (activeOnly !== false) {
         filters.ActiveStatus = "ActiveOnly";
