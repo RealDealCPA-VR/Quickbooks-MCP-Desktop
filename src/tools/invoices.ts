@@ -353,4 +353,186 @@ export function registerInvoiceTools(
       }
     }
   );
+
+  // Phase 12 #57a — workflow stand-in for #45 (memorized transactions, which
+  // QBXML doesn't expose at any version). Same outcome as right-click "Use"
+  // on a QB-Desktop memorized template: read source invoice's lines, submit
+  // a fresh InvoiceAddRq with the carried CustomerRef + lines and operator-
+  // supplied overrides. Composite tool — no new wire types. Real QB has no
+  // single "duplicate" RPC; this is two QBXML calls (Query + Add) glued
+  // together at the tool layer. Mirrors qb_estimate_convert_to_invoice's
+  // shape; differs in carry policy — TxnDate / DueDate / RefNumber are NOT
+  // carried by default (a duplicate is a NEW invoice on a NEW date; carrying
+  // them creates ref-number collisions and misleading due dates).
+  server.tool(
+    "qb_invoice_duplicate",
+    "Duplicate an existing invoice in QuickBooks Desktop. Reads the source invoice's CustomerRef + lines (and optional ClassRef / TermsRef / SalesRepRef / PORefNumber on the header) and submits a fresh InvoiceAddRq with that payload plus operator-supplied overrides. Carries by default: CustomerRef, ClassRef, TermsRef, SalesRepRef, PORefNumber, lines. Does NOT carry: TxnDate (default = today), DueDate, RefNumber (a duplicate needs a fresh number — supply it via refNumber or let QB autonumber), Memo (defaults to 'Duplicate of <source ref or TxnID>'). Use this for the monthly-retainer billing pattern (last month's invoice → this month's), or to retarget a one-off invoice at a different customer via customerName/customerListId. Composite tool — uses existing Invoice query + add primitives, no new wire request types. Read-only sessions reject with statusCode 9001 (the InvoiceAddRq half is gated). Source invoice not found returns statusCode 500.",
+    {
+      sourceTxnId: z.string().describe("TxnID of the invoice to duplicate"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Date for the new invoice (YYYY-MM-DD). Default: today. The source invoice's TxnDate is NOT carried — duplicating to the same date is rarely what you want."),
+      dueDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Due date for the new invoice (YYYY-MM-DD). The source invoice's DueDate is NOT carried (it's relative to TxnDate; carrying makes no sense for a different date)."),
+      refNumber: z.string().optional()
+        .describe("Reference/invoice number for the new invoice. The source invoice's RefNumber is NOT carried — duplicates need fresh numbers to avoid collisions. Leave blank to let QB autonumber (when enabled in QB preferences)."),
+      memo: z.string().optional()
+        .describe("Memo for the new invoice. Default: 'Duplicate of <source ref or TxnID>'."),
+      customerName: z.string().optional()
+        .describe("Retarget the duplicate at a different customer by full name. Default: source invoice's CustomerRef."),
+      customerListId: z.string().optional()
+        .describe("Retarget the duplicate at a different customer by ListID. Default: source invoice's CustomerRef."),
+      idempotencyKey: z.string().min(1).optional()
+        .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+    },
+    async (args) => {
+      const session = getSession();
+
+      let matches: Record<string, unknown>[];
+      try {
+        // Phase 10 #41 made *QueryRq strip *LineRet by default; this tool
+        // reads InvoiceLineRet to map onto InvoiceLineAdd, so it must opt
+        // back in explicitly.
+        matches = await session.queryEntity("Invoice", {
+          TxnID: args.sourceTxnId,
+          IncludeLineItems: true,
+        });
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceQueryRq (duplicate source read) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const source = matches[0];
+      if (!source) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 500,
+              statusMessage: `Source invoice "${args.sourceTxnId}" not found`,
+              humanReadable: qbStatusCodeMessage(500),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      // CustomerRef from operator override; fall back to source. The source's
+      // CustomerRef should always be populated (real QB requires it on every
+      // invoice), but guard anyway in case a malformed live response surfaces.
+      let customerRef: Record<string, unknown> | undefined;
+      if (args.customerListId) {
+        customerRef = { ListID: args.customerListId };
+      } else if (args.customerName) {
+        customerRef = { FullName: args.customerName };
+      } else {
+        customerRef = source.CustomerRef as Record<string, unknown> | undefined;
+      }
+      if (!customerRef) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Source invoice "${args.sourceTxnId}" has no CustomerRef and no override supplied`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const invoiceData: Record<string, unknown> = {
+        CustomerRef: customerRef,
+      };
+
+      // Header carry-overs. Real QB invoices can carry ClassRef / TermsRef /
+      // SalesRepRef / PORefNumber on the header — we surface them on
+      // duplicate even though qb_invoice_create doesn't accept them yet
+      // (they could be present on invoices loaded from a live QB file).
+      // Mirrors the convert-estimate-to-invoice carry list.
+      const carryFields = ["ClassRef", "TermsRef", "SalesRepRef", "PORefNumber"] as const;
+      for (const field of carryFields) {
+        if (source[field] !== undefined) {
+          invoiceData[field] = source[field];
+        }
+      }
+
+      if (args.txnDate) invoiceData.TxnDate = args.txnDate;
+      if (args.dueDate) invoiceData.DueDate = args.dueDate;
+      if (args.refNumber) invoiceData.RefNumber = args.refNumber;
+
+      const sourceLabel = source.RefNumber
+        ? String(source.RefNumber)
+        : String(source.TxnID ?? args.sourceTxnId);
+      invoiceData.Memo = args.memo ?? `Duplicate of ${sourceLabel}`;
+
+      // Map InvoiceLineRet → InvoiceLineAdd. TxnLineID is a return-side
+      // identifier and is intentionally NOT carried — the new invoice
+      // generates its own line IDs. ClassRef on the line carries when present.
+      // Header-only source (no lines) is allowed — produces a header-only
+      // duplicate.
+      const sourceLines = Array.isArray(source.InvoiceLineRet)
+        ? (source.InvoiceLineRet as Record<string, unknown>[])
+        : source.InvoiceLineRet
+          ? [source.InvoiceLineRet as Record<string, unknown>]
+          : [];
+
+      if (sourceLines.length > 0) {
+        invoiceData.InvoiceLineAdd = sourceLines.map((line) => {
+          const lineData: Record<string, unknown> = {};
+          if (line.ItemRef) lineData.ItemRef = line.ItemRef;
+          if (line.Desc !== undefined) lineData.Desc = line.Desc;
+          if (line.Quantity !== undefined) lineData.Quantity = line.Quantity;
+          if (line.Rate !== undefined) lineData.Rate = line.Rate;
+          if (line.Amount !== undefined) lineData.Amount = line.Amount;
+          if (line.ClassRef) lineData.ClassRef = line.ClassRef;
+          return lineData;
+        });
+      }
+
+      try {
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Invoice", invoiceData, args.idempotencyKey)
+          : { entity: await session.addEntity("Invoice", invoiceData), replayed: false };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              sourceTxnId: args.sourceTxnId,
+              invoice: result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceAddRq (duplicate) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
 }

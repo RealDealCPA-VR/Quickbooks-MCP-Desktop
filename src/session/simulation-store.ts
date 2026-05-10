@@ -109,6 +109,15 @@ export class SimulationStore {
           response = this.handleQuery(key, reqData);
         } else if (key.endsWith("AddRq")) {
           response = this.handleAdd(key, reqData);
+        } else if (key === "ClearedStatusModRq") {
+          // ClearedStatusMod is the bank-reconciliation primitive (Phase 10
+          // #46). Structurally distinct from entity *ModRq — targets a single
+          // TxnID and flips a single field. Handler walks the bank-affecting
+          // transaction stores to locate the txn, since the request body has
+          // no TxnDelType-style discriminator. This branch must precede the
+          // `endsWith("ModRq")` catch-all (handleMod) which would otherwise
+          // try to derive a "ClearedStatus" entity type and look for ListID.
+          response = this.handleClearedStatusMod(reqData);
         } else if (key.endsWith("ModRq")) {
           response = this.handleMod(key, reqData);
         } else if (key === "ListDelRq") {
@@ -1072,6 +1081,19 @@ export class SimulationStore {
     // Set FullName from Name if applicable
     if (addData.Name && !addData.FullName) {
       entity.FullName = String(addData.Name);
+    }
+
+    // Bank-affecting txns get an explicit NotCleared default on creation
+    // (matches real QB — every new check / deposit / transfer / CC charge
+    // starts uncleared and flips to Cleared via the reconciliation flow).
+    // Caller-supplied ClearedStatus wins (handleClearedStatusMod is the
+    // canonical path, but tests / seed fixtures may need to set the field
+    // up front).
+    if (
+      SimulationStore.BANK_AFFECTING_TXN_TYPES.includes(entityType) &&
+      entity.ClearedStatus === undefined
+    ) {
+      entity.ClearedStatus = "NotCleared";
     }
 
     const finalEntity = isTransaction
@@ -2557,6 +2579,194 @@ export class SimulationStore {
       statusSeverity: "Info",
       statusMessage: "Status OK",
       data: { TxnDelType: entityType, TxnID: txnID },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // ClearedStatusMod handler (Phase 10 #46 — bank rec primitive)
+  // -----------------------------------------------------------------------
+
+  // Bank-affecting transaction types — the only types real QB allows
+  // ClearedStatusModRq against. The header-level posting on each of these
+  // hits a Bank or CreditCard account, so the txn carries a meaningful
+  // cleared status on its own (not per-split-line). Order matters only for
+  // the lookup walk; first-match wins.
+  //
+  // Excluded intentionally: Invoice, Bill, SalesReceipt, CreditMemo,
+  // PurchaseOrder, Estimate, JournalEntry (CC/Bank exposure only happens
+  // through their AppliedTo / payment-linked txns, NOT through their own
+  // header — real QB rejects ClearedStatusMod against them with 3120).
+  private static readonly BANK_AFFECTING_TXN_TYPES = [
+    "Check",
+    "BillPaymentCheck",
+    "BillPaymentCreditCard",
+    "Deposit",
+    "Transfer",
+    "CreditCardCharge",
+    "CreditCardCredit",
+  ];
+
+  private handleClearedStatusMod(
+    reqData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const rsType = "ClearedStatusModRs";
+
+    // fast-xml-parser surfaces the wrapped block under ClearedStatusMod; the
+    // session manager always builds the wrapped form. Be defensive against
+    // both shapes so direct in-process callers (tests) can pass the inner
+    // dict if convenient.
+    const mod = (reqData.ClearedStatusMod ?? reqData) as Record<string, unknown>;
+
+    const txnId = mod.TxnID !== undefined ? String(mod.TxnID) : "";
+    const txnLineId = mod.TxnLineID !== undefined ? String(mod.TxnLineID) : null;
+    const clearedStatus = mod.ClearedStatus !== undefined
+      ? String(mod.ClearedStatus)
+      : "";
+
+    if (!txnId) {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage:
+          "There is a missing element: TxnID (ClearedStatusModRq requires TxnID)",
+        data: {},
+      };
+    }
+
+    if (
+      clearedStatus !== "Cleared" &&
+      clearedStatus !== "NotCleared" &&
+      clearedStatus !== "Pending"
+    ) {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage:
+          `Invalid ClearedStatus value: ${clearedStatus || "(missing)"} (must be Cleared, NotCleared, or Pending)`,
+        data: {},
+      };
+    }
+
+    // Walk bank-affecting stores to locate the target txn. First-match wins;
+    // a TxnID under a non-bank-affecting store (Invoice/Bill/JE) returns 3120
+    // ("transaction type does not support cleared status") matching real QB.
+    let target: StoredEntity | null = null;
+    let targetType: string | null = null;
+    for (const t of SimulationStore.BANK_AFFECTING_TXN_TYPES) {
+      const hit = this.getStore(t).get(txnId);
+      if (hit) {
+        target = hit;
+        targetType = t;
+        break;
+      }
+    }
+
+    if (!target) {
+      // Distinguish "TxnID exists but the txn type doesn't support cleared
+      // status" (3120) from "TxnID doesn't exist anywhere" (500). Probe the
+      // non-bank-affecting stores to make the distinction.
+      const otherTxnTypes = [
+        "Invoice", "Bill", "SalesReceipt", "CreditMemo",
+        "PurchaseOrder", "Estimate", "JournalEntry", "ReceivePayment",
+        "SalesOrder",
+      ];
+      for (const t of otherTxnTypes) {
+        if (this.getStore(t).has(txnId)) {
+          return {
+            type: rsType,
+            statusCode: 3120,
+            statusSeverity: "Error",
+            statusMessage:
+              `Transaction "${txnId}" is a ${t} — ClearedStatusMod is only valid against bank-affecting transactions (Check, BillPaymentCheck, BillPaymentCreditCard, Deposit, Transfer, CreditCardCharge, CreditCardCredit)`,
+            data: {},
+          };
+        }
+      }
+      return {
+        type: rsType,
+        statusCode: 500,
+        statusSeverity: "Error",
+        statusMessage:
+          `Transaction "${txnId}" specified in the request cannot be found`,
+        data: {},
+      };
+    }
+
+    // TxnLineID-targeted update: flip the cleared status on a single line in
+    // the txn's *LineRet array. Real QB allows this for split-line txns like
+    // Deposit (DepositLineRet) and Check (ExpenseLineRet / ItemLineRet) where
+    // each split line is its own posting. The line is identified by matching
+    // TxnLineID across every *LineRet-shaped array on the txn. If no match,
+    // 3120 (caller named a line that doesn't exist).
+    if (txnLineId) {
+      let matched = false;
+      const updatedTxn: StoredEntity = { ...target };
+      for (const [k, v] of Object.entries(updatedTxn)) {
+        if (!/Line(s?)Ret$/.test(k) || !Array.isArray(v)) continue;
+        const lines = v as Record<string, unknown>[];
+        const newLines = lines.map((l) => {
+          if (String(l.TxnLineID ?? "") === txnLineId) {
+            matched = true;
+            return { ...l, ClearedStatus: clearedStatus };
+          }
+          return l;
+        });
+        updatedTxn[k] = newLines;
+      }
+      if (!matched) {
+        return {
+          type: rsType,
+          statusCode: 3120,
+          statusSeverity: "Error",
+          statusMessage:
+            `TxnLineID "${txnLineId}" not found on transaction "${txnId}"`,
+          data: {},
+        };
+      }
+      updatedTxn.TimeModified = new Date().toISOString();
+      updatedTxn.EditSequence = this.nextEditSequence();
+      this.getStore(targetType!).set(txnId, updatedTxn);
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: {
+          ClearedStatusRet: {
+            TxnID: txnId,
+            TxnLineID: txnLineId,
+            ClearedStatus: clearedStatus,
+            TimeModified: updatedTxn.TimeModified,
+          },
+        },
+      };
+    }
+
+    // Header-level update: flip the txn's ClearedStatus field. The default
+    // for newly-created bank-affecting txns is NotCleared (see seedData /
+    // handleAdd) so this is the typical path for the reconcile flow.
+    const updatedTxn: StoredEntity = {
+      ...target,
+      ClearedStatus: clearedStatus,
+      TimeModified: new Date().toISOString(),
+      EditSequence: this.nextEditSequence(),
+    };
+    this.getStore(targetType!).set(txnId, updatedTxn);
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: {
+        ClearedStatusRet: {
+          TxnID: txnId,
+          ClearedStatus: clearedStatus,
+          TimeModified: updatedTxn.TimeModified,
+        },
+      },
     };
   }
 

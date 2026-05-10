@@ -23,6 +23,7 @@ import {
   buildModRequest,
   buildDeleteRequest,
   buildReportRequest,
+  buildClearedStatusModRequest,
 } from "../qbxml/builder.js";
 import {
   parseQBXMLResponse,
@@ -889,6 +890,53 @@ export class QBSessionManager {
       });
     }
     return { results, replayed: false };
+  }
+
+  /**
+   * Mark a transaction (or specific line within a split transaction) as
+   * Cleared / NotCleared / Pending in QuickBooks. Wraps `ClearedStatusModRq`,
+   * the canonical bank-reconciliation primitive — set against bank/credit-card
+   * affecting transactions (Check, BillPaymentCheck, BillPaymentCreditCard,
+   * Deposit, Transfer, CreditCardCharge, CreditCardCredit), this is how the
+   * QB Desktop UI's reconciliation screen actually flips cleared status under
+   * the hood.
+   *
+   * Routed through the typed-mutation pipeline (assertWritable gate applies),
+   * so a session opened with `readOnly: true` rejects with `QBReadOnlyError`
+   * (statusCode 9001) before any envelope is built. The idempotency cache is
+   * intentionally NOT applied here — the operation is naturally idempotent
+   * (setting Cleared on a Cleared transaction is a no-op in real QB) and
+   * fingerprinting cleared-status mutations would add no value.
+   *
+   * Live behavior: a stale-state TxnID (deleted since last seen) returns
+   * statusCode 500 from QB; a TxnID against a non-bank-affecting transaction
+   * returns 3120 (real QB enforces this — JE/Invoice/Bill bodies have no
+   * cleared status, only bank-account-touching txns do). Both surface through
+   * the existing tool-side error wrapper as structured `isError: true`.
+   */
+  async updateClearedStatus(
+    params: {
+      txnId: string;
+      clearedStatus: "Cleared" | "NotCleared" | "Pending";
+      txnLineId?: string;
+    }
+  ): Promise<Record<string, unknown>> {
+    this.assertWritable(
+      `updateClearedStatus(${params.txnId}${params.txnLineId ? `:${params.txnLineId}` : ""})`
+    );
+    const xml = buildClearedStatusModRequest(params, this.config.qbxmlVersion);
+    const response = await this.sendRequest(xml);
+    const data = extractResponseData(response, "ClearedStatusModRs");
+    const block = (Array.isArray(data) ? data[0] ?? {} : data) as Record<string, unknown>;
+    // ClearedStatusModRs wraps a single ClearedStatusRet payload (TxnID,
+    // optional TxnLineID, ClearedStatus, TimeModified). Unwrap to match the
+    // shape every other typed-mutation helper returns (the inner *Ret block,
+    // not the response data envelope).
+    const ret = block.ClearedStatusRet;
+    if (ret) {
+      return (Array.isArray(ret) ? ret[0] : ret) as Record<string, unknown>;
+    }
+    return block;
   }
 
   async deleteEntity(

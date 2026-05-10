@@ -9,7 +9,24 @@
       "PowerShell(\"\" | & node dist/index.js; Write-Output \"ExitCode=$LASTEXITCODE\")",
       "Bash(npm view *)",
       "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 10; Write-Output \"EXIT=$LASTEXITCODE\")",
-      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-String -Pattern \"Mode:|tool|running\" | Select-Object -First 10; Write-Output \"EXIT=$LASTEXITCODE\")"
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-String -Pattern \"Mode:|tool|running\" | Select-Object -First 10; Write-Output \"EXIT=$LASTEXITCODE\")",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:developer.intuit.com)",
+      "WebFetch(domain:wiki.consolibyte.com)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops130.xml\")",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops130.xml\")",
+      "Bash(curl -s \"https://api.github.com/repos/qbwc/qbxml/contents/schema\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops140.xml\")",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops140.xml\")",
+      "PowerShell(npm run build)",
+      "PowerShell(npm test 2>&1)",
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 10; \"exit=$LASTEXITCODE\")",
+      "PowerShell(npx vitest run tests/invoice-duplicate.test.ts 2>&1)",
+      "PowerShell(npm run build; npm test 2>&1 | Select-String -Pattern \"Test Files|Tests \" | Select-Object -Last 2; \"\" | & node dist/index.js 2>&1 | Select-String -Pattern \"Mode:|stdio\"; \"exit=$LASTEXITCODE\")",
+      "PowerShell(\"\" | & node dist/index.js 2>&1; \"ExitCode: $LASTEXITCODE\")",
+      "PowerShell($config = Get-Content \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\" -Raw -ErrorAction SilentlyContinue; if \\($config\\) { $config } else { \"config file not found at $env:APPDATA\\\\Claude\\\\claude_desktop_config.json\" })"
     ]
   }
 }

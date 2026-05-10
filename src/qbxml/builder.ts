@@ -137,6 +137,43 @@ export function buildModRequest(
 }
 
 /**
+ * Build a ClearedStatusModRq envelope. Structural outlier — unlike entity-typed
+ * *ModRq calls (CustomerMod, InvoiceMod, …), ClearedStatusMod targets a single
+ * transaction (or line within one) and mutates only its cleared-status field.
+ * It's the canonical bank-reconciliation primitive in the QBXML SDK; there is
+ * no `ReconcileQueryRq` / `ReconcileAddRq` / `ReconcileModRq` (verified against
+ * the qbxmlops130/140 schemas).
+ *
+ * Schema-required child order (QBXML 13.0+ SDK):
+ *   TxnID → TxnLineID? → ClearedStatus
+ * TxnLineID is optional — omit it to mark the whole transaction
+ * (Check/Deposit/Transfer, where the header is the bank-affecting posting);
+ * include it for split-line transactions where only one line cleared.
+ *
+ * ClearedStatus is one of three enum values: "Cleared", "NotCleared", "Pending"
+ * (matches the QB Desktop reconciliation UI's three-state model).
+ */
+export function buildClearedStatusModRequest(
+  params: {
+    txnId: string;
+    clearedStatus: "Cleared" | "NotCleared" | "Pending";
+    txnLineId?: string;
+  },
+  version?: string
+): string {
+  const modBody: Record<string, unknown> = {
+    TxnID: params.txnId,
+  };
+  if (params.txnLineId) modBody.TxnLineID = params.txnLineId;
+  modBody.ClearedStatus = params.clearedStatus;
+  return buildSingleRequest(
+    "ClearedStatusModRq",
+    { ClearedStatusMod: modBody },
+    version
+  );
+}
+
+/**
  * Build a GeneralSummaryReportQueryRq for P&L / Balance Sheet style reports.
  *
  * Report rqs are structurally distinct from list/txn queries — they take

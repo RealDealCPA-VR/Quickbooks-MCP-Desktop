@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (78 total)
+## Tools (80 total)
 
 ### Customers
 | Tool | Description |
@@ -51,6 +51,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 | `qb_invoice_create` | Create an invoice with line items |
 | `qb_invoice_update` | Modify an existing invoice. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. Customer balance adjusts by `newBalanceRemaining - oldBalanceRemaining` (or full reverse-then-apply if `customerName` / `customerListId` re-points the invoice). |
 | `qb_invoice_delete` | Delete an invoice |
+| `qb_invoice_duplicate` | Duplicate an existing invoice. Pass `sourceTxnId`; the tool reads the source's `CustomerRef` + lines (and optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PORefNumber`) and submits a fresh `InvoiceAddRq` with that payload. Defaults: `TxnDate` → today, `DueDate` / `RefNumber` → unset (avoids ref-number collisions on monthly retainer flows), `Memo` → `"Duplicate of <source ref or TxnID>"`. Operator overrides win: `txnDate`, `dueDate`, `refNumber`, `memo`, `customerName` / `customerListId` (retarget at a different customer). Workflow stand-in for QB Desktop's memorized-template "Use" command (which the QBXML SDK doesn't expose). |
 
 ### Bills (Accounts Payable)
 
@@ -206,6 +207,16 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 | `qb_1099_summary` | Aggregate Bill + Check payments to 1099-eligible vendors (`IsVendorEligibleFor1099 === true`) for a tax-year window. Defaults to **last completed tax year** (current year − 1) — `qb_1099_summary({})` in January 2026 returns TY2025 totals; pass `taxYear` to override, or explicit `fromDate` / `toDate` (which override taxYear). Classifies each vendor as 1099-NEC (default — nonemployee compensation) or 1099-MISC (vendor record's `Vendor1099Type === 'MISC'` — typically rents/royalties). Compares per-vendor totals against `threshold` (default 600, the IRS general 1099-NEC + 1099-MISC threshold for TY2024+). Returns `{ totalEligibleVendors, vendorsAboveThreshold, vendorsBelowThreshold, totalsByForm: {NEC, MISC}, vendors: [...] }` sorted by `totalPaid` descending. Each vendor row carries `taxId` + `address` + `formType` + `totalPaid` + `transactionCount` + `billCount`/`billTotal`/`checkCount`/`checkTotal` + `meetsThreshold`. Optional `formType: 'NEC' \| 'MISC' \| 'all'` filter. Optional `includeBelowThreshold: true` surfaces sub-threshold vendors (with `meetsThreshold: false`) — useful for review. **Card payments excluded** per IRS rule (the card processor reports those on 1099-K). **Limitation:** does NOT honor QB Preferences' per-account 1099 box mapping — every payment to an eligible vendor counts toward the threshold. Strict box-by-box reporting requires real QB's Form1099 wizard. |
 | `qb_1099_detail` | Per-transaction breakdown for 1099 prep — same Bill + Check walk as `qb_1099_summary` but returns each transaction with `txnId` / `txnDate` / `refNumber` / `total` / `memo` / `lines` (per-line `accountName` + `amount` + `memo`). Use to verify the summary, drill into a specific vendor (`vendorListId` or `vendorFullName`), or export to a 1099 prep spreadsheet. No threshold filter (every transaction is surfaced regardless of vendor total). Empty result when the scope filter matches nothing is a structured success (not an error). Defaults to last completed tax year. Card payments excluded per IRS rule. |
 | `qb_raw_query` | Execute raw QBXML queries |
+
+### Bank Reconciliation
+
+The QBXML SDK's actual reconciliation surface is much narrower than the QB Desktop UI suggests: there is **no `ReconcileQueryRq`**, **no `ReconcileDetail` GeneralDetailReportType**, and **no `LastReconciledDate` field on AccountRet** (verified against qbxmlops130/140 schemas — see [DECISIONS.md](DECISIONS.md) `2026-05-10 — bank reconciliation SDK surface`). What IS exposed is `ClearedStatusModRq` — a single-field write that flips one transaction (or one split line) between `Cleared` / `NotCleared` / `Pending`. That is the atomic primitive QB's reconciliation UI is built on; orchestrating a sequence of these against open bank/CC transactions IS the reconcile flow.
+
+`qb_cleared_status_update` ships that primitive. Read-side (which txns are currently uncleared) requires `CustomDetailReportQueryRq` with `IncludeColumn=ClearedStatus` — the only QBXML path that returns cleared-status data — and lands in Phase 11 alongside `qb_reconciliation_discrepancy` / `qb_uncleared_transactions_by_account` (item 56) which share the same custom-report infrastructure. Until then, the operator pairs QB Desktop's reconciliation screen (visual: which items match the bank statement) with bulk `qb_cleared_status_update` calls through an agent (replaces clicking every line by hand).
+
+| Tool | Description |
+|------|-------------|
+| `qb_cleared_status_update` | Mark a bank/CC transaction `Cleared` / `NotCleared` / `Pending`. Wraps `ClearedStatusModRq`. Targets the seven bank-affecting transaction types only (`Check`, `BillPaymentCheck`, `BillPaymentCreditCard`, `Deposit`, `Transfer`, `CreditCardCharge`, `CreditCardCredit`); calls against `Invoice` / `Bill` / `JournalEntry` / etc. return statusCode 3120 ("transaction type does not support cleared status") because those headers don't carry the field. Pass `txnId` for whole-transaction update (typical for a Check or Deposit); add `txnLineId` to flip a single split line within a multi-line transaction (e.g. one line of a multi-account Deposit). Naturally idempotent — flipping `Cleared` on an already-Cleared txn is a server-side no-op, so this tool does NOT accept an `idempotencyKey` arg (the cache would add no value). Read-only sessions reject with statusCode 9001 before any envelope is built. |
 
 ### Session Management
 | Tool | Description |

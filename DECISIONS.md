@@ -29,6 +29,76 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-10 — Memorized transactions not exposed by QBXML SDK (#45 closed SDK-blocked)
+
+**Chosen:** Close Phase 10 #45 ("Memorized / recurring transaction CRUD") as not-actionable, no implementation. Address the operator's underlying pain (monthly retainer billing across hundreds of bookkeeping clients) with a separate Phase 12 workflow tool, `qb_invoice_duplicate`, queued as new item #57a.
+
+**Why:** Verified directly against the qbwc/qbxml master mirrors of Intuit's official SDK XSDs (qbxmlops130.xml and qbxmlops140.xml, 2.77 MB each — the highest schema versions Intuit publishes; SDK 15/16 added no new entity types in this area). Search results: the only mention of `memorizedTxn` in the entire 2.77 MB schema is as a `rowType` enumeration value inside `ListDeletedQueryRq` (a way to query *deletion records* of memorized templates — not the live list). There is **no** `MemorizedTransactionListQueryRq`, **no** `MemorizedTxnListQueryRq`, **no** Add / Mod / Del / Execute / Submit for memorized transactions in any SDK version. Intuit's long-standing posture (confirmed by community discussions on the help forum): memorized transactions are managed exclusively through QuickBooks Desktop's UI (Ctrl+M on an open transaction) and auto-executed by QB's internal scheduler. The SDK does not expose the recurring/memorized list to integrators at all.
+
+The HANDOFF's framing ("Intuit's SDK supports read + execute well; create is partial") was incorrect at every layer. Without QBXML elements to wrap, there is nothing to implement.
+
+The operator's actual need — being able to bill monthly retainers without retyping every line — is well served by a tool that DOESN'T need memorized-transaction SDK support: read a prior month's invoice, copy its lines into a fresh `InvoiceAddRq` with a new `TxnDate` / `RefNumber`. Same outcome as right-click "Use" on a QB-Desktop memorized template, just routed through SDK elements that DO exist. Queued as Phase 12 item #57a (`qb_invoice_duplicate`).
+
+**Alternatives rejected:**
+
+- **Implement `ListDeletedQueryRq` filtered to `rowType=memorizedTxn`.** The one SDK affordance that touches memorized transactions. But the operator's pain isn't "I need to see which templates were deleted" — they need to USE the live ones. A deletion-history tool would be cosmetic; nobody asked for it.
+- **Wrap QBFC (the COM library) instead of QBXML.** QBFC has slightly broader surface than QBXML for some operations, but research suggests memorized-transaction CRUD is unsupported there too (the gap is at the SDK level, not the wire-protocol level). Adding a COM dependency to dodge a missing feature wouldn't actually deliver it.
+- **Build a sim-only mock implementation.** Would violate the NF1 mode-parity invariant (sim claims to do something live mode physically cannot). Worse, would create a foot-gun for operators who develop against sim and discover the gap only after going live.
+- **Wait for SDK 17/18 to add it.** Intuit hasn't shipped a meaningful QBXML feature addition in years; this is unlikely to ever land.
+
+**Tradeoffs / consequences:**
+
+- The operator continues to manage memorized templates through QB Desktop's UI (Ctrl+M / Lists → Memorized Transactions). No regression — they already do this.
+- `qb_invoice_duplicate` (Phase 12 #57a) gives them the same workflow value for the most common case (monthly retainer billing) without depending on SDK features that don't exist.
+- A small block of work (the original #45 estimate) is reclaimed for higher-value tools.
+- Carried gotcha for future sessions: do not re-litigate #45 if memorized-transaction tools come up in a different framing. The SDK surface is verified absent at the schema level.
+
+**Revisit when:** Intuit ships a new QBXML SDK version with explicit memorized-transaction support (would appear in qbxmlops150.xml or higher). No scheduled revisit; check the qbwc/qbxml repo when SDK 17 releases.
+
+---
+
+## 2026-05-10 — Bank reconciliation SDK surface — ClearedStatusModRq is the actual primitive (#46 closed with narrowed scope)
+
+**Chosen:** Ship Phase 10 #46 as `qb_cleared_status_update` only — a single write tool wrapping `ClearedStatusModRq`. Defer the read side (which transactions are uncleared) to Phase 11 #56 (which has the matching `CustomDetailReportQueryRq` infrastructure) and a new companion #56a (`qb_uncleared_transactions`).
+
+**Why:** The original HANDOFF's premise — that #46 is a "read-only well-supported" scope and writing reconciliation state isn't possible — turned out to be wrong in **both** directions. Schema research against qbxmlops130.xml + qbxmlops140.xml found:
+
+1. **No `ReconcileQueryRq`** anywhere in the schema (search for "reconcil" found only `SpecialAccountType=ReconciliationDifferences` — a metadata flag, not a query element).
+2. **No `ReconcileDetail` GeneralDetailReportType** — the full enum includes `1099Detail`, `AuditTrail`, `BalanceSheetDetail`, `CheckDetail`, `CustomerBalanceDetail`, `DepositDetail`, `MissingChecks`, `Journal`, `OpenInvoices`, etc., but no "Reconcile" or "Uncleared" types.
+3. **No `LastReconciledDate` / `LastReconciledBalance` field on AccountRet** (so even "when was account X last reconciled" can't be read directly).
+4. **`ClearedStatus` is NOT a filter on any *QueryRq and NOT in any *Ret output** — only appears as `ClearedStatusModRq` input and as a column in `CustomDetailReportQueryRq` output (via `IncludeColumn=ClearedStatus`).
+5. **`ClearedStatusModRq` DOES exist** — and is unambiguously the write primitive bank reconciliation is built on. Takes `TxnID` + optional `TxnLineID` + `ClearedStatus` (enum: `Cleared`/`NotCleared`/`Pending`). The QB Desktop reconciliation UI is just a UX wrapper around a sequence of these.
+
+So the actual SDK affordance is the OPPOSITE of what was assumed: the write side IS supported, and the read side requires custom-report infrastructure that hadn't landed yet. Shipping just the write primitive gives the operator real workflow value immediately (they can pair QB Desktop's reconcile screen with bulk `qb_cleared_status_update` agent calls — replaces clicking every line by hand), while the read side gets done correctly in Phase 11 alongside #56 which needs the same `CustomDetailReportQueryRq` plumbing.
+
+**Implementation:**
+
+- New `buildClearedStatusModRequest(params, version)` helper in [src/qbxml/builder.ts](src/qbxml/builder.ts). Emits `TxnID → TxnLineID? → ClearedStatus` in schema order (pinned in [tests/reconciliation.test.ts](tests/reconciliation.test.ts)).
+- New `session.updateClearedStatus({txnId, clearedStatus, txnLineId?})` method in [src/session/manager.ts](src/session/manager.ts). Routes through `assertWritable` (read-only sessions reject with `QBReadOnlyError` / statusCode 9001 before any envelope is built). Idempotency cache is intentionally NOT applied — the operation is naturally idempotent (flipping Cleared on an already-Cleared txn is a server no-op) and fingerprinting wouldn't add value.
+- New `handleClearedStatusMod` in [src/session/simulation-store.ts](src/session/simulation-store.ts). Walks the seven bank-affecting transaction stores (Check / BillPaymentCheck / BillPaymentCreditCard / Deposit / Transfer / CreditCardCharge / CreditCardCredit). Distinguishes statusCode 3120 ("TxnID exists but txn type doesn't support cleared status" — probes Invoice/Bill/JE/etc. stores explicitly) from 500 ("TxnID doesn't exist anywhere") so error surfaces are useful. Default `ClearedStatus: "NotCleared"` on bank-affecting `handleAdd` matches real QB behavior.
+- Dispatch fix in `processRequest`: the `key === "ClearedStatusModRq"` branch must precede the `key.endsWith("ModRq")` catch-all (which would otherwise derive a "ClearedStatus" entity type and call handleMod expecting a ListID). Caught early via test failures.
+- New `qb_cleared_status_update` tool in [src/tools/reconciliation.ts](src/tools/reconciliation.ts). Zod enum on `clearedStatus`; rejects unknown values at the schema layer. Error wrapper surfaces statusCode + humanReadable via the existing Item 25 pattern.
+- 23 new tests in [tests/reconciliation.test.ts](tests/reconciliation.test.ts) covering all four layers.
+
+**Alternatives rejected:**
+
+- **Ship both `qb_cleared_status_update` AND a sim-only `qb_uncleared_transactions` (live mode returns "use Phase 11" error).** Tempting — gets two tools out of #46. Rejected because it violates the NF1 mode-parity invariant: the same call would succeed in sim and fail in live, creating dev-vs-prod skew the operator would hit at the worst possible moment (middle of month-end close).
+- **Implement `CustomDetailReportQueryRq` infrastructure in this session.** Would let both write + read ship under #46 with mode parity. Rejected on scope grounds — CustomDetailReport's row-tree shape is structurally similar to PnL/BS (which already have `adaptLiveReportRet` plumbing) but the IncludeColumn + IncludeAccount + filter combinatorics is its own substantial design. Better landed once, in #56, where it can serve multiple report tools (#56 reconciliation discrepancy + #56a uncleared + #53 GL + #58 sales by customer/item/rep detail variants).
+- **Implement `TxnListByDate` GeneralDetailReportQueryRq as the read primitive.** A real schema-supported report type, but its row data doesn't include `ClearedStatus` (the IncludeColumn enum doesn't cover it for this report type per the schema). Wouldn't actually answer the operator's question.
+- **Track cleared status as a separate sim-only field and document live as TBD.** A variant of the first alternative; same NF1 problem.
+
+**Tradeoffs / consequences:**
+
+- Operator can mark transactions cleared through the MCP today; cannot yet ENUMERATE uncleared transactions through the MCP (they use QB Desktop's reconcile screen for that part). This is a real but bounded workflow gap that closes when #56 lands.
+- The seven bank-affecting transaction types now carry an explicit `ClearedStatus` field on creation (default `NotCleared`). Existing tests still pass (the default is invisible to anything that doesn't look for it).
+- Two new statusCode distinctions (3120 "wrong txn type" vs 500 "unknown txn") give downstream agents enough information to retry or pivot. Pinned in tests.
+- The dispatch-order subtlety in `processRequest` is now structurally important. If a future PR adds another non-entity-typed `*ModRq` (e.g. a hypothetical `DisplayModRq`), it must also slot in BEFORE the `endsWith("ModRq")` catch-all. Documented inline.
+- A new HANDOFF gotcha: future scope assumptions sourced from "I think QBXML supports X" should be verified against qbwc/qbxml master before committing to scope. The original #45/#46 framing was wrong by ~5 different elements; that's a lot of wasted sketch work for a future agent that trusts it.
+
+**Revisit when:** Phase 11 #56 + #56a land — at which point `qb_cleared_status_update` should compose naturally with the read tools and the operator can run month-end close end-to-end through the MCP. No earlier revisit.
+
+---
+
 ## 2026-05-10 — Idempotency cache lives at QBSessionManager, fingerprint-matches on replay, only caches successful creates
 
 **Chosen:** Phase 10 #47 ships as a single chokepoint inside `QBSessionManager` mirroring the #42 read-only gate template — new `addEntityIdempotent(entityType, data, key)` and `executeBatchAddIdempotent(entityType, entries, key)` methods that delegate to the existing `addEntity` / `executeBatchAdd` and return `{entity|results, replayed}`. Cache state (`Map<key, {entityType, payloadFingerprint, result, createdAt}>`) is per-`QBSessionManager` instance, FIFO-bounded at 1000 entries, and explicitly cleared on `switchCompanyFile`. Fingerprint is SHA-256 of canonicalized JSON (recursive sorted-key normalization so `{a, b}` and `{b, a}` collide; arrays preserve order so `[line1, line2]` and `[line2, line1]` don't). Same key + matching fingerprint → return cached with `replayed: true`. Same key + different fingerprint → throw `QBIdempotencyKeyConflictError` (synthetic statusCode 9002). Tool surface: every `*_create` / `*_add` tool gains optional `idempotencyKey: z.string().min(1).optional()`; on replay the response carries `idempotentReplay: true`.
