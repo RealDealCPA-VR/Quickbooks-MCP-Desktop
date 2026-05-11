@@ -23,12 +23,16 @@ import {
   buildModRequest,
   buildDeleteRequest,
   buildReportRequest,
+  buildCustomDetailReportRequest,
+  buildGeneralDetailReportRequest,
   buildClearedStatusModRequest,
 } from "../qbxml/builder.js";
 import {
   parseQBXMLResponse,
   extractResponseData,
   extractReportData,
+  extractCustomDetailReportData,
+  extractGeneralDetailReportData,
   flattenEntityArray,
 } from "../qbxml/parser.js";
 import type {
@@ -960,14 +964,24 @@ export class QBSessionManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Run a GeneralSummaryReportQueryRq (P&L / Balance Sheet) and return the
-   * extracted ReportRet block. In simulation the store emits the simplified
-   * shape (Sections / Totals); live mode (Phase 7) will need a row-tree
-   * adapter — see extractReportData jsdoc.
+   * Run a GeneralSummaryReportQueryRq (P&L / Balance Sheet /
+   * SalesByCustomerSummary) and return the extracted ReportRet block. In
+   * simulation the store emits the simplified shape (Sections / Totals);
+   * live mode dispatches through extractReportData → adaptLiveReportRet's
+   * row-tree translator (PnL / BS / flat — see jsdoc).
+   *
+   * `entityFilter` (Phase 11 #49) narrows the report to a single customer for
+   * SalesByCustomerSummary — silently ignored by P&L / BS where the wire-side
+   * envelope doesn't carry it.
    */
   async runReport(
     reportType: string,
-    params: { fromDate?: string; toDate?: string; basis?: "Accrual" | "Cash" } = {}
+    params: {
+      fromDate?: string;
+      toDate?: string;
+      basis?: "Accrual" | "Cash";
+      entityFilter?: { FullName?: string; ListID?: string };
+    } = {}
   ): Promise<Record<string, unknown>> {
     const xml = buildReportRequest(
       { reportType, ...params },
@@ -975,5 +989,69 @@ export class QBSessionManager {
     );
     const response = await this.sendRequest(xml);
     return extractReportData(response, "GeneralSummaryReportQueryRs");
+  }
+
+  /**
+   * Run a CustomDetailReportQueryRq (Phase 11 #56 + #56a) and return the
+   * extracted ReportRet block in {Columns, Rows} shape — uniform between
+   * live and simulation via extractCustomDetailReportData. Used by the
+   * bank-rec read tools (qb_uncleared_transactions,
+   * qb_reconciliation_discrepancy) to reach the only QBXML reporting surface
+   * that returns ClearedStatus per transaction.
+   */
+  async runCustomDetailReport(
+    params: {
+      reportType?: string;
+      fromDate?: string;
+      toDate?: string;
+      account?: { FullName?: string; ListID?: string };
+      clearedStatusFilter?: "ClearedOnly" | "UnclearedOnly" | "All";
+      fromModifiedDate?: string;
+      toModifiedDate?: string;
+      basis?: "Accrual" | "Cash";
+      includeColumns?: string[];
+    } = {}
+  ): Promise<Record<string, unknown>> {
+    const xml = buildCustomDetailReportRequest(
+      params,
+      this.config.qbxmlVersion
+    );
+    const response = await this.sendRequest(xml);
+    return extractCustomDetailReportData(response, "CustomDetailReportQueryRs");
+  }
+
+  /**
+   * Run a GeneralDetailReportQueryRq (Phase 11 #49 SalesByCustomerDetail, plus
+   * the planned #50/#52 sales / expense detail variants once their sim
+   * handlers land) and return the extracted ReportRet block in {Columns, Rows}
+   * shape — uniform between live and simulation via
+   * extractGeneralDetailReportData.
+   *
+   * Distinct from runCustomDetailReport because GeneralDetailReportType is a
+   * separate SDK enum from CustomDetailReportType — verified the hard way
+   * with #53 where the HANDOFF's "compose on CustomDetailReport" suggestion
+   * would have failed live with statusCode 3120. See DECISIONS.md
+   * 2026-05-10.
+   */
+  async runGeneralDetailReport(
+    params: {
+      reportType: string;
+      fromDate?: string;
+      toDate?: string;
+      account?: { FullName?: string; ListID?: string };
+      entityFilter?: { FullName?: string; ListID?: string };
+      itemFilter?: { FullName?: string; ListID?: string };
+      fromModifiedDate?: string;
+      toModifiedDate?: string;
+      basis?: "Accrual" | "Cash";
+      includeColumns?: string[];
+    }
+  ): Promise<Record<string, unknown>> {
+    const xml = buildGeneralDetailReportRequest(
+      params,
+      this.config.qbxmlVersion
+    );
+    const response = await this.sendRequest(xml);
+    return extractGeneralDetailReportData(response, "GeneralDetailReportQueryRs");
   }
 }

@@ -329,6 +329,94 @@ export function adaptLiveReportRet(
     .filter((r) => r.kind === "text")
     .map((r) => decodeXmlEntities(String(r.data["@_value"] ?? "")).toLowerCase());
   const isPnl = textLabels.some((l) => PNL_SECTION_NAMES.has(l));
+  const hasBs = !isPnl && textLabels.some((l) => BS_SECTION_NAMES.has(l));
+
+  // Flat-summary fork (Phase 11 #49 — SalesByCustomerSummary, plus future
+  // expense-by-vendor-summary / sales-by-item-summary variants). These reports
+  // have no per-section TextRows the adapter can open against; QB emits a
+  // single flat list of DataRows with a closing TotalRow. Synthesize one
+  // section keyed by the report's natural domain (e.g. "Sales") and route
+  // every DataRow into it. Detection: neither PnL nor BS section labels were
+  // present in TextRows — that's locale-stable (the labels QB emits in TextRow
+  // ARE the section names being opened; their absence means the report isn't
+  // section-shaped).
+  if (!isPnl && !hasBs) {
+    // Empty-data short-circuit: when QB returned no rows at all (status 1
+    // "no matching object" path or a genuinely empty period), don't
+    // synthesize a phantom section — return Sections: [] like the prior
+    // adapter shape did. Avoids breaking callers that distinguish "report
+    // returned no data" from "report returned one section with no accounts".
+    const hasAnyData = timeline.some(
+      (r) => r.kind === "data" || r.kind === "subtotal" || r.kind === "total",
+    );
+    if (!hasAnyData) {
+      return {
+        ReportTitle: reportRet.ReportTitle,
+        ReportBasis: reportRet.ReportBasis,
+        Sections: [],
+        Totals: {},
+      };
+    }
+
+    const accounts: { Name: string; Total: number }[] = [];
+    for (const row of timeline) {
+      if (row.kind !== "data") continue;
+      const nameRaw = colValue(row.data, 1);
+      if (nameRaw === undefined || nameRaw === null) continue;
+      const name = decodeXmlEntities(String(nameRaw));
+      // Find the rightmost numeric ColData on the row — QB's
+      // SalesByCustomerSummary emits {Name, Amount} as ColID 1 and 2 but
+      // future flat reports may have extra Subcolumns (e.g. % of total). The
+      // total column is conventionally the last numeric.
+      let total: number | undefined;
+      for (const c of asArray<Record<string, unknown>>(row.data.ColData)) {
+        const id = Number(c["@_colID"] ?? 0);
+        if (id <= 1) continue;
+        const v = Number(c["@_value"]);
+        if (Number.isFinite(v)) total = v;
+      }
+      if (total === undefined || !Number.isFinite(total)) continue;
+      accounts.push({ Name: name, Total: round2(total) });
+    }
+
+    let grandTotal: number | undefined;
+    for (const row of timeline) {
+      if (row.kind !== "total" && row.kind !== "subtotal") continue;
+      const labelRaw = decodeXmlEntities(String(colValue(row.data, 1) ?? "")).toLowerCase();
+      if (labelRaw !== "total" && labelRaw !== "totals") continue;
+      const v = Number(colValue(row.data, 2));
+      if (Number.isFinite(v)) {
+        grandTotal = v;
+        break;
+      }
+    }
+    if (grandTotal === undefined) {
+      grandTotal = accounts.reduce((s, a) => s + a.Total, 0);
+    }
+    const totalRounded = round2(grandTotal);
+
+    // Section name heuristic — strip trailing "Summary" / "Detail" from the
+    // ReportTitle and use what remains. Falls back to "Sales" which fits the
+    // first flat report shipped (SalesByCustomer); future flat reports can
+    // contribute their own canonical section name through this strip.
+    const title = String(reportRet.ReportTitle ?? "");
+    const stripped = title.replace(/\s+(Summary|Detail)$/i, "").trim();
+    const sectionName =
+      stripped.toLowerCase().includes("sales by customer") ? "Sales" :
+      stripped || "Sales";
+
+    const out: Record<string, unknown> = {
+      ReportTitle: reportRet.ReportTitle,
+      ReportBasis: reportRet.ReportBasis,
+      Sections: [
+        { Name: sectionName, Accounts: accounts, Subtotal: totalRounded },
+      ],
+      Totals: { TotalSales: totalRounded },
+    };
+    if (reportRet.ReportSubtitle) out.ReportSubtitle = reportRet.ReportSubtitle;
+    return out;
+  }
+
   const sectionMap = isPnl ? PNL_SECTION_NAMES : BS_SECTION_NAMES;
 
   type Section = {
@@ -445,6 +533,179 @@ export function adaptLiveReportRet(
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+// ---------------------------------------------------------------------------
+// CustomDetailReport adapter (Phase 11 #56 + #56a)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a CustomDetailReportRet from a CustomDetailReportQueryRs response.
+ * Distinct from extractReportData — that one is hard-coded to dispatch
+ * GeneralSummaryReport's row-tree → {Sections, Totals} adapter via
+ * adaptLiveReportRet. This one routes to adaptLiveCustomDetailReportRet for
+ * the live row-tree → {Columns, Rows} translation, and returns the sim's
+ * native {Columns, Rows} shape unchanged.
+ *
+ * Detection is structural: live emits `ReportData` (TextRow / DataRow /
+ * SubtotalRow / TotalRow under it) and `ColDesc` (column metadata); sim emits
+ * `Rows` directly. Returns {} on the "no data" status (1) — matches the
+ * extractResponseData semantics so callers can treat the empty case
+ * uniformly.
+ */
+export function extractCustomDetailReportData(
+  response: QBXMLResponse,
+  expectedType?: string
+): Record<string, unknown> {
+  const data = extractResponseData(response, expectedType);
+  const obj = Array.isArray(data) ? data[0] ?? {} : data;
+  const reportRet = (obj as Record<string, unknown>).ReportRet;
+  if (!reportRet) return {};
+  const ret = (Array.isArray(reportRet) ? reportRet[0] : reportRet) as
+    | Record<string, unknown>
+    | undefined;
+  if (!ret) return {};
+  if (ret.ReportData && !ret.Rows) {
+    return adaptLiveCustomDetailReportRet(ret);
+  }
+  return ret;
+}
+
+/**
+ * Extract a GeneralDetailReportRet from a GeneralDetailReportQueryRs response
+ * (Phase 11 #49 — SalesByCustomerDetail, plus the planned #50/#52 sales /
+ * expense detail variants that share this envelope). Wire shape is structurally
+ * identical to CustomDetailReport — ColDesc metadata + ReportData row tree —
+ * so we delegate to the same adapter (adaptLiveCustomDetailReportRet) for the
+ * live → {Columns, Rows} translation. Returns the sim's native {Columns, Rows}
+ * shape unchanged. Returns {} on the "no data" status (1).
+ */
+export function extractGeneralDetailReportData(
+  response: QBXMLResponse,
+  expectedType?: string
+): Record<string, unknown> {
+  const data = extractResponseData(response, expectedType);
+  const obj = Array.isArray(data) ? data[0] ?? {} : data;
+  const reportRet = (obj as Record<string, unknown>).ReportRet;
+  if (!reportRet) return {};
+  const ret = (Array.isArray(reportRet) ? reportRet[0] : reportRet) as
+    | Record<string, unknown>
+    | undefined;
+  if (!ret) return {};
+  if (ret.ReportData && !ret.Rows) {
+    return adaptLiveCustomDetailReportRet(ret);
+  }
+  return ret;
+}
+
+/**
+ * Translate a live QB CustomDetailReportRet (row-tree under ReportData) into
+ * the simplified {Columns, Rows} shape the simulation emits. Designed for
+ * `CustomDetailReportType=CustomTxnDetail` with column inclusion specifically
+ * for the bank-rec read tools (TxnType / Date / Num / Name / Memo / Amount /
+ * ClearedStatus). Other CustomDetailReport types (CustomSummary etc.) are
+ * out of scope — the adapter would still produce a Columns + Rows shape but
+ * the column titles would be whatever ColDesc emits.
+ *
+ * Algorithm:
+ *   1. Read ColDesc[] → map colID → { Title, Type } so each row can name its
+ *      cells. ColDesc.@_colID is the join key matching ColData.@_colID inside
+ *      each DataRow.
+ *   2. Walk DataRow[] (skip TextRow / SubtotalRow / TotalRow — those are
+ *      formatting rows, not transaction rows).
+ *   3. For each DataRow, build a flat object keyed by colID-resolved title
+ *      with the cell @_value. Number-type cells get coerced to Number;
+ *      everything else stays a string. Decode embedded numeric-character
+ *      entities (the "&#183;" middle-dot QB emits in account/item names —
+ *      see decodeXmlEntities jsdoc).
+ *
+ * Output:
+ *   { ReportTitle?, ReportSubtitle?, ReportBasis?, Columns: [{Title, Type}],
+ *     Rows: [{ <colTitle>: value, ... }] }
+ *
+ * `RowData.@_rowType` on a DataRow contains the actual TxnType QB tracks
+ * internally (e.g. "Check", "Deposit") — surfaced as `_rowType` on each row
+ * so callers can disambiguate even when the IncludeColumn list omits TxnType.
+ */
+export function adaptLiveCustomDetailReportRet(
+  reportRet: Record<string, unknown>
+): Record<string, unknown> {
+  const reportData = (reportRet.ReportData as Record<string, unknown>) ?? {};
+
+  // ColDesc lives at reportRet.ColDesc OR reportRet.ColDescList.ColDesc
+  // depending on the QBXML version. Probe both.
+  const colDescList = reportRet.ColDescList as Record<string, unknown> | undefined;
+  const colDescs = asArray<Record<string, unknown>>(
+    reportRet.ColDesc ?? colDescList?.ColDesc
+  );
+  type ColInfo = { title: string; type: string };
+  const colByID = new Map<number, ColInfo>();
+  const columns: ColInfo[] = [];
+  for (const cd of colDescs) {
+    const id = Number(cd["@_colID"] ?? 0);
+    // ColDesc carries a ColTitle child which may itself be an object
+    // ({ #text, @_titleRow? }) or a plain string per QBXML version. Coerce.
+    const titleRaw = cd.ColTitle ?? cd["@_colTitle"] ?? "";
+    const title = typeof titleRaw === "object" && titleRaw !== null
+      ? String((titleRaw as Record<string, unknown>).value
+          ?? (titleRaw as Record<string, unknown>)["#text"]
+          ?? "")
+      : String(titleRaw);
+    const type = String(cd.ColType ?? cd["@_colType"] ?? "");
+    const info: ColInfo = { title: decodeXmlEntities(title), type };
+    colByID.set(id, info);
+    columns.push(info);
+  }
+
+  // Number-coerce columns whose ColType indicates a numeric value. QBXML
+  // ColType values cover Amount / Quantity / Price / Number / etc.; treat
+  // any of those as numeric. Date-coerce we leave as string (callers parse
+  // YYYY-MM-DD themselves and would lose timezone disambiguation through Date).
+  const isNumericColType = (t: string): boolean => {
+    const lc = t.toLowerCase();
+    return (
+      lc === "amount" ||
+      lc === "amounttype" ||
+      lc === "quantity" ||
+      lc === "quantitytype" ||
+      lc === "price" ||
+      lc === "pricetype" ||
+      lc === "number" ||
+      lc === "numbertype"
+    );
+  };
+
+  const rows: Record<string, unknown>[] = [];
+  for (const dr of asArray<Record<string, unknown>>(reportData.DataRow)) {
+    const row: Record<string, unknown> = {};
+    // QB tracks the underlying transaction type at @_rowType on the row
+    // wrapper (e.g. "Check", "Deposit"). Surface it as _rowType so callers
+    // can disambiguate even when IncludeColumn omits TxnType.
+    const rowType = dr["@_rowType"];
+    if (rowType !== undefined) row._rowType = String(rowType);
+    for (const cell of asArray<Record<string, unknown>>(dr.ColData)) {
+      const id = Number(cell["@_colID"] ?? 0);
+      const info = colByID.get(id);
+      if (!info) continue;
+      const raw = cell["@_value"];
+      if (raw === undefined || raw === null || raw === "") continue;
+      const decoded = decodeXmlEntities(String(raw));
+      const value = isNumericColType(info.type) ? Number(decoded) : decoded;
+      // Fall back to the raw string if numeric coercion produced NaN — better
+      // than dropping the cell silently.
+      row[info.title] = Number.isNaN(value as number) ? decoded : value;
+    }
+    rows.push(row);
+  }
+
+  const out: Record<string, unknown> = {
+    ReportTitle: reportRet.ReportTitle,
+    ReportBasis: reportRet.ReportBasis,
+    Columns: columns.map((c) => ({ Title: c.title, Type: c.type })),
+    Rows: rows,
+  };
+  if (reportRet.ReportSubtitle) out.ReportSubtitle = reportRet.ReportSubtitle;
+  return out;
 }
 
 /**

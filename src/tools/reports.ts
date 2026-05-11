@@ -27,6 +27,14 @@ const CANONICAL_ACCOUNT_TYPES: readonly string[] = [
   ...NONPOSTING_TYPES,
 ];
 
+const GL_ELIGIBLE_ACCOUNT_TYPES = new Set<string>([
+  ...ASSET_TYPES,
+  ...LIABILITY_TYPES,
+  ...EQUITY_TYPES,
+  ...INCOME_TYPES,
+  ...EXPENSE_TYPES,
+]);
+
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 // Aging-bucket helpers (qb_ar_aging / qb_ap_aging). Real QB defaults — single
@@ -171,6 +179,83 @@ export function buildBalanceSummary(
       expenses: round2(Number(pnlTotals.TotalExpenses ?? 0)),
       netIncome: round2(Number(pnlTotals.NetIncome ?? 0)),
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// General Ledger helper (qb_general_ledger) — Phase 11 #53
+// ---------------------------------------------------------------------------
+
+export type GeneralLedgerAccountInput = {
+  ListID?: string;
+  FullName?: string;
+  Name?: string;
+  AccountType?: string;
+  Balance?: number;
+};
+
+export type GeneralLedgerTransactionInput = Record<string, unknown>;
+
+export type GeneralLedgerSection = {
+  accountName: string;
+  accountListId?: string;
+  accountType: string;
+  openingBalance: number;
+  closingBalance: number;
+  periodChange: number;
+  count: number;
+  transactions: Record<string, unknown>[];
+};
+
+/**
+ * Build one GL section: opening balance → period rows (each annotated with
+ * RunningBalance) → closing balance. Pure function so the math can be unit-
+ * tested without spinning up an MCP transport.
+ *
+ * Algorithm (same shape as qb_transaction_list_by_account's running-balance
+ * walk in src/tools/transactions.ts:106-140):
+ *   1. currentBalance = Account.Balance (snapshot through "now").
+ *   2. periodSum     = Σ row.Amount over the queried window.
+ *   3. openingBalance = currentBalance − periodSum.
+ *   4. Walk rows forward; RunningBalance += row.Amount per row.
+ *
+ * This is exact when toDate ≥ now (the typical case). For historical windows
+ * (toDate < now AND postings exist after toDate) openingBalance is overstated
+ * by those after-period postings — same documented limitation. Closing balance
+ * is the running balance after the last row in the window (= currentBalance
+ * when toDate ≥ now and no rows are dropped by maxRowsPerAccount).
+ *
+ * Rows are NOT re-sorted here — the caller guarantees chronological order via
+ * the underlying TransactionQueryRq (sim sorts in handleTransactionQuery,
+ * live's order is QB-driven; the wrapping tool re-sorts defensively before
+ * passing rows in).
+ */
+export function buildGeneralLedgerSection(
+  account: GeneralLedgerAccountInput,
+  rows: GeneralLedgerTransactionInput[],
+): GeneralLedgerSection {
+  const accountName = String(account.FullName ?? account.Name ?? "");
+  const accountType = String(account.AccountType ?? "");
+  const currentBalance = Number(account.Balance ?? 0);
+  const periodSum = rows.reduce((s, r) => s + Number(r.Amount ?? 0), 0);
+  const openingBalance = round2((Number.isFinite(currentBalance) ? currentBalance : 0) - periodSum);
+
+  let running = openingBalance;
+  const transactions: Record<string, unknown>[] = rows.map((r) => {
+    running += Number(r.Amount ?? 0);
+    return { ...r, RunningBalance: round2(running) };
+  });
+  const closingBalance = round2(running);
+
+  return {
+    accountName,
+    ...(account.ListID ? { accountListId: String(account.ListID) } : {}),
+    accountType,
+    openingBalance,
+    closingBalance,
+    periodChange: round2(periodSum),
+    count: transactions.length,
+    transactions,
   };
 }
 
@@ -724,6 +809,425 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "GeneralSummaryReportQueryRq (BalanceSheetStandard) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_general_ledger (Phase 11 #53)
+  //
+  // Composite tool — multi-account version of qb_transaction_list_by_account.
+  // Fetches the chart of accounts, filters by accountName / accountListId /
+  // accountType, then fans out one TransactionQueryRq per matching account
+  // and aggregates into sectioned per-account ledger output with running
+  // balance.
+  //
+  // Why composite (vs. a single GeneralDetailReportQueryRq wire request):
+  //   - Reuses verified primitives (TransactionQueryRq + AccountQueryRq) that
+  //     already run cleanly in live mode — zero schema-order risk.
+  //   - No new builder / parser-adapter / sim-handler surface area, no new
+  //     pin in tests/builder-emit-order.test.ts.
+  //   - Tradeoff: N round trips for N accounts in live mode. For a 200-account
+  //     chart that's ~100 s at typical QBXMLRP2 latency. Acceptable for
+  //     month-end use; mitigated by accountType / accountName filtering.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_general_ledger",
+    "General Ledger — for every GL-affecting account (or the subset selected by accountName / accountListId / accountType), list every line-level posting that hit it in the date window, sorted by TxnDate ascending, with per-row RunningBalance and per-account OpeningBalance / ClosingBalance / periodChange. Composite of qb_transaction_list_by_account: this is N round trips (one per matching account) — pass accountType ('Expense', 'Income', 'Bank', etc.) or accountName to scope. NonPosting accounts (Estimate / PurchaseOrder / SalesOrder sinks) are always excluded — they don't post to GL. Sign convention: positive Amount = increases the account's natural balance. Sim emits LINE-LEVEL postings only — implicit AR/AP/Bank counter-postings are NOT surfaced (same limitation as qb_transaction_list_by_account); live QB returns the full posting tree. RunningBalance math: openingBalance = currentBalance − periodSum, then walks forward; exact when toDate ≥ now, approximate (overstated by post-period postings) for historical windows.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the GL window (YYYY-MM-DD, inclusive). Omit for all-time (each account section walks every posting that hit it ever)."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the GL window (YYYY-MM-DD, inclusive). Omit for through-current. RunningBalance math is exact only when toDate ≥ now."),
+      accountName: z.string().optional()
+        .describe("Single-account scope by FullName (e.g. 'Rent Expense'). Equivalent to calling qb_transaction_list_by_account directly. Takes precedence over accountType."),
+      accountListId: z.string().optional()
+        .describe("Single-account scope by ListID. Alternative to accountName."),
+      accountType: z.enum([...CANONICAL_ACCOUNT_TYPES] as [string, ...string[]]).optional()
+        .describe("Scope to accounts of one AccountType (Bank / AccountsReceivable / Income / Expense / etc.). Useful for 'GL for all expenses' — typical month-end ask. Ignored when accountName or accountListId is supplied."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual. Currently advisory in simulation (queryTransactions does not branch on basis); threaded through for parity with other report tools."),
+      maxAccounts: z.number().int().positive().optional()
+        .describe("Cap on the number of accounts to fan out across (safety brake against accidental runaway in live mode). Default 200, max effectively bounded by the chart of accounts size."),
+      maxRowsPerAccount: z.number().int().positive().optional()
+        .describe("Per-account row cap, passed through to TransactionQueryRq as MaxReturned. Default 500 (matches QB's per-batch cap). Hitting this cap on any account triggers a `truncated` flag on that section."),
+      includeEmpty: z.boolean().optional()
+        .describe("When true, include accounts with zero postings in the window (each with empty transactions array, openingBalance = closingBalance = currentBalance, periodChange = 0). Default false — empty sections are pruned so the response stays focused on accounts with activity."),
+    },
+    async (args) => {
+      const session = getSession();
+      const effectiveMaxAccounts = args.maxAccounts ?? 200;
+      const effectiveMaxRows = args.maxRowsPerAccount ?? 500;
+      const includeEmpty = args.includeEmpty === true;
+      const warnings: string[] = [];
+
+      try {
+        // 1) Fetch the chart of accounts. AccountQueryRq has no AccountType
+        //    filter in the sim's handleQuery (and live's surface is also
+        //    limited) — pull all and filter in-process. Cheap: typically 50-300
+        //    rows.
+        const allAccounts = await session.queryEntity("Account", {});
+
+        // 2) Resolve targets — single-account scope (name or ListID) wins over
+        //    accountType; if neither is set, fan out across every GL-eligible
+        //    account.
+        let targets: GeneralLedgerAccountInput[] = allAccounts as GeneralLedgerAccountInput[];
+
+        if (args.accountListId) {
+          targets = targets.filter((a) => String(a.ListID ?? "") === args.accountListId);
+          if (targets.length === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 500,
+                  statusMessage: `Account with ListID '${args.accountListId}' not found`,
+                  humanReadable: qbStatusCodeMessage(500),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        } else if (args.accountName) {
+          targets = targets.filter((a) => String(a.FullName ?? a.Name ?? "") === args.accountName);
+          if (targets.length === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 500,
+                  statusMessage: `Account with FullName '${args.accountName}' not found`,
+                  humanReadable: qbStatusCodeMessage(500),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        } else if (args.accountType) {
+          targets = targets.filter((a) => String(a.AccountType ?? "") === args.accountType);
+        }
+
+        // 3) Drop NonPosting accounts — they don't post to GL (Estimate, PO,
+        //    SalesOrder sinks). When the operator explicitly scoped to a
+        //    NonPosting account by name/ListID we keep them and let the
+        //    underlying TransactionQueryRq return empty; surface a warning.
+        const droppedNonPosting: string[] = [];
+        targets = targets.filter((a) => {
+          const type = String(a.AccountType ?? "");
+          if (type === "NonPosting" && !args.accountName && !args.accountListId) {
+            droppedNonPosting.push(String(a.FullName ?? a.Name ?? ""));
+            return false;
+          }
+          return true;
+        });
+        if (droppedNonPosting.length > 0) {
+          warnings.push(
+            `Excluded ${droppedNonPosting.length} NonPosting account(s) (they don't post to GL): ${droppedNonPosting.slice(0, 5).join(", ")}${droppedNonPosting.length > 5 ? "…" : ""}`,
+          );
+        }
+
+        if (targets.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                fromDate: args.fromDate ?? null,
+                toDate: args.toDate ?? null,
+                basis: args.basis ?? "Accrual",
+                accountCount: 0,
+                totalRowCount: 0,
+                sections: [],
+                ...(warnings.length > 0 ? { warnings } : {}),
+                note: "No matching GL-affecting accounts. Check accountName / accountListId / accountType filter — or qb_account_list to discover available accounts.",
+              }, null, 2),
+            }],
+          };
+        }
+
+        if (targets.length > effectiveMaxAccounts) {
+          warnings.push(
+            `Account fanout (${targets.length}) exceeds maxAccounts (${effectiveMaxAccounts}). Truncating — re-run with maxAccounts: ${targets.length} to see all, or scope by accountType.`,
+          );
+          targets = targets.slice(0, effectiveMaxAccounts);
+        }
+
+        // 4) Fan out — one TransactionQueryRq per account. Each section is
+        //    independent so a failure on one account doesn't poison the
+        //    others (surfaced as a section-level error instead).
+        const sections: (GeneralLedgerSection & { truncated?: boolean; error?: string })[] = [];
+        let totalRowCount = 0;
+
+        for (const acct of targets) {
+          const fullName = String(acct.FullName ?? acct.Name ?? "");
+          const listId = acct.ListID ? String(acct.ListID) : undefined;
+
+          // Match the queryTransactions schema-required filter order (per
+          // src/session/manager.ts:584-591): MaxReturned →
+          // TxnDateRangeFilter → AccountFilter.
+          const filters: Record<string, unknown> = {
+            MaxReturned: effectiveMaxRows,
+          };
+          if (args.fromDate || args.toDate) {
+            filters.TxnDateRangeFilter = {
+              FromTxnDate: args.fromDate,
+              ToTxnDate: args.toDate,
+            };
+          }
+          filters.AccountFilter = listId ? { ListID: listId } : { FullName: fullName };
+
+          let rows: Record<string, unknown>[] = [];
+          let sectionError: string | undefined;
+          try {
+            rows = await session.queryTransactions(filters);
+          } catch (err) {
+            sectionError = (err as Error).message;
+          }
+
+          if (sectionError) {
+            sections.push({
+              accountName: fullName,
+              ...(listId ? { accountListId: listId } : {}),
+              accountType: String(acct.AccountType ?? ""),
+              openingBalance: 0,
+              closingBalance: 0,
+              periodChange: 0,
+              count: 0,
+              transactions: [],
+              error: sectionError,
+            });
+            continue;
+          }
+
+          // Defensive re-sort — sim already sorts chronologically in
+          // handleTransactionQuery, but live's response order is QB-driven and
+          // not guaranteed. Same comparator as qb_transaction_list_by_account.
+          const sorted = [...rows].sort((a, b) => {
+            const ad = String(a.TxnDate ?? "");
+            const bd = String(b.TxnDate ?? "");
+            if (ad !== bd) return ad < bd ? -1 : 1;
+            const at = String(a.TimeCreated ?? "");
+            const bt = String(b.TimeCreated ?? "");
+            return at < bt ? -1 : at > bt ? 1 : 0;
+          });
+
+          const section = buildGeneralLedgerSection(acct, sorted);
+          totalRowCount += section.count;
+
+          if (!includeEmpty && section.count === 0) continue;
+
+          const truncated = sorted.length >= effectiveMaxRows;
+          sections.push({ ...section, ...(truncated ? { truncated: true } : {}) });
+        }
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              fromDate: args.fromDate ?? null,
+              toDate: args.toDate ?? null,
+              basis: args.basis ?? "Accrual",
+              accountCount: sections.length,
+              totalRowCount,
+              sections,
+              ...(warnings.length > 0 ? { warnings } : {}),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "qb_general_ledger failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_sales_by_customer_summary (Phase 11 #49)
+  //
+  // Wraps GeneralSummaryReportQueryRq with ReportType=SalesByCustomerSummary.
+  // Per-customer revenue rollup over the date window: walks Invoice +
+  // SalesReceipt lines (positive) and CreditMemo lines (negative), groups by
+  // CustomerRef.FullName on the parent txn, returns sorted-desc by total.
+  // Real QB's SalesByCustomerSummary uses the same income-side aggregation.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_sales_by_customer_summary",
+    "Sales by Customer Summary — per-customer revenue rollup (Invoice + SalesReceipt − CreditMemo line totals, grouped by CustomerRef.FullName) over a date window. Returns customers sorted by total descending plus the grand TotalSales. Scope to a single customer with customerName / customerListId (server-side ReportEntityFilter). Sums are line.Amount sums — sales-tax lines and zero-amount lines drop naturally without inflating the customer's total (matches QB's actual SalesByCustomerSummary report). CreditMemo lines reduce sales — a negative customer total in the response means the customer has more credits than billing in the window. Basis defaults to Accrual.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for no lower bound (all-time)."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current (no upper bound)."),
+      customerName: z.string().optional()
+        .describe("Single-customer scope by FullName (e.g. 'Acme Corp'). Passes through as ReportEntityFilter.FullName. Takes precedence over customerListId."),
+      customerListId: z.string().optional()
+        .describe("Single-customer scope by ListID. Alternative to customerName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual. (Note: in simulation mode the income walk is identical regardless of basis — Cash-basis revenue recognition will land with the live-mode adapter validation.)"),
+    },
+    async ({ fromDate, toDate, customerName, customerListId, basis }) => {
+      const session = getSession();
+      try {
+        const entityFilter = customerListId
+          ? { ListID: customerListId }
+          : customerName
+            ? { FullName: customerName }
+            : undefined;
+
+        const reportRet = await session.runReport("SalesByCustomerSummary", {
+          fromDate,
+          toDate,
+          basis,
+          ...(entityFilter ? { entityFilter } : {}),
+        });
+
+        const totals = (reportRet.Totals as Record<string, unknown> | undefined) ?? {};
+        const sections = (reportRet.Sections as Array<{
+          Name: string;
+          Accounts: Array<{ Name: string; Total: number }>;
+          Subtotal: number;
+        }> | undefined) ?? [];
+        // One synthesized section "Sales" in both sim and live (live's flat-
+        // summary adapter emits the same single section). Flatten to a plain
+        // customers list for the tool surface — callers don't need the
+        // section wrapper that P&L / BS rely on for canonical-type grouping.
+        const customers = sections[0]?.Accounts?.map((a) => ({
+          customerName: a.Name,
+          total: a.Total,
+        })) ?? [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Sales by Customer Summary",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              customerCount: customers.length,
+              totalSales: Number(totals.TotalSales ?? 0),
+              customers,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralSummaryReportQueryRq (SalesByCustomerSummary) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_sales_by_customer_detail (Phase 11 #49)
+  //
+  // Wraps GeneralDetailReportQueryRq with ReportType=SalesByCustomerDetail.
+  // Per-line transaction detail (one row per Invoice / SalesReceipt /
+  // CreditMemo line that touches a customer), with TxnType / Date / Num /
+  // Name / Memo / Item / Quantity / Rate / Account / Amount / TxnID columns.
+  // Rows are sorted by Customer (alpha) → Date (asc) → TxnID (stable). Use
+  // customerName / customerListId for single-customer drilldown.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_sales_by_customer_detail",
+    "Sales by Customer Detail — per-line sales detail (Invoice / SalesReceipt / CreditMemo line rows) for the date window, sorted by Customer → TxnDate → TxnID. Returns rows with TxnType / Date / Num (refNumber) / Name (customer) / Memo / Item / Quantity / Rate / Account (income account) / Amount / TxnID. CreditMemo rows emit with Amount sign-flipped (negative) so the running sum matches QB's actual SalesByCustomerDetail. Scope by customer (customerName | customerListId) for single-customer drilldown — without scope every customer-bearing sale line in the window is emitted. Composite of GeneralDetailReportQueryRq + per-line walking — this is the line-level companion to qb_sales_by_customer_summary. NOTE: live mode adapter for this report uses the same row-tree translator as CustomDetailReport — verified-by-construction structurally but live-validation against a real QB Desktop hasn't run yet; if QBXMLRP2 surfaces statusCode -1 the fix is a child-order tweak in buildGeneralDetailReportRequest.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for no lower bound."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current."),
+      customerName: z.string().optional()
+        .describe("Single-customer scope by FullName. Passes through as ReportEntityFilter.FullName. Takes precedence over customerListId."),
+      customerListId: z.string().optional()
+        .describe("Single-customer scope by ListID. Alternative to customerName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual. (Note: in simulation mode the line walk is identical regardless of basis.)"),
+    },
+    async ({ fromDate, toDate, customerName, customerListId, basis }) => {
+      const session = getSession();
+      try {
+        const entityFilter = customerListId
+          ? { ListID: customerListId }
+          : customerName
+            ? { FullName: customerName }
+            : undefined;
+
+        const reportRet = await session.runGeneralDetailReport({
+          reportType: "SalesByCustomerDetail",
+          fromDate,
+          toDate,
+          basis,
+          ...(entityFilter ? { entityFilter } : {}),
+        });
+
+        const rows = (reportRet.Rows as Record<string, unknown>[] | undefined) ?? [];
+        const columns = (reportRet.Columns as Array<{ Title: string; Type: string }> | undefined) ?? [];
+
+        // Aggregate totals client-side from rows — useful summary stat for
+        // operators consuming the detail variant (matches what QB's GUI
+        // surfaces as the report's TOTAL row).
+        const totalAmount = round2(
+          rows.reduce((s, r) => s + Number(r.Amount ?? 0), 0),
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Sales by Customer Detail",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              rowCount: rows.length,
+              totalAmount,
+              columns,
+              rows,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralDetailReportQueryRq (SalesByCustomerDetail) failed",
               ...(humanReadable ? { humanReadable } : {}),
             }),
           }],

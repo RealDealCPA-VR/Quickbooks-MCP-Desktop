@@ -26,7 +26,12 @@
       "PowerShell(npx vitest run tests/invoice-duplicate.test.ts 2>&1)",
       "PowerShell(npm run build; npm test 2>&1 | Select-String -Pattern \"Test Files|Tests \" | Select-Object -Last 2; \"\" | & node dist/index.js 2>&1 | Select-String -Pattern \"Mode:|stdio\"; \"exit=$LASTEXITCODE\")",
       "PowerShell(\"\" | & node dist/index.js 2>&1; \"ExitCode: $LASTEXITCODE\")",
-      "PowerShell($config = Get-Content \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\" -Raw -ErrorAction SilentlyContinue; if \\($config\\) { $config } else { \"config file not found at $env:APPDATA\\\\Claude\\\\claude_desktop_config.json\" })"
+      "PowerShell($config = Get-Content \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\" -Raw -ErrorAction SilentlyContinue; if \\($config\\) { $config } else { \"config file not found at $env:APPDATA\\\\Claude\\\\claude_desktop_config.json\" })",
+      "PowerShell(\"\" | & node dist/index.js; \"EXIT=$LASTEXITCODE\")",
+      "Bash(npx vitest *)",
+      "Bash(node dist/index.js)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(node -e \"const fs=require\\('fs'\\);const todo=fs.readFileSync\\('todo.md','utf8'\\);const handoff=fs.readFileSync\\('HANDOFF.md','utf8'\\);console.log\\('todo #49 line:'\\);console.log\\(todo.split\\('\\\\n'\\).filter\\(l=>l.includes\\('**49.**'\\)\\)[0].slice\\(0,180\\)+'...'\\);console.log\\('\\\\nHANDOFF sections:'\\);for\\(const l of handoff.split\\('\\\\n'\\)\\){if\\(l.startsWith\\('## '\\)\\) console.log\\('  '+l\\);}console.log\\('\\\\nHANDOFF length:',handoff.length,'chars'\\);\")"
     ]
   }
 }

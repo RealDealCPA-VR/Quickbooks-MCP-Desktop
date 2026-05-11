@@ -14,7 +14,13 @@
 // to schema-compliant XML.
 
 import { describe, it, expect } from "vitest";
-import { buildQueryRequest, buildQBXMLRequest, buildReportRequest } from "../src/qbxml/builder.js";
+import {
+  buildQueryRequest,
+  buildQBXMLRequest,
+  buildReportRequest,
+  buildCustomDetailReportRequest,
+  buildGeneralDetailReportRequest,
+} from "../src/qbxml/builder.js";
 
 // Returns the names of `candidates` that appear inside the given request
 // element, sorted by their position in the emitted XML.
@@ -283,6 +289,169 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
       "IncludeSubcolumns",
       "ReportBasis",
     ]);
+  });
+
+  it("GeneralSummaryReportQueryRq with ReportEntityFilter: type → ReportPeriod → ReportEntityFilter → SummarizeColumnsBy → IncludeSubcolumns → ReportBasis", () => {
+    // Phase 11 #49 — qb_sales_by_customer_summary passes ReportEntityFilter
+    // through buildReportRequest to scope SalesByCustomerSummary to one
+    // customer. Schema-order: ReportEntityFilter sits between ReportPeriod
+    // and the SummarizeColumnsBy / IncludeSubcolumns / ReportBasis tail.
+    // Without an explicit pin here a future filter-dict edit could slot
+    // ReportEntityFilter after ReportBasis and re-introduce the schema-order
+    // bug class for SalesByCustomerSummary live calls.
+    const xml = buildReportRequest({
+      reportType: "SalesByCustomerSummary",
+      fromDate: "2026-01-01",
+      toDate: "2026-12-31",
+      basis: "Accrual",
+      entityFilter: { FullName: "Acme Corp" },
+    });
+
+    const order = emittedChildOrder(xml, "GeneralSummaryReportQueryRq", [
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "ReportEntityFilter",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+
+    expect(order).toEqual([
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "ReportEntityFilter",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+
+    // ReportEntityFilter contains the FullName child (or ListID — ListID
+    // takes precedence when both are supplied).
+    expect(xml).toContain("<FullName>Acme Corp</FullName>");
+
+    // Backwards compatibility: when entityFilter is omitted, the emit shape
+    // is identical to pre-#49 (the original P&L / BS shape that landed in
+    // #37). The ReportEntityFilter element must NOT appear.
+    const plain = buildReportRequest({
+      reportType: "ProfitAndLossStandard",
+      fromDate: "2026-01-01",
+      toDate: "2026-12-31",
+      basis: "Accrual",
+    });
+    expect(plain).not.toContain("ReportEntityFilter");
+  });
+
+  it("GeneralDetailReportQueryRq: type → ReportPeriod → ReportAccountFilter → ReportEntityFilter → ReportItemFilter → ReportModifiedDateRangeFilter → ReportBasis → IncludeColumn", () => {
+    // Phase 11 #49 — qb_sales_by_customer_detail (and the planned Phase 11
+    // #50/#52 sales/expense detail variants) ride on this new wire request.
+    // Inferred from QBXML 16.0 SDK schema patterns; pin so future filter-dict
+    // edits in buildGeneralDetailReportRequest can't silently re-introduce
+    // the schema-order class of bug for the detail-report tools.
+    //
+    // The exact xs:sequence position numbers per the QBXML 16.0 SDK XSD have
+    // not been verified line-by-line in this session — if live QBXMLRP2
+    // surfaces statusCode -1 "found an error when parsing" against this
+    // builder, that's the same class as the 2026-05-09 P&L bug (#37) and
+    // the fix is to reorder children to match the actual XSD <xs:sequence>.
+    const xml = buildGeneralDetailReportRequest({
+      reportType: "SalesByCustomerDetail",
+      fromDate: "2026-05-01",
+      toDate: "2026-05-31",
+      account: { FullName: "Sales Revenue" },
+      entityFilter: { FullName: "Acme Corp" },
+      itemFilter: { FullName: "Consulting" },
+      fromModifiedDate: "2026-05-01",
+      toModifiedDate: "2026-05-31",
+      basis: "Accrual",
+      includeColumns: ["TxnType", "Date", "Num", "Name", "Memo", "Amount"],
+    });
+
+    const order = emittedChildOrder(xml, "GeneralDetailReportQueryRq", [
+      "GeneralDetailReportType",
+      "ReportPeriod",
+      "ReportAccountFilter",
+      "ReportEntityFilter",
+      "ReportItemFilter",
+      "ReportModifiedDateRangeFilter",
+      "ReportBasis",
+      "IncludeColumn",
+    ]);
+
+    expect(order).toEqual([
+      "GeneralDetailReportType",
+      "ReportPeriod",
+      "ReportAccountFilter",
+      "ReportEntityFilter",
+      "ReportItemFilter",
+      "ReportModifiedDateRangeFilter",
+      "ReportBasis",
+      "IncludeColumn",
+    ]);
+
+    // Multiple <IncludeColumn> children — one per requested column. The
+    // builder serializes string[] as repeated sibling elements (no wrapper).
+    expect(xml.match(/<IncludeColumn>/g) ?? []).toHaveLength(6);
+    expect(xml).toContain("<IncludeColumn>Amount</IncludeColumn>");
+
+    // Bare-minimum emit (just type + basis, no filters) — pin that no
+    // accidental empty filter elements appear when caller passes nothing.
+    const bare = buildGeneralDetailReportRequest({
+      reportType: "SalesByCustomerDetail",
+    });
+    expect(bare).toContain("<GeneralDetailReportType>SalesByCustomerDetail</GeneralDetailReportType>");
+    expect(bare).toContain("<ReportBasis>Accrual</ReportBasis>");
+    expect(bare).not.toContain("ReportAccountFilter");
+    expect(bare).not.toContain("ReportEntityFilter");
+    expect(bare).not.toContain("ReportItemFilter");
+    expect(bare).not.toContain("ReportPeriod");
+    expect(bare).not.toContain("ReportModifiedDateRangeFilter");
+    expect(bare).not.toContain("IncludeColumn");
+  });
+
+  it("CustomDetailReportQueryRq: CustomDetailReportType → ReportPeriod → ReportAccountFilter → ReportClearedStatusFilter → ReportModifiedDateRangeFilter → ReportBasis → IncludeColumn", () => {
+    // Phase 11 #56 + #56a — bank-rec read side. Pinning the emit order so
+    // future filter-dict edits in src/qbxml/builder.ts can't silently
+    // re-introduce the schema-order class of bug for the bank-rec read tools.
+    // The exact xs:sequence position numbers per the QBXML 16.0 SDK XSD have
+    // not been verified line-by-line in this session — if live QBXMLRP2
+    // surfaces statusCode -1 "found an error when parsing" against this
+    // builder, that's the same class as the 2026-05-09 P&L bug (#37) and
+    // the fix is to reorder children to match the actual XSD <xs:sequence>.
+    const xml = buildCustomDetailReportRequest({
+      reportType: "CustomTxnDetail",
+      fromDate: "2026-05-01",
+      toDate: "2026-05-31",
+      account: { FullName: "Checking" },
+      clearedStatusFilter: "UnclearedOnly",
+      fromModifiedDate: "2026-05-01",
+      basis: "Accrual",
+      includeColumns: ["TxnType", "Date", "Num", "Name", "Memo", "Amount", "ClearedStatus"],
+    });
+
+    const order = emittedChildOrder(xml, "CustomDetailReportQueryRq", [
+      "CustomDetailReportType",
+      "ReportPeriod",
+      "ReportAccountFilter",
+      "ReportClearedStatusFilter",
+      "ReportModifiedDateRangeFilter",
+      "ReportBasis",
+      "IncludeColumn",
+    ]);
+
+    expect(order).toEqual([
+      "CustomDetailReportType",
+      "ReportPeriod",
+      "ReportAccountFilter",
+      "ReportClearedStatusFilter",
+      "ReportModifiedDateRangeFilter",
+      "ReportBasis",
+      "IncludeColumn",
+    ]);
+
+    // Multiple <IncludeColumn> children — one per requested column. The
+    // builder serializes string[] as repeated sibling elements (no wrapper).
+    expect(xml.match(/<IncludeColumn>/g) ?? []).toHaveLength(7);
+    expect(xml).toContain("<IncludeColumn>ClearedStatus</IncludeColumn>");
   });
 
   it("TransactionQueryRq: MaxReturned → TxnDateRangeFilter → AccountFilter", () => {

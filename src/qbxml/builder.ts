@@ -206,6 +206,7 @@ export function buildReportRequest(
     fromDate?: string;
     toDate?: string;
     basis?: "Accrual" | "Cash";
+    entityFilter?: { FullName?: string; ListID?: string };
   },
   version?: string
 ): string {
@@ -220,11 +221,214 @@ export function buildReportRequest(
     body.ReportPeriod = reportPeriod;
   }
 
+  // ReportEntityFilter (Phase 11 #49) — narrows reports like SalesByCustomerSummary
+  // to a single customer. Schema position is between ReportPeriod and the
+  // SummarizeColumnsBy/IncludeSubcolumns/ReportBasis tail; emitting it here
+  // preserves the canonical <xs:sequence> order pinned in
+  // tests/builder-emit-order.test.ts. Skipped silently for P&L / BS calls that
+  // don't pass it (existing emit shape unchanged).
+  if (params.entityFilter) {
+    const ef: Record<string, unknown> = {};
+    if (params.entityFilter.ListID) ef.ListID = params.entityFilter.ListID;
+    else if (params.entityFilter.FullName) ef.FullName = params.entityFilter.FullName;
+    if (Object.keys(ef).length > 0) body.ReportEntityFilter = ef;
+  }
+
   body.SummarizeColumnsBy = "TotalOnly";
   body.IncludeSubcolumns = 0;
   body.ReportBasis = params.basis ?? "Accrual";
 
   return buildSingleRequest("GeneralSummaryReportQueryRq", body, version);
+}
+
+/**
+ * Build a GeneralDetailReportQueryRq for per-line / per-transaction detail
+ * reports — SalesByCustomerDetail, SalesByItemDetail, ExpensesByVendorDetail,
+ * CustomerBalanceDetail, VendorBalanceDetail, ProfitAndLossDetail, etc. (Phase
+ * 11 #49 lands the first of these — SalesByCustomerDetail — and the others
+ * will plug into this same builder by passing different `reportType` values).
+ *
+ * Differs from buildCustomDetailReportRequest:
+ *   - GeneralDetailReportType is a separate SDK enum from CustomDetailReportType
+ *     — `SalesByCustomerDetail` is NOT a valid CustomDetailReportType value
+ *     (verified the hard way; the operator paid for that lesson on #53).
+ *   - Adds ReportEntityFilter / ReportItemFilter (customer/item scoping) that
+ *     CustomDetailReportQueryRq lacks for the same purpose.
+ *   - No ReportClearedStatusFilter (cleared-status is only meaningful on
+ *     bank-account scoped reports, which is what CustomDetailReport handles).
+ *
+ * Schema-required <xs:sequence> emit order, inferred from QBXML 16.0 SDK
+ * schema patterns and pinned in tests/builder-emit-order.test.ts:
+ *   1.  GeneralDetailReportType
+ *   2.  ReportPeriod (FromReportDate?, ToReportDate?)
+ *   3.  ReportAccountFilter (FullName | ListID)
+ *   4.  ReportEntityFilter (FullName | ListID)
+ *   5.  ReportItemFilter (FullName | ListID)
+ *   6.  ReportModifiedDateRangeFilter (FromModifiedDate?, ToModifiedDate?)
+ *   7.  ReportBasis
+ *   8.  IncludeColumn (repeated)
+ *
+ * NOTE: as with buildCustomDetailReportRequest, the exact schema-position
+ * numbers per the QBXML 16.0 XSD have not been verified line-by-line in this
+ * session. If live QBXMLRP2 surfaces statusCode -1 "found an error when
+ * parsing" against this builder, the fix is to reorder children to match the
+ * actual <xs:sequence> — same class as the 2026-05-09 #37 P&L schema-order
+ * bug.
+ */
+export function buildGeneralDetailReportRequest(
+  params: {
+    reportType: string;
+    fromDate?: string;
+    toDate?: string;
+    account?: { FullName?: string; ListID?: string };
+    entityFilter?: { FullName?: string; ListID?: string };
+    itemFilter?: { FullName?: string; ListID?: string };
+    fromModifiedDate?: string;
+    toModifiedDate?: string;
+    basis?: "Accrual" | "Cash";
+    includeColumns?: string[];
+  },
+  version?: string
+): string {
+  const body: Record<string, unknown> = {
+    GeneralDetailReportType: params.reportType,
+  };
+
+  const reportPeriod: Record<string, unknown> = {};
+  if (params.fromDate) reportPeriod.FromReportDate = params.fromDate;
+  if (params.toDate) reportPeriod.ToReportDate = params.toDate;
+  if (Object.keys(reportPeriod).length > 0) {
+    body.ReportPeriod = reportPeriod;
+  }
+
+  if (params.account) {
+    const acct: Record<string, unknown> = {};
+    if (params.account.ListID) acct.ListID = params.account.ListID;
+    else if (params.account.FullName) acct.FullName = params.account.FullName;
+    if (Object.keys(acct).length > 0) body.ReportAccountFilter = acct;
+  }
+
+  if (params.entityFilter) {
+    const ef: Record<string, unknown> = {};
+    if (params.entityFilter.ListID) ef.ListID = params.entityFilter.ListID;
+    else if (params.entityFilter.FullName) ef.FullName = params.entityFilter.FullName;
+    if (Object.keys(ef).length > 0) body.ReportEntityFilter = ef;
+  }
+
+  if (params.itemFilter) {
+    const itf: Record<string, unknown> = {};
+    if (params.itemFilter.ListID) itf.ListID = params.itemFilter.ListID;
+    else if (params.itemFilter.FullName) itf.FullName = params.itemFilter.FullName;
+    if (Object.keys(itf).length > 0) body.ReportItemFilter = itf;
+  }
+
+  if (params.fromModifiedDate || params.toModifiedDate) {
+    const mod: Record<string, unknown> = {};
+    if (params.fromModifiedDate) mod.FromModifiedDate = params.fromModifiedDate;
+    if (params.toModifiedDate) mod.ToModifiedDate = params.toModifiedDate;
+    body.ReportModifiedDateRangeFilter = mod;
+  }
+
+  body.ReportBasis = params.basis ?? "Accrual";
+
+  if (params.includeColumns && params.includeColumns.length > 0) {
+    body.IncludeColumn = params.includeColumns;
+  }
+
+  return buildSingleRequest(
+    "GeneralDetailReportQueryRq",
+    body,
+    version
+  );
+}
+
+/**
+ * Build a CustomDetailReportQueryRq for transaction-detail reports with
+ * column-level control. Used by Phase 11 #56 + #56a (bank-rec read side) —
+ * the only QBXML reporting surface that returns ClearedStatus per transaction
+ * (not exposed as a field on any *Ret element nor as a filter on any *QueryRq).
+ *
+ * Differs from buildReportRequest (GeneralSummaryReportQueryRq):
+ *   - Returns row-level transaction detail rather than account-level totals.
+ *   - Supports per-column inclusion via repeated <IncludeColumn> children.
+ *   - Supports a ReportClearedStatusFilter (UnclearedOnly / ClearedOnly / All)
+ *     which GeneralSummaryReport does not.
+ *
+ * Schema-required <xs:sequence> emit order pinned in
+ * tests/builder-emit-order.test.ts:
+ *   1.  CustomDetailReportType
+ *   2.  ReportPeriod (FromReportDate?, ToReportDate?)
+ *   3.  ReportAccountFilter (FullName | ListID)
+ *   4.  ReportClearedStatusFilter
+ *   5.  ReportModifiedDateRangeFilter (FromModifiedDate?, ToModifiedDate?)
+ *   6.  ReportBasis
+ *   7.  IncludeColumn (repeated)
+ * The exact schema position numbers per the QBXML 16.0 SDK XSD have not been
+ * verified line-by-line against qbxmlops130/140 in this session — if live
+ * QBXMLRP2 surfaces statusCode -1 "found an error when parsing" against this
+ * builder, that's the same class of bug as the 2026-05-09 #37 P&L bug and
+ * the fix is to reorder children to match the XSD's <xs:sequence>.
+ */
+export function buildCustomDetailReportRequest(
+  params: {
+    reportType?: string;
+    fromDate?: string;
+    toDate?: string;
+    account?: { FullName?: string; ListID?: string };
+    clearedStatusFilter?: "ClearedOnly" | "UnclearedOnly" | "All";
+    fromModifiedDate?: string;
+    toModifiedDate?: string;
+    basis?: "Accrual" | "Cash";
+    includeColumns?: string[];
+  },
+  version?: string
+): string {
+  const body: Record<string, unknown> = {
+    CustomDetailReportType: params.reportType ?? "CustomTxnDetail",
+  };
+
+  const reportPeriod: Record<string, unknown> = {};
+  if (params.fromDate) reportPeriod.FromReportDate = params.fromDate;
+  if (params.toDate) reportPeriod.ToReportDate = params.toDate;
+  if (Object.keys(reportPeriod).length > 0) {
+    body.ReportPeriod = reportPeriod;
+  }
+
+  if (params.account) {
+    const acct: Record<string, unknown> = {};
+    // ListID-form takes precedence when both supplied — matches QB's behavior
+    // (more specific selector wins).
+    if (params.account.ListID) acct.ListID = params.account.ListID;
+    else if (params.account.FullName) acct.FullName = params.account.FullName;
+    if (Object.keys(acct).length > 0) body.ReportAccountFilter = acct;
+  }
+
+  if (params.clearedStatusFilter) {
+    body.ReportClearedStatusFilter = params.clearedStatusFilter;
+  }
+
+  if (params.fromModifiedDate || params.toModifiedDate) {
+    const mod: Record<string, unknown> = {};
+    if (params.fromModifiedDate) mod.FromModifiedDate = params.fromModifiedDate;
+    if (params.toModifiedDate) mod.ToModifiedDate = params.toModifiedDate;
+    body.ReportModifiedDateRangeFilter = mod;
+  }
+
+  body.ReportBasis = params.basis ?? "Accrual";
+
+  if (params.includeColumns && params.includeColumns.length > 0) {
+    // Multiple <IncludeColumn> children — serializeBody emits arrays as
+    // repeated sibling elements with the same tag name (each value wrapped
+    // in its own <IncludeColumn>...</IncludeColumn>), which matches the
+    // xs:sequence cardinality QBXML wants.
+    body.IncludeColumn = params.includeColumns;
+  }
+
+  return buildSingleRequest(
+    "CustomDetailReportQueryRq",
+    body,
+    version
+  );
 }
 
 export function buildDeleteRequest(

@@ -99,6 +99,24 @@ export class SimulationStore {
         let response: QBXMLResponseBody;
         if (key === "GeneralSummaryReportQueryRq") {
           response = this.handleReportQuery(key, reqData);
+        } else if (key === "CustomDetailReportQueryRq") {
+          // Phase 11 #56 + #56a — bank-rec read side. Distinct from
+          // GeneralSummaryReport (which returns Sections/Totals account-level
+          // rollups) — CustomDetailReport returns per-transaction rows with
+          // operator-selected columns. The only QBXML reporting surface that
+          // surfaces ClearedStatus per transaction. Must precede the
+          // `endsWith("QueryRq")` catch-all (handleQuery would treat it as a
+          // per-type query against a "CustomDetailReport" store).
+          response = this.handleCustomDetailReportQuery(key, reqData);
+        } else if (key === "GeneralDetailReportQueryRq") {
+          // Phase 11 #49 — sales-by-customer-detail (and the planned #50/#52
+          // sales/expense detail variants share this entry). Distinct from
+          // CustomDetailReport because the QBXML SDK exposes its own
+          // GeneralDetailReportType enum (SalesByCustomerDetail,
+          // SalesByItemDetail, ExpensesByVendorDetail, …) — not reachable via
+          // CustomDetailReportType. Returns per-line/per-transaction rows.
+          // Must precede the `endsWith("QueryRq")` catch-all.
+          response = this.handleGeneralDetailReportQuery(key, reqData);
         } else if (key === "TransactionQueryRq") {
           // TransactionQueryRq is a CROSS-TYPE query — fans out across every
           // transaction store and emits per-line postings as TransactionRet.
@@ -421,18 +439,44 @@ export class SimulationStore {
     const toDate = reportPeriod.ToReportDate ? String(reportPeriod.ToReportDate) : null;
     const basis = String(reqData.ReportBasis ?? "Accrual") as "Accrual" | "Cash";
 
-    if (reportType !== "ProfitAndLossStandard" && reportType !== "BalanceSheetStandard") {
+    if (
+      reportType !== "ProfitAndLossStandard" &&
+      reportType !== "BalanceSheetStandard" &&
+      reportType !== "SalesByCustomerSummary"
+    ) {
       return {
         type: rsType,
         statusCode: 3120,
         statusSeverity: "Error",
-        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard and BalanceSheetStandard are implemented)`,
+        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard, BalanceSheetStandard, and SalesByCustomerSummary are implemented)`,
         data: {},
       };
     }
 
     if (reportType === "ProfitAndLossStandard") {
       const reportRet = this.buildPnLReport(fromDate, toDate, basis);
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: reportRet },
+      };
+    }
+
+    if (reportType === "SalesByCustomerSummary") {
+      // ReportEntityFilter scopes the report to a single customer (or any
+      // customer named by FullName) — real QB also accepts this on the
+      // GeneralSummary envelope. ListID is resolved against the Customer
+      // store; missing ListID just falls through to the FullName filter
+      // (or to no filter at all if both are absent).
+      const ef = (reqData.ReportEntityFilter as Record<string, unknown> | undefined) ?? {};
+      let efName: string | null = ef.FullName ? String(ef.FullName) : null;
+      if (!efName && ef.ListID) {
+        const c = this.getStore("Customer").get(String(ef.ListID));
+        if (c) efName = String(c.FullName ?? c.Name ?? "");
+      }
+      const reportRet = this.buildSalesByCustomerSummary(fromDate, toDate, basis, efName);
       return {
         type: rsType,
         statusCode: 0,
@@ -451,6 +495,487 @@ export class SimulationStore {
       statusMessage: "Status OK",
       data: { ReportRet: reportRet },
     };
+  }
+
+  // Walk Invoice + SalesReceipt + CreditMemo line stores within the date
+  // window, group by CustomerRef.FullName on the parent txn, and emit a
+  // single-section Sections/Totals ReportRet shape ({Name: "Sales",
+  // Accounts: [{Name: customerName, Total}], Subtotal} + {TotalSales}).
+  // CreditMemo lines are subtracted — matches QB's SalesByCustomerSummary
+  // where credit-memos reduce gross sales.
+  //
+  // `customerFilter` (FullName) narrows the walk to a single customer when
+  // set. ListID-form filters are resolved to FullName by the caller before
+  // entering this method.
+  //
+  // Sum source is line.Amount (not txn.TotalAmount) so sales-tax-only lines
+  // and zero-amount lines drop naturally without inflating the customer's
+  // total. Mirrors how QB's actual report computes the "Total" column.
+  private buildSalesByCustomerSummary(
+    from: string | null,
+    to: string | null,
+    basis: "Accrual" | "Cash",
+    customerFilter: string | null,
+  ): Record<string, unknown> {
+    const byCustomer = new Map<string, number>();
+    const accumulate = (storeName: string, lineKey: string, sign: 1 | -1): void => {
+      for (const txn of this.getStore(storeName).values()) {
+        const txnDate = String(txn.TxnDate ?? "");
+        if (from && txnDate < from) continue;
+        if (to && txnDate > to) continue;
+        const ref = txn.CustomerRef as Record<string, unknown> | undefined;
+        const rname = String(ref?.FullName ?? "");
+        if (customerFilter && rname !== customerFilter) continue;
+        const lines = txn[lineKey];
+        if (!Array.isArray(lines)) continue;
+        let sum = 0;
+        for (const line of lines as Record<string, unknown>[]) {
+          const amt = Number(line.Amount ?? 0);
+          if (Number.isFinite(amt)) sum += sign * amt;
+        }
+        const display = rname || "(no customer)";
+        byCustomer.set(display, (byCustomer.get(display) ?? 0) + sum);
+      }
+    };
+    accumulate("Invoice", "InvoiceLineRet", 1);
+    accumulate("SalesReceipt", "SalesReceiptLineRet", 1);
+    accumulate("CreditMemo", "CreditMemoLineRet", -1);
+
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+    const customers = [...byCustomer.entries()]
+      .map(([Name, Total]) => ({ Name, Total: round2(Total) }))
+      .filter((c) => c.Total !== 0)
+      .sort((a, b) => b.Total - a.Total);
+    const totalSales = round2(customers.reduce((s, c) => s + c.Total, 0));
+
+    return {
+      ReportTitle: "Sales by Customer Summary",
+      ReportBasis: basis,
+      ...(from ? { FromReportDate: from } : {}),
+      ...(to ? { ToReportDate: to } : {}),
+      Sections: [
+        { Name: "Sales", Accounts: customers, Subtotal: totalSales },
+      ],
+      Totals: { TotalSales: totalSales },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // CustomDetailReportQueryRq handler (Phase 11 #56 + #56a)
+  // -----------------------------------------------------------------------
+
+  // Walks the seven bank-affecting transaction stores filtered by the
+  // operator-supplied account + date + cleared-status + modified-date
+  // filters, emits per-posting rows in the {Columns, Rows} shape the
+  // parser's adaptLiveCustomDetailReportRet also produces (so the live and
+  // sim contracts converge — see extractCustomDetailReportData).
+  //
+  // Scope: implements `CustomDetailReportType=CustomTxnDetail` for the bank-
+  // rec use case only. Other CustomDetailReport types (CustomSummary,
+  // arbitrary account types) return statusCode 3120. ReportAccountFilter is
+  // required (real QB also enforces this for transaction-detail reports
+  // against bank/CC accounts).
+  //
+  // Sign convention on the emitted Amount: positive = increases the target
+  // account's natural balance (Deposit / CreditCardCharge / Transfer-in /
+  // BillPaymentCC against a CC account); negative = decreases it (Check /
+  // BillPaymentCheck / Transfer-out / CreditCardCredit). Matches how QB's
+  // CustomTxnDetail report shows the Amount column when filtered by a
+  // single account.
+  //
+  // Limitation: emits ONE row per (txn, posting account match) — for a
+  // Transfer that hits two accounts, we emit two rows when both match the
+  // filter, but otherwise this is one row per txn. Per-line cleared status
+  // (Deposit's per-line ClearedStatus from line-level ClearedStatusModRq)
+  // is not aggregated into this row's ClearedStatus — the header field
+  // governs. Documented in the qb_uncleared_transactions tool description.
+  private handleCustomDetailReportQuery(
+    reqType: string,
+    reqData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const rsType = reqType.replace("Rq", "Rs");
+
+    const reportType = String(reqData.CustomDetailReportType ?? "CustomTxnDetail");
+    if (reportType !== "CustomTxnDetail") {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage: `Unsupported CustomDetailReportType: ${reportType} (only CustomTxnDetail is implemented in simulation)`,
+        data: {},
+      };
+    }
+
+    const reportPeriod = (reqData.ReportPeriod as Record<string, unknown> | undefined) ?? {};
+    const fromDate = reportPeriod.FromReportDate ? String(reportPeriod.FromReportDate) : null;
+    const toDate = reportPeriod.ToReportDate ? String(reportPeriod.ToReportDate) : null;
+
+    const acctFilter = (reqData.ReportAccountFilter as Record<string, unknown> | undefined) ?? {};
+    let targetAccountName: string | null = null;
+    if (acctFilter.ListID) {
+      const a = this.getStore("Account").get(String(acctFilter.ListID));
+      if (a) targetAccountName = String(a.FullName ?? a.Name ?? "");
+    }
+    if (!targetAccountName && acctFilter.FullName) {
+      targetAccountName = String(acctFilter.FullName);
+    }
+    if (!targetAccountName) {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage:
+          "There is a missing element: ReportAccountFilter (CustomDetailReportQueryRq for CustomTxnDetail requires an account filter)",
+        data: {},
+      };
+    }
+
+    const clearedFilterRaw = String(reqData.ReportClearedStatusFilter ?? "All");
+    const clearedFilter: "ClearedOnly" | "UnclearedOnly" | "All" =
+      clearedFilterRaw === "ClearedOnly" || clearedFilterRaw === "UnclearedOnly"
+        ? clearedFilterRaw
+        : "All";
+
+    const modFilter = (reqData.ReportModifiedDateRangeFilter as Record<string, unknown> | undefined) ?? {};
+    const fromMod = modFilter.FromModifiedDate ? String(modFilter.FromModifiedDate) : null;
+    const toMod = modFilter.ToModifiedDate ? String(modFilter.ToModifiedDate) : null;
+
+    type Row = {
+      TxnType: string;
+      Date: string;
+      Num: string;
+      Name: string;
+      Memo: string;
+      Amount: number;
+      ClearedStatus: string;
+      TxnID: string;
+      TimeModified: string;
+    };
+    const rows: Row[] = [];
+
+    for (const txnType of SimulationStore.BANK_AFFECTING_TXN_TYPES) {
+      for (const txn of this.getStore(txnType).values()) {
+        const matches = this.txnPostingsToBankAccount(txn, txnType, targetAccountName);
+        if (matches.length === 0) continue;
+
+        const txnDate = String(txn.TxnDate ?? "");
+        if (fromDate && txnDate < fromDate) continue;
+        if (toDate && txnDate > toDate) continue;
+
+        const status = String(txn.ClearedStatus ?? "NotCleared");
+        if (clearedFilter === "ClearedOnly" && status !== "Cleared") continue;
+        if (clearedFilter === "UnclearedOnly" && status === "Cleared") continue;
+
+        const timeMod = String(txn.TimeModified ?? "");
+        // ModifiedDateRangeFilter inputs are conventionally YYYY-MM-DD;
+        // TimeModified is full ISO. Slice both to date-only so the upper
+        // bound (toMod="2026-05-10") includes the whole day rather than
+        // excluding any TimeModified with a "T..." suffix.
+        if (fromMod && timeMod) {
+          if (timeMod.slice(0, 10) < String(fromMod).slice(0, 10)) continue;
+        }
+        if (toMod && timeMod) {
+          if (timeMod.slice(0, 10) > String(toMod).slice(0, 10)) continue;
+        }
+
+        const headerName = this.resolveTxnEntityName(txn);
+        const headerMemo = txn.Memo !== undefined ? String(txn.Memo) : "";
+        const refNumber = txn.RefNumber !== undefined ? String(txn.RefNumber) : "";
+        const txnId = String(txn.TxnID ?? "");
+
+        for (const m of matches) {
+          rows.push({
+            TxnType: txnType,
+            Date: txnDate,
+            Num: refNumber,
+            Name: headerName,
+            Memo: m.memo ?? headerMemo,
+            Amount: Math.round(m.amount * 100) / 100,
+            ClearedStatus: status,
+            TxnID: txnId,
+            TimeModified: timeMod,
+          });
+        }
+      }
+    }
+
+    rows.sort((a, b) => {
+      if (a.Date !== b.Date) return a.Date < b.Date ? -1 : 1;
+      return a.TxnID < b.TxnID ? -1 : a.TxnID > b.TxnID ? 1 : 0;
+    });
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: {
+        ReportRet: {
+          ReportTitle: "Custom Transaction Detail Report",
+          ReportBasis: String(reqData.ReportBasis ?? "Accrual"),
+          ...(fromDate ? { FromReportDate: fromDate } : {}),
+          ...(toDate ? { ToReportDate: toDate } : {}),
+          Columns: [
+            { Title: "TxnType", Type: "Text" },
+            { Title: "Date", Type: "Date" },
+            { Title: "Num", Type: "Text" },
+            { Title: "Name", Type: "Text" },
+            { Title: "Memo", Type: "Text" },
+            { Title: "Amount", Type: "Amount" },
+            { Title: "ClearedStatus", Type: "Text" },
+            { Title: "TxnID", Type: "Text" },
+            { Title: "TimeModified", Type: "Text" },
+          ],
+          Rows: rows,
+        },
+      },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // GeneralDetailReportQueryRq handler (Phase 11 #49)
+  // -----------------------------------------------------------------------
+
+  // QBXML SDK's GeneralDetailReportType enum carries the per-domain detail
+  // reports (SalesByCustomerDetail, SalesByItemDetail, ExpensesByVendorDetail,
+  // CustomerBalanceDetail, VendorBalanceDetail, ProfitAndLossDetail, …).
+  // Returns per-line / per-transaction row data with operator-selectable
+  // columns. Structurally similar to CustomDetailReport but routed through
+  // a different envelope by QB — the report types are NOT cross-callable.
+  //
+  // Scope of THIS implementation: `GeneralDetailReportType=SalesByCustomerDetail`
+  // is the only enum value handled. Other values return statusCode 3120 with
+  // an explicit "implemented in simulation" message; the wire infrastructure
+  // (builder + parser + manager + dispatch + this handler shell) is in place
+  // for future variants (Phase 11 #50/#52/#54) to drop in as additional
+  // branches.
+  //
+  // Output: the same {Columns, Rows} shape adaptLiveCustomDetailReportRet
+  // and the live wire emit — so the sim/live contracts converge and tools
+  // can consume one shape via extractGeneralDetailReportData.
+  //
+  // ReportEntityFilter scopes to one customer (FullName | ListID). Without
+  // it, every customer-bearing sale line in the date window is emitted.
+  // ReportPeriod filters by TxnDate ∈ [from, to]. CreditMemo rows emit with
+  // Amount sign-flipped (negative) so the running sum matches QB's actual
+  // SalesByCustomerDetail behavior.
+  private handleGeneralDetailReportQuery(
+    reqType: string,
+    reqData: Record<string, unknown>,
+  ): QBXMLResponseBody {
+    const rsType = reqType.replace("Rq", "Rs");
+
+    const reportType = String(reqData.GeneralDetailReportType ?? "");
+    if (reportType !== "SalesByCustomerDetail") {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage: `Unsupported GeneralDetailReportType: ${reportType || "(missing)"} (only SalesByCustomerDetail is implemented in simulation)`,
+        data: {},
+      };
+    }
+
+    const reportPeriod = (reqData.ReportPeriod as Record<string, unknown> | undefined) ?? {};
+    const fromDate = reportPeriod.FromReportDate ? String(reportPeriod.FromReportDate) : null;
+    const toDate = reportPeriod.ToReportDate ? String(reportPeriod.ToReportDate) : null;
+
+    const ef = (reqData.ReportEntityFilter as Record<string, unknown> | undefined) ?? {};
+    let customerFilter: string | null = ef.FullName ? String(ef.FullName) : null;
+    if (!customerFilter && ef.ListID) {
+      const c = this.getStore("Customer").get(String(ef.ListID));
+      if (c) customerFilter = String(c.FullName ?? c.Name ?? "");
+    }
+
+    type Row = {
+      TxnType: string;
+      Date: string;
+      Num: string;
+      Name: string;
+      Memo: string;
+      Item: string;
+      Quantity: number;
+      Rate: number;
+      Account: string;
+      Amount: number;
+      TxnID: string;
+    };
+    const rows: Row[] = [];
+
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+    // Aggregate by customer first (so we can sort rows-within-customer
+    // chronologically and emit customers in stable alphabetical order — what
+    // QB's actual SalesByCustomerDetail does on the wire).
+    const emit = (
+      txn: StoredEntity,
+      txnType: string,
+      lineKey: string,
+      sign: 1 | -1,
+    ): void => {
+      const txnDate = String(txn.TxnDate ?? "");
+      if (fromDate && txnDate < fromDate) return;
+      if (toDate && txnDate > toDate) return;
+      const ref = txn.CustomerRef as Record<string, unknown> | undefined;
+      const customerName = String(ref?.FullName ?? "");
+      if (customerFilter && customerName !== customerFilter) return;
+
+      const lines = txn[lineKey];
+      if (!Array.isArray(lines)) return;
+      for (const line of lines as Record<string, unknown>[]) {
+        const amt = Number(line.Amount ?? 0);
+        if (!Number.isFinite(amt) || amt === 0) continue;
+        const accountName = this.resolveLineAccount(line, "income") ?? "Uncategorized Income";
+        const itemRef = line.ItemRef as Record<string, unknown> | undefined;
+        const qty = Number(line.Quantity ?? 0);
+        const rate = Number(line.Rate ?? 0);
+        rows.push({
+          TxnType: txnType,
+          Date: txnDate,
+          Num: txn.RefNumber !== undefined ? String(txn.RefNumber) : "",
+          Name: customerName || "(no customer)",
+          Memo: line.Memo ? String(line.Memo) : (txn.Memo ? String(txn.Memo) : ""),
+          Item: itemRef?.FullName ? String(itemRef.FullName) : "",
+          Quantity: Number.isFinite(qty) ? qty : 0,
+          Rate: Number.isFinite(rate) ? round2(rate) : 0,
+          Account: accountName,
+          Amount: round2(sign * amt),
+          TxnID: String(txn.TxnID ?? ""),
+        });
+      }
+    };
+
+    for (const txn of this.getStore("Invoice").values()) {
+      emit(txn, "Invoice", "InvoiceLineRet", 1);
+    }
+    for (const txn of this.getStore("SalesReceipt").values()) {
+      emit(txn, "SalesReceipt", "SalesReceiptLineRet", 1);
+    }
+    for (const txn of this.getStore("CreditMemo").values()) {
+      emit(txn, "CreditMemo", "CreditMemoLineRet", -1);
+    }
+
+    // Stable sort — primary by customer Name (alpha), secondary by TxnDate
+    // ascending, tertiary by TxnID for repeatability when same customer +
+    // same date.
+    rows.sort((a, b) => {
+      if (a.Name !== b.Name) return a.Name < b.Name ? -1 : 1;
+      if (a.Date !== b.Date) return a.Date < b.Date ? -1 : 1;
+      return a.TxnID < b.TxnID ? -1 : a.TxnID > b.TxnID ? 1 : 0;
+    });
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: {
+        ReportRet: {
+          ReportTitle: "Sales by Customer Detail",
+          ReportBasis: String(reqData.ReportBasis ?? "Accrual"),
+          ...(fromDate ? { FromReportDate: fromDate } : {}),
+          ...(toDate ? { ToReportDate: toDate } : {}),
+          Columns: [
+            { Title: "TxnType", Type: "Text" },
+            { Title: "Date", Type: "Date" },
+            { Title: "Num", Type: "Text" },
+            { Title: "Name", Type: "Text" },
+            { Title: "Memo", Type: "Text" },
+            { Title: "Item", Type: "Text" },
+            { Title: "Quantity", Type: "Quantity" },
+            { Title: "Rate", Type: "Price" },
+            { Title: "Account", Type: "Text" },
+            { Title: "Amount", Type: "Amount" },
+            { Title: "TxnID", Type: "Text" },
+          ],
+          Rows: rows,
+        },
+      },
+    };
+  }
+
+  // Resolve which bank/CC account(s) a bank-affecting txn posts to and the
+  // signed amount of each posting against that account, with the natural-
+  // balance sign convention QB's CustomTxnDetail report uses (positive =
+  // increases the account's natural balance).
+  //
+  // Returns multiple matches only for Transfer when both the from and to
+  // accounts equal the target — otherwise returns 0 or 1 match.
+  private txnPostingsToBankAccount(
+    txn: StoredEntity,
+    txnType: string,
+    targetAccountName: string
+  ): { amount: number; memo?: string }[] {
+    const matches: { amount: number; memo?: string }[] = [];
+    const refName = (ref: unknown): string => {
+      if (!ref || typeof ref !== "object") return "";
+      const fn = (ref as Record<string, unknown>).FullName;
+      return fn !== undefined ? String(fn) : "";
+    };
+
+    if (txnType === "Check") {
+      if (refName(txn.AccountRef) !== targetAccountName) return [];
+      const amt = Math.abs(Number(txn.Amount ?? 0));
+      matches.push({ amount: -amt });
+    } else if (txnType === "Deposit") {
+      if (refName(txn.DepositToAccountRef) !== targetAccountName) return [];
+      // Deposit total = sum of DepositLineRet amounts (real QB).
+      const lines = Array.isArray(txn.DepositLineRet)
+        ? (txn.DepositLineRet as Record<string, unknown>[])
+        : [];
+      const lineSum = lines.reduce((s, l) => s + Number(l.Amount ?? 0), 0);
+      const amt = Math.abs(lineSum || Number(txn.DepositTotal ?? txn.Amount ?? 0));
+      matches.push({ amount: amt });
+    } else if (txnType === "BillPaymentCheck") {
+      if (refName(txn.BankAccountRef) !== targetAccountName) return [];
+      // BillPayment* total lives on TotalAmount (set by applyBillPayment as
+      // sum(AppliedToTxn.PaymentAmount) at apply time) — no header `Amount`
+      // field exists on this txn type.
+      const amt = Math.abs(Number(txn.TotalAmount ?? txn.Amount ?? 0));
+      matches.push({ amount: -amt });
+    } else if (txnType === "BillPaymentCreditCard") {
+      // Paying a vendor with a CC INCREASES the CC liability — positive
+      // posting on the CC account (matches CreditCardCharge).
+      if (refName(txn.CreditCardAccountRef) !== targetAccountName) return [];
+      const amt = Math.abs(Number(txn.TotalAmount ?? txn.Amount ?? 0));
+      matches.push({ amount: amt });
+    } else if (txnType === "Transfer") {
+      const fromMatch = refName(txn.TransferFromAccountRef) === targetAccountName;
+      const toMatch = refName(txn.TransferToAccountRef) === targetAccountName;
+      if (!fromMatch && !toMatch) return [];
+      const amt = Math.abs(Number(txn.Amount ?? 0));
+      if (fromMatch) matches.push({ amount: -amt, memo: "Transfer out" });
+      if (toMatch) matches.push({ amount: amt, memo: "Transfer in" });
+    } else if (txnType === "CreditCardCharge") {
+      if (refName(txn.AccountRef) !== targetAccountName) return [];
+      const amt = Math.abs(Number(txn.Amount ?? 0));
+      matches.push({ amount: amt });
+    } else if (txnType === "CreditCardCredit") {
+      if (refName(txn.AccountRef) !== targetAccountName) return [];
+      const amt = Math.abs(Number(txn.Amount ?? 0));
+      matches.push({ amount: -amt });
+    }
+
+    return matches;
+  }
+
+  // Resolve a display name for a bank-affecting txn — payee for Check /
+  // BillPayment* / CreditCard*, no header entity for Deposit/Transfer
+  // (Deposit carries per-line EntityRef; Transfer has no entity at all).
+  private resolveTxnEntityName(txn: StoredEntity): string {
+    const refs = [
+      txn.PayeeEntityRef,
+      txn.EntityRef,
+      txn.CustomerRef,
+      txn.VendorRef,
+    ];
+    for (const r of refs) {
+      if (r && typeof r === "object") {
+        const fn = (r as Record<string, unknown>).FullName;
+        if (fn !== undefined) return String(fn);
+      }
+    }
+    return "";
   }
 
   // -----------------------------------------------------------------------
