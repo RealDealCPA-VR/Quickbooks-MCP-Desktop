@@ -303,6 +303,174 @@ export function registerSalesReceiptTools(
     }
   );
 
+  // Phase 12 #57a mirror — sales-receipt analog of qb_invoice_duplicate. Same
+  // shape: read source SR with IncludeLineItems opt-in (Phase 10 #41 strip),
+  // submit a fresh SalesReceiptAddRq carrying CustomerRef + PaymentMethodRef +
+  // DepositToAccountRef + lines plus operator overrides. No new wire types.
+  server.tool(
+    "qb_sales_receipt_duplicate",
+    "Duplicate an existing sales receipt in QuickBooks Desktop. Reads the source receipt's CustomerRef + PaymentMethodRef + DepositToAccountRef + SalesReceiptLineRet and submits a fresh SalesReceiptAddRq with that payload plus operator-supplied overrides. Carries by default: CustomerRef, PaymentMethodRef, DepositToAccountRef, lines. Does NOT carry: TxnDate (default = today), RefNumber (a duplicate needs a fresh number — supply it via refNumber or let QB autonumber), Memo (defaults to 'Duplicate of <source ref or TxnID>'). Use this to mirror a recurring cash-sale entry (last month's standing customer → this month's), or retarget at a different customer via customerName/customerListId. Composite tool — uses existing SalesReceipt query + add primitives, no new wire request types. Read-only sessions reject with statusCode 9001 (the SalesReceiptAddRq half is gated). Source receipt not found returns statusCode 500.",
+    {
+      sourceTxnId: z.string().describe("TxnID of the sales receipt to duplicate"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Date for the new sales receipt (YYYY-MM-DD). Default: today. The source receipt's TxnDate is NOT carried — duplicating to the same date is rarely what you want."),
+      refNumber: z.string().optional()
+        .describe("Reference/sales receipt number for the new entry. The source receipt's RefNumber is NOT carried — duplicates need fresh numbers to avoid collisions. Leave blank to let QB autonumber (when enabled in QB preferences)."),
+      memo: z.string().optional()
+        .describe("Memo for the new sales receipt. Default: 'Duplicate of <source ref or TxnID>'."),
+      customerName: z.string().optional()
+        .describe("Retarget the duplicate at a different customer by full name. Default: source receipt's CustomerRef."),
+      customerListId: z.string().optional()
+        .describe("Retarget the duplicate at a different customer by ListID. Default: source receipt's CustomerRef."),
+      paymentMethodName: z.string().optional()
+        .describe("Override the payment method (e.g. 'Check', 'Visa'). Default: source receipt's PaymentMethodRef (carried when present)."),
+      depositToAccountName: z.string().optional()
+        .describe("Override the deposit account (e.g. 'Undeposited Funds', 'Operating Checking'). Default: source receipt's DepositToAccountRef (carried when present)."),
+      idempotencyKey: z.string().min(1).optional()
+        .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+    },
+    async (args) => {
+      const session = getSession();
+
+      let matches: Record<string, unknown>[];
+      try {
+        matches = await session.queryEntity("SalesReceipt", {
+          TxnID: args.sourceTxnId,
+          IncludeLineItems: true,
+        });
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "SalesReceiptQueryRq (duplicate source read) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const source = matches[0];
+      if (!source) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 500,
+              statusMessage: `Source sales receipt "${args.sourceTxnId}" not found`,
+              humanReadable: qbStatusCodeMessage(500),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      let customerRef: Record<string, unknown> | undefined;
+      if (args.customerListId) {
+        customerRef = { ListID: args.customerListId };
+      } else if (args.customerName) {
+        customerRef = { FullName: args.customerName };
+      } else {
+        customerRef = source.CustomerRef as Record<string, unknown> | undefined;
+      }
+      if (!customerRef) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Source sales receipt "${args.sourceTxnId}" has no CustomerRef and no override supplied`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const receiptData: Record<string, unknown> = {
+        CustomerRef: customerRef,
+      };
+
+      // PaymentMethodRef + DepositToAccountRef carry-overs with operator
+      // override priority. Source refs are only used as fallback when no
+      // override is supplied.
+      if (args.paymentMethodName) {
+        receiptData.PaymentMethodRef = { FullName: args.paymentMethodName };
+      } else if (source.PaymentMethodRef) {
+        receiptData.PaymentMethodRef = source.PaymentMethodRef;
+      }
+
+      if (args.depositToAccountName) {
+        receiptData.DepositToAccountRef = { FullName: args.depositToAccountName };
+      } else if (source.DepositToAccountRef) {
+        receiptData.DepositToAccountRef = source.DepositToAccountRef;
+      }
+
+      if (args.txnDate) receiptData.TxnDate = args.txnDate;
+      if (args.refNumber) receiptData.RefNumber = args.refNumber;
+
+      const sourceLabel = source.RefNumber
+        ? String(source.RefNumber)
+        : String(source.TxnID ?? args.sourceTxnId);
+      receiptData.Memo = args.memo ?? `Duplicate of ${sourceLabel}`;
+
+      const sourceLines = Array.isArray(source.SalesReceiptLineRet)
+        ? (source.SalesReceiptLineRet as Record<string, unknown>[])
+        : source.SalesReceiptLineRet
+          ? [source.SalesReceiptLineRet as Record<string, unknown>]
+          : [];
+      if (sourceLines.length > 0) {
+        receiptData.SalesReceiptLineAdd = sourceLines.map((line) => {
+          const lineData: Record<string, unknown> = {};
+          if (line.ItemRef) lineData.ItemRef = line.ItemRef;
+          if (line.Desc !== undefined) lineData.Desc = line.Desc;
+          if (line.Quantity !== undefined) lineData.Quantity = line.Quantity;
+          if (line.Rate !== undefined) lineData.Rate = line.Rate;
+          if (line.Amount !== undefined) lineData.Amount = line.Amount;
+          if (line.ClassRef) lineData.ClassRef = line.ClassRef;
+          return lineData;
+        });
+      }
+
+      try {
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("SalesReceipt", receiptData, args.idempotencyKey)
+          : { entity: await session.addEntity("SalesReceipt", receiptData), replayed: false };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              sourceTxnId: args.sourceTxnId,
+              salesReceipt: result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "SalesReceiptAddRq (duplicate) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   server.tool(
     "qb_sales_receipt_delete",
     "Delete a sales receipt from QuickBooks Desktop. Sales receipts are cash sales — there's no AR balance to reverse, but the original deposit posting against depositToAccountRef is rolled back implicitly by the delete. WARNING: Irreversible.",

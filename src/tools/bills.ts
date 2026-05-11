@@ -439,6 +439,178 @@ export function registerBillTools(
     }
   );
 
+  // Phase 12 #57a mirror — bill-side equivalent of qb_invoice_duplicate. Same
+  // shape: read a source bill (with IncludeLineItems opt-in because Phase 10
+  // #41 strips lines by default), submit a fresh BillAddRq with VendorRef +
+  // line arrays carried + operator overrides applied. No new wire types.
+  server.tool(
+    "qb_bill_duplicate",
+    "Duplicate an existing bill in QuickBooks Desktop. Reads the source bill's VendorRef + ExpenseLineRet + ItemLineRet and submits a fresh BillAddRq with that payload plus operator-supplied overrides. Carries by default: VendorRef, expense lines, item lines. Does NOT carry: TxnDate (default = today), DueDate, RefNumber (a duplicate needs a fresh number — supply it via refNumber or let QB autonumber), Memo (defaults to 'Duplicate of <source ref or TxnID>'). Use this to mirror a recurring vendor bill (last month's rent → this month's), or retarget a one-off bill at a different vendor via vendorName/vendorListId. Composite tool — uses existing Bill query + add primitives, no new wire request types. Read-only sessions reject with statusCode 9001 (the BillAddRq half is gated). Source bill not found returns statusCode 500.",
+    {
+      sourceTxnId: z.string().describe("TxnID of the bill to duplicate"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Date for the new bill (YYYY-MM-DD). Default: today. The source bill's TxnDate is NOT carried — duplicating to the same date is rarely what you want."),
+      dueDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Due date for the new bill (YYYY-MM-DD). The source bill's DueDate is NOT carried (it's relative to TxnDate; carrying makes no sense for a different date)."),
+      refNumber: z.string().optional()
+        .describe("Reference/bill number for the new bill. The source bill's RefNumber is NOT carried — duplicates need fresh numbers to avoid collisions. Leave blank to let QB autonumber (when enabled in QB preferences)."),
+      memo: z.string().optional()
+        .describe("Memo for the new bill. Default: 'Duplicate of <source ref or TxnID>'."),
+      vendorName: z.string().optional()
+        .describe("Retarget the duplicate at a different vendor by full name. Default: source bill's VendorRef."),
+      vendorListId: z.string().optional()
+        .describe("Retarget the duplicate at a different vendor by ListID. Default: source bill's VendorRef."),
+      idempotencyKey: z.string().min(1).optional()
+        .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+    },
+    async (args) => {
+      const session = getSession();
+
+      let matches: Record<string, unknown>[];
+      try {
+        matches = await session.queryEntity("Bill", {
+          TxnID: args.sourceTxnId,
+          IncludeLineItems: true,
+        });
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "BillQueryRq (duplicate source read) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const source = matches[0];
+      if (!source) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 500,
+              statusMessage: `Source bill "${args.sourceTxnId}" not found`,
+              humanReadable: qbStatusCodeMessage(500),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      let vendorRef: Record<string, unknown> | undefined;
+      if (args.vendorListId) {
+        vendorRef = { ListID: args.vendorListId };
+      } else if (args.vendorName) {
+        vendorRef = { FullName: args.vendorName };
+      } else {
+        vendorRef = source.VendorRef as Record<string, unknown> | undefined;
+      }
+      if (!vendorRef) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Source bill "${args.sourceTxnId}" has no VendorRef and no override supplied`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const billData: Record<string, unknown> = {
+        VendorRef: vendorRef,
+      };
+
+      if (args.txnDate) billData.TxnDate = args.txnDate;
+      if (args.dueDate) billData.DueDate = args.dueDate;
+      if (args.refNumber) billData.RefNumber = args.refNumber;
+
+      const sourceLabel = source.RefNumber
+        ? String(source.RefNumber)
+        : String(source.TxnID ?? args.sourceTxnId);
+      billData.Memo = args.memo ?? `Duplicate of ${sourceLabel}`;
+
+      // Map ExpenseLineRet → ExpenseLineAdd. TxnLineID is not carried —
+      // the new bill generates its own line IDs.
+      const sourceExpenseLines = Array.isArray(source.ExpenseLineRet)
+        ? (source.ExpenseLineRet as Record<string, unknown>[])
+        : source.ExpenseLineRet
+          ? [source.ExpenseLineRet as Record<string, unknown>]
+          : [];
+      if (sourceExpenseLines.length > 0) {
+        billData.ExpenseLineAdd = sourceExpenseLines.map((line) => {
+          const lineData: Record<string, unknown> = {};
+          if (line.AccountRef) lineData.AccountRef = line.AccountRef;
+          if (line.Amount !== undefined) lineData.Amount = line.Amount;
+          if (line.Memo !== undefined) lineData.Memo = line.Memo;
+          if (line.ClassRef) lineData.ClassRef = line.ClassRef;
+          return lineData;
+        });
+      }
+
+      // Map ItemLineRet → ItemLineAdd. Item lines carry Quantity + Cost +
+      // Amount; the sim recomputes Amount = Quantity * Cost on add, so
+      // explicit Amount carry keeps round-trip equality.
+      const sourceItemLines = Array.isArray(source.ItemLineRet)
+        ? (source.ItemLineRet as Record<string, unknown>[])
+        : source.ItemLineRet
+          ? [source.ItemLineRet as Record<string, unknown>]
+          : [];
+      if (sourceItemLines.length > 0) {
+        billData.ItemLineAdd = sourceItemLines.map((line) => {
+          const lineData: Record<string, unknown> = {};
+          if (line.ItemRef) lineData.ItemRef = line.ItemRef;
+          if (line.Quantity !== undefined) lineData.Quantity = line.Quantity;
+          if (line.Cost !== undefined) lineData.Cost = line.Cost;
+          if (line.Amount !== undefined) lineData.Amount = line.Amount;
+          if (line.Memo !== undefined) lineData.Memo = line.Memo;
+          return lineData;
+        });
+      }
+
+      try {
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("Bill", billData, args.idempotencyKey)
+          : { entity: await session.addEntity("Bill", billData), replayed: false };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              sourceTxnId: args.sourceTxnId,
+              bill: result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "BillAddRq (duplicate) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // -----------------------------------------------------------------------
   // Bill payment (BillPaymentCheck / BillPaymentCreditCard)
   // -----------------------------------------------------------------------

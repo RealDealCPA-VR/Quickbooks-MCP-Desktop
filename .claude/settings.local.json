@@ -31,7 +31,13 @@
       "Bash(npx vitest *)",
       "Bash(node dist/index.js)",
       "Bash(echo \"EXIT=$?\")",
-      "Bash(node -e \"const fs=require\\('fs'\\);const todo=fs.readFileSync\\('todo.md','utf8'\\);const handoff=fs.readFileSync\\('HANDOFF.md','utf8'\\);console.log\\('todo #49 line:'\\);console.log\\(todo.split\\('\\\\n'\\).filter\\(l=>l.includes\\('**49.**'\\)\\)[0].slice\\(0,180\\)+'...'\\);console.log\\('\\\\nHANDOFF sections:'\\);for\\(const l of handoff.split\\('\\\\n'\\)\\){if\\(l.startsWith\\('## '\\)\\) console.log\\('  '+l\\);}console.log\\('\\\\nHANDOFF length:',handoff.length,'chars'\\);\")"
+      "Bash(node -e \"const fs=require\\('fs'\\);const todo=fs.readFileSync\\('todo.md','utf8'\\);const handoff=fs.readFileSync\\('HANDOFF.md','utf8'\\);console.log\\('todo #49 line:'\\);console.log\\(todo.split\\('\\\\n'\\).filter\\(l=>l.includes\\('**49.**'\\)\\)[0].slice\\(0,180\\)+'...'\\);console.log\\('\\\\nHANDOFF sections:'\\);for\\(const l of handoff.split\\('\\\\n'\\)\\){if\\(l.startsWith\\('## '\\)\\) console.log\\('  '+l\\);}console.log\\('\\\\nHANDOFF length:',handoff.length,'chars'\\);\")",
+      "Bash(\"C:\\\\nvm4w\\\\nodejs\\\\node.exe\" \"C:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\")",
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 10; \"EXIT=$LASTEXITCODE\")",
+      "PowerShell($cfg = \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\"; if \\(Test-Path $cfg\\) { \\(Get-Content $cfg -Raw\\) } else { \"NOT FOUND: $cfg\" })",
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 10; \"ExitCode: $LASTEXITCODE\")",
+      "PowerShell($config = \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\"; if \\(Test-Path $config\\) { Get-Content $config -Raw | Select-String -Pattern 'command|node\\\\.exe|nvm4w' -AllMatches } else { \"Config not present\" })",
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-String \"Mode:\"; \"ExitCode: $LASTEXITCODE\")"
     ]
   }
 }

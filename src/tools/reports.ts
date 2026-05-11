@@ -259,6 +259,129 @@ export function buildGeneralLedgerSection(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Customer / Vendor balance detail helpers — Phase 11 #48 + #51
+// ---------------------------------------------------------------------------
+//
+// qb_customer_balance_detail and qb_vendor_balance_detail share the same
+// per-entity running-balance shape: walk this entity's AR-/AP-affecting
+// transactions in the window, opening balance = current snapshot − period
+// postings, then walk forward. Identical math to buildGeneralLedgerSection
+// except the snapshot field is Customer.Balance / Vendor.Balance (the entity's
+// open AR/AP balance) instead of Account.Balance.
+
+export type EntityBalanceEntity = {
+  ListID?: string;
+  FullName?: string;
+  Name?: string;
+  Balance?: number;
+};
+
+export type EntityBalanceRow = Record<string, unknown> & {
+  Amount: number;
+};
+
+export type EntityBalanceSection = {
+  entityName: string;
+  entityListId?: string;
+  openingBalance: number;
+  closingBalance: number;
+  periodChange: number;
+  count: number;
+  transactions: Array<Record<string, unknown> & { RunningBalance: number }>;
+};
+
+/**
+ * Build one entity-balance section: openingBalance → period rows (each
+ * annotated with RunningBalance) → closingBalance. Pure function so the math
+ * can be unit-tested without spinning up an MCP transport.
+ *
+ * Algorithm (same shape as buildGeneralLedgerSection — see comments there):
+ *   1. currentBalance = entity.Balance (snapshot through "now").
+ *   2. periodSum     = Σ row.Amount over the queried window (signed).
+ *   3. openingBalance = currentBalance − periodSum.
+ *   4. Walk rows forward; RunningBalance += row.Amount per row.
+ *
+ * Exact when toDate ≥ now. For historical windows (toDate < now AND postings
+ * exist after toDate) openingBalance is overstated by those after-period
+ * postings — same documented limitation as qb_general_ledger.
+ *
+ * Sign convention (caller's responsibility — the helper only sums and walks):
+ *   Customer balance: Invoice +, ReceivePayment −, CreditMemo −
+ *   Vendor balance:   Bill +, BillPaymentCheck −, BillPaymentCreditCard −
+ * Positive Amount increases the entity's open AR/AP balance.
+ *
+ * Rows are NOT re-sorted here — the caller guarantees chronological order
+ * (by TxnDate ascending, then TimeCreated as tiebreaker).
+ */
+export function buildEntityBalanceSection(
+  entity: EntityBalanceEntity,
+  rows: EntityBalanceRow[],
+): EntityBalanceSection {
+  const entityName = String(entity.FullName ?? entity.Name ?? "");
+  const currentBalance = Number(entity.Balance ?? 0);
+  const periodSum = rows.reduce((s, r) => s + Number(r.Amount ?? 0), 0);
+  const openingBalance = round2((Number.isFinite(currentBalance) ? currentBalance : 0) - periodSum);
+
+  let running = openingBalance;
+  const transactions: Array<Record<string, unknown> & { RunningBalance: number }> = rows.map((r) => {
+    running += Number(r.Amount ?? 0);
+    return { ...r, RunningBalance: round2(running) };
+  });
+  const closingBalance = round2(running);
+
+  return {
+    entityName,
+    ...(entity.ListID ? { entityListId: String(entity.ListID) } : {}),
+    openingBalance,
+    closingBalance,
+    periodChange: round2(periodSum),
+    count: transactions.length,
+    transactions,
+  };
+}
+
+// Extract the original transaction amount that hit AR/AP at create time.
+// Invoice carries Subtotal + SalesTaxTotal directly; CreditMemo carries the
+// pre-computed TotalAmount; ReceivePayment carries TotalAmount; BillPayment*
+// carries TotalAmount (Amount fallback for older sim records — see the
+// HANDOFF gotcha on BillPaymentCheck). Bill is the outlier — its AmountDue
+// header field is DECREMENTED on every bill payment, so a fully-paid bill
+// has AmountDue=0 and can't be sourced from there; walk ExpenseLineRet +
+// ItemLineRet sums for the original face value.
+export function extractOriginalTxnAmount(
+  txn: Record<string, unknown>,
+  txnType: string,
+): number {
+  if (txnType === "Invoice") {
+    return round2(Number(txn.Subtotal ?? 0) + Number(txn.SalesTaxTotal ?? 0));
+  }
+  if (txnType === "CreditMemo") {
+    const total = Number(txn.TotalAmount ?? 0);
+    if (total) return round2(total);
+    return round2(Number(txn.Subtotal ?? 0) + Number(txn.SalesTaxTotal ?? 0));
+  }
+  if (txnType === "ReceivePayment") {
+    return round2(Number(txn.TotalAmount ?? 0));
+  }
+  if (txnType === "BillPaymentCheck" || txnType === "BillPaymentCreditCard") {
+    return round2(Number(txn.TotalAmount ?? txn.Amount ?? 0));
+  }
+  if (txnType === "Bill") {
+    let sum = 0;
+    for (const key of ["ExpenseLineRet", "ItemLineRet"]) {
+      const lines = txn[key];
+      if (!Array.isArray(lines)) continue;
+      for (const line of lines as Record<string, unknown>[]) {
+        const amt = Number(line.Amount ?? 0);
+        if (Number.isFinite(amt)) sum += amt;
+      }
+    }
+    return round2(sum);
+  }
+  return 0;
+}
+
 export function registerReportTools(
   server: McpServer,
   getSession: () => QBSessionManager
@@ -1228,6 +1351,851 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "GeneralDetailReportQueryRq (SalesByCustomerDetail) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_sales_by_item_summary (Phase 11 #50)
+  //
+  // Wraps GeneralSummaryReportQueryRq with ReportType=SalesByItemSummary.
+  // Per-item revenue rollup over the date window: walks Invoice + SalesReceipt
+  // lines (positive) and CreditMemo lines (negative), groups by line.ItemRef
+  // .FullName. Lines without an ItemRef (sales-tax / discount lines without
+  // an item bound) drop naturally — there's no item to key them under, which
+  // matches QB's actual SalesByItemSummary report.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_sales_by_item_summary",
+    "Sales by Item Summary — per-item revenue rollup (Invoice + SalesReceipt − CreditMemo line totals, grouped by line.ItemRef.FullName) over a date window. Returns items sorted by total descending plus the grand TotalSales. Scope to a single item with itemName / itemListId (server-side ReportItemFilter). Sums are line.Amount sums; lines without an ItemRef drop (no item to key under — matches QB's report). CreditMemo lines reduce sales — a negative item total in the response means more credits than billing in the window. Basis defaults to Accrual.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for no lower bound (all-time)."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current (no upper bound)."),
+      itemName: z.string().optional()
+        .describe("Single-item scope by FullName (e.g. 'Consulting Services'). Passes through as ReportItemFilter.FullName. Takes precedence over itemListId."),
+      itemListId: z.string().optional()
+        .describe("Single-item scope by ListID. Resolved across all five Item subtype stores (ItemService / ItemInventory / ItemNonInventory / ItemOtherCharge / ItemGroup). Alternative to itemName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual. (Note: in simulation mode the income walk is identical regardless of basis — Cash-basis revenue recognition will land with the live-mode adapter validation.)"),
+    },
+    async ({ fromDate, toDate, itemName, itemListId, basis }) => {
+      const session = getSession();
+      try {
+        const itemFilter = itemListId
+          ? { ListID: itemListId }
+          : itemName
+            ? { FullName: itemName }
+            : undefined;
+
+        const reportRet = await session.runReport("SalesByItemSummary", {
+          fromDate,
+          toDate,
+          basis,
+          ...(itemFilter ? { itemFilter } : {}),
+        });
+
+        const totals = (reportRet.Totals as Record<string, unknown> | undefined) ?? {};
+        const sections = (reportRet.Sections as Array<{
+          Name: string;
+          Accounts: Array<{ Name: string; Total: number }>;
+          Subtotal: number;
+        }> | undefined) ?? [];
+        const items = sections[0]?.Accounts?.map((a) => ({
+          itemName: a.Name,
+          total: a.Total,
+        })) ?? [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Sales by Item Summary",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              itemCount: items.length,
+              totalSales: Number(totals.TotalSales ?? 0),
+              items,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralSummaryReportQueryRq (SalesByItemSummary) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_sales_by_item_detail (Phase 11 #50)
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_sales_by_item_detail",
+    "Sales by Item Detail — per-line sales detail (Invoice / SalesReceipt / CreditMemo line rows) for the date window, sorted by Item → TxnDate → TxnID. Returns rows with TxnType / Date / Num (refNumber) / Name (customer) / Memo / Item / Quantity / Rate / Account (income account) / Amount / TxnID. CreditMemo rows emit with Amount sign-flipped (negative). Lines without an ItemRef drop (no item to attribute). Scope by item (itemName | itemListId) for single-item drilldown. NOTE: live mode adapter for this report uses the same row-tree translator as CustomDetailReport — verified-by-construction structurally but live-validation against a real QB Desktop hasn't been run yet.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for no lower bound."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current."),
+      itemName: z.string().optional()
+        .describe("Single-item scope by FullName. Passes through as ReportItemFilter.FullName. Takes precedence over itemListId."),
+      itemListId: z.string().optional()
+        .describe("Single-item scope by ListID. Resolved across all five Item subtype stores. Alternative to itemName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual."),
+    },
+    async ({ fromDate, toDate, itemName, itemListId, basis }) => {
+      const session = getSession();
+      try {
+        const itemFilter = itemListId
+          ? { ListID: itemListId }
+          : itemName
+            ? { FullName: itemName }
+            : undefined;
+
+        const reportRet = await session.runGeneralDetailReport({
+          reportType: "SalesByItemDetail",
+          fromDate,
+          toDate,
+          basis,
+          ...(itemFilter ? { itemFilter } : {}),
+        });
+
+        const rows = (reportRet.Rows as Record<string, unknown>[] | undefined) ?? [];
+        const columns = (reportRet.Columns as Array<{ Title: string; Type: string }> | undefined) ?? [];
+        const totalAmount = round2(
+          rows.reduce((s, r) => s + Number(r.Amount ?? 0), 0),
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Sales by Item Detail",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              rowCount: rows.length,
+              totalAmount,
+              columns,
+              rows,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralDetailReportQueryRq (SalesByItemDetail) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_expense_by_vendor_summary (Phase 11 #52)
+  //
+  // Wraps GeneralSummaryReportQueryRq with ReportType=ExpensesByVendorSummary.
+  // Per-vendor expense rollup: walks Bill (VendorRef) + Check (PayeeEntityRef)
+  // + CreditCardCharge (PayeeEntityRef) ExpenseLineRet + ItemLineRet, sums
+  // line.Amount by vendor name. Mirrors qb_sales_by_customer_summary's
+  // simpler approach — every line.Amount counts (no AccountType filter), which
+  // means the rare asset-purchase via Check is included too. Documented.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_expense_by_vendor_summary",
+    "Expenses by Vendor Summary — per-vendor expense rollup (Bill + Check + CreditCardCharge ExpenseLineRet + ItemLineRet totals, grouped by the txn's VendorRef / PayeeEntityRef) over a date window. Returns vendors sorted by total descending plus the grand TotalExpenses. Scope to a single vendor with vendorName / vendorListId (server-side ReportEntityFilter). Sums are line.Amount sums — caveat: the simpler walk does NOT filter by underlying account's AccountType (matches the Phase 11 #49 simplification), so a Check posting to a Fixed Asset account still counts here as an 'expense to vendor X'. Real QB's ExpensesByVendor scopes to Expense/COGS/OtherExpense postings; in live mode this report goes through QB which applies that filter. Basis defaults to Accrual.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for no lower bound (all-time)."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current (no upper bound)."),
+      vendorName: z.string().optional()
+        .describe("Single-vendor scope by FullName (e.g. 'ACME Property Mgmt'). Passes through as ReportEntityFilter.FullName. Takes precedence over vendorListId."),
+      vendorListId: z.string().optional()
+        .describe("Single-vendor scope by ListID. Resolved against the Vendor store. Alternative to vendorName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual. (Note: in simulation mode the expense walk is identical regardless of basis.)"),
+    },
+    async ({ fromDate, toDate, vendorName, vendorListId, basis }) => {
+      const session = getSession();
+      try {
+        const entityFilter = vendorListId
+          ? { ListID: vendorListId }
+          : vendorName
+            ? { FullName: vendorName }
+            : undefined;
+
+        const reportRet = await session.runReport("ExpensesByVendorSummary", {
+          fromDate,
+          toDate,
+          basis,
+          ...(entityFilter ? { entityFilter } : {}),
+        });
+
+        const totals = (reportRet.Totals as Record<string, unknown> | undefined) ?? {};
+        const sections = (reportRet.Sections as Array<{
+          Name: string;
+          Accounts: Array<{ Name: string; Total: number }>;
+          Subtotal: number;
+        }> | undefined) ?? [];
+        const vendors = sections[0]?.Accounts?.map((a) => ({
+          vendorName: a.Name,
+          total: a.Total,
+        })) ?? [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Expenses by Vendor Summary",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              vendorCount: vendors.length,
+              totalExpenses: Number(totals.TotalExpenses ?? 0),
+              vendors,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralSummaryReportQueryRq (ExpensesByVendorSummary) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_expense_by_vendor_detail (Phase 11 #52)
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_expense_by_vendor_detail",
+    "Expenses by Vendor Detail — per-line expense detail (Bill / Check / CreditCardCharge ExpenseLineRet + ItemLineRet rows) for the date window, sorted by Vendor → TxnDate → TxnID. Returns rows with TxnType / Date / Num (refNumber) / Name (vendor) / Memo / Item (item line only) / Quantity / Rate (or Cost for item lines) / Account (expense account, or 'Uncategorized Expense' fallback when an item carries no ExpenseAccountRef) / Amount / TxnID. Scope by vendor (vendorName | vendorListId) for single-vendor drilldown. Same caveat as the summary variant: sim doesn't filter by underlying account's AccountType. NOTE: live mode adapter reuses the CustomDetailReport row-tree translator — verified-by-construction structurally but live-validation against a real QB Desktop hasn't been run yet.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for no lower bound."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current."),
+      vendorName: z.string().optional()
+        .describe("Single-vendor scope by FullName. Passes through as ReportEntityFilter.FullName. Takes precedence over vendorListId."),
+      vendorListId: z.string().optional()
+        .describe("Single-vendor scope by ListID. Resolved against the Vendor store. Alternative to vendorName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual."),
+    },
+    async ({ fromDate, toDate, vendorName, vendorListId, basis }) => {
+      const session = getSession();
+      try {
+        const entityFilter = vendorListId
+          ? { ListID: vendorListId }
+          : vendorName
+            ? { FullName: vendorName }
+            : undefined;
+
+        const reportRet = await session.runGeneralDetailReport({
+          reportType: "ExpensesByVendorDetail",
+          fromDate,
+          toDate,
+          basis,
+          ...(entityFilter ? { entityFilter } : {}),
+        });
+
+        const rows = (reportRet.Rows as Record<string, unknown>[] | undefined) ?? [];
+        const columns = (reportRet.Columns as Array<{ Title: string; Type: string }> | undefined) ?? [];
+        const totalAmount = round2(
+          rows.reduce((s, r) => s + Number(r.Amount ?? 0), 0),
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Expenses by Vendor Detail",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              rowCount: rows.length,
+              totalAmount,
+              columns,
+              rows,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralDetailReportQueryRq (ExpensesByVendorDetail) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_customer_balance_detail (Phase 11 #48)
+  //
+  // Composite over typed entity queries — fetches Customer + Invoice +
+  // ReceivePayment + CreditMemo (optionally scoped by EntityFilter +
+  // TxnDateRangeFilter), groups postings by customer, walks each group
+  // chronologically with buildEntityBalanceSection. Same composite pattern
+  // as qb_ar_aging (one query per entity type), NOT qb_general_ledger's
+  // per-customer TransactionQueryRq fanout — TransactionQueryRq requires
+  // AccountFilter and emits line-level postings only, which means the sim
+  // doesn't surface AR counter-postings (a known limitation documented on
+  // handleTransactionQuery). Walking typed entities directly hits the AR
+  // posting on Invoice/ReceivePayment/CreditMemo without that gap and
+  // collapses to ≤3 round trips regardless of customer count.
+  //
+  // Sign convention (handled by extractOriginalTxnAmount):
+  //   Invoice         → +Subtotal + SalesTaxTotal (increases AR)
+  //   ReceivePayment  → -TotalAmount             (decreases AR)
+  //   CreditMemo      → -TotalAmount             (decreases AR)
+  //
+  // JournalEntry postings to the AR account are NOT walked — JE lines don't
+  // reliably carry a customer reference in the sim, and a JE that debits AR
+  // shows on qb_transaction_list_by_account / qb_general_ledger for the AR
+  // account directly. Documented limitation; real QB CustomerBalanceDetail
+  // would include them via the per-line customer ref the live wire returns.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_customer_balance_detail",
+    "Customer Balance Detail — for every customer with AR activity in the date window (or the single customer selected by customerName / customerListId), list every Invoice / ReceivePayment / CreditMemo that hit their AR balance, sorted by TxnDate ascending, with per-row RunningBalance plus per-customer OpeningBalance / ClosingBalance / periodChange. Composite of InvoiceQueryRq + ReceivePaymentQueryRq + CreditMemoQueryRq with optional EntityFilter — three round trips regardless of customer count (not a per-customer fanout). Sign convention: positive Amount = increases AR (Invoice posts the full Subtotal + SalesTaxTotal); negative = decreases AR (ReceivePayment.TotalAmount, CreditMemo.TotalAmount). RunningBalance math: openingBalance = Customer.Balance − periodSum, then walks forward; exact when toDate ≥ now. JournalEntry postings to the AR account are NOT walked (JE lines don't carry customer ref reliably in sim — visible via qb_transaction_list_by_account on the AR account directly). Empty sections (customers with no activity in window AND zero closing balance) are pruned by default — set includeZeroBalance:true to keep them.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for all-time (each customer section walks every AR-affecting txn ever)."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current. RunningBalance math is exact only when toDate ≥ now."),
+      customerName: z.string().optional()
+        .describe("Single-customer scope by FullName. Passes through as EntityFilter.FullName on each underlying query. Takes precedence over customerListId."),
+      customerListId: z.string().optional()
+        .describe("Single-customer scope by ListID. Alternative to customerName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual. Currently advisory in simulation (the entity walks don't branch on basis); threaded through for parity with other report tools."),
+      maxCustomers: z.number().int().positive().optional()
+        .describe("Cap on the number of customers to emit sections for (safety brake). Default 200. Sections are sorted alphabetically by customer name before truncation, so the first N alphabetically win."),
+      maxRowsPerCustomer: z.number().int().positive().optional()
+        .describe("Per-customer row cap. Default 500. Hitting this cap on any customer triggers a `truncated` flag on that section."),
+      includeZeroBalance: z.boolean().optional()
+        .describe("When true, include customers with no activity in the window AND zero closing balance. Default false — empty sections are pruned so the response focuses on customers with AR activity or open balance."),
+    },
+    async (args) => {
+      const session = getSession();
+      const effectiveMaxCustomers = args.maxCustomers ?? 200;
+      const effectiveMaxRows = args.maxRowsPerCustomer ?? 500;
+      const includeZero = args.includeZeroBalance === true;
+      const warnings: string[] = [];
+
+      try {
+        const allCustomers = await session.queryEntity("Customer", {});
+
+        let targetCustomers = allCustomers as EntityBalanceEntity[];
+        if (args.customerListId) {
+          targetCustomers = targetCustomers.filter(
+            (c) => String(c.ListID ?? "") === args.customerListId,
+          );
+          if (targetCustomers.length === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 500,
+                  statusMessage: `Customer with ListID '${args.customerListId}' not found`,
+                  humanReadable: qbStatusCodeMessage(500),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        } else if (args.customerName) {
+          targetCustomers = targetCustomers.filter(
+            (c) => String(c.FullName ?? c.Name ?? "") === args.customerName,
+          );
+          if (targetCustomers.length === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 500,
+                  statusMessage: `Customer with FullName '${args.customerName}' not found`,
+                  humanReadable: qbStatusCodeMessage(500),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        }
+
+        // Build shared filter dict in canonical schema order: MaxReturned →
+        // TxnDateRangeFilter → EntityFilter (per qbxmlops <xs:sequence> for
+        // InvoiceQueryRq / ReceivePaymentQueryRq / CreditMemoQueryRq; pinned
+        // in tests/builder-emit-order.test.ts for InvoiceQueryRq, the others
+        // share the same prefix).
+        //
+        // Resolve listId → fullName for the EntityFilter: real QB matches
+        // either form, but the sim's handleQuery only checks ref.ListID
+        // directly and stored CustomerRefs added via addEntity with only
+        // FullName don't carry a hydrated ListID. Canonicalizing to FullName
+        // (taken from the already-fetched customer record) keeps the match
+        // robust across both modes.
+        const resolvedCustomer = targetCustomers.length === 1 ? targetCustomers[0] : null;
+        const entityFilter = resolvedCustomer
+          ? { FullName: String(resolvedCustomer.FullName ?? resolvedCustomer.Name ?? "") }
+          : args.customerName
+            ? { FullName: args.customerName }
+            : undefined;
+
+        const sharedFilters: Record<string, unknown> = {};
+        if (args.fromDate || args.toDate) {
+          sharedFilters.TxnDateRangeFilter = {
+            FromTxnDate: args.fromDate,
+            ToTxnDate: args.toDate,
+          };
+        }
+        if (entityFilter) sharedFilters.EntityFilter = entityFilter;
+
+        const [invoices, payments, creditMemos] = await Promise.all([
+          session.queryEntity("Invoice", sharedFilters),
+          session.queryEntity("ReceivePayment", sharedFilters),
+          session.queryEntity("CreditMemo", sharedFilters),
+        ]);
+
+        // Group postings by customer FullName. Build rows tagged with TxnType
+        // so the response carries enough context for the operator to drill
+        // down via qb_invoice_list / qb_payment_list / qb_credit_memo_list.
+        const rowsByCustomer = new Map<string, EntityBalanceRow[]>();
+        const pushRow = (
+          customerName: string,
+          row: EntityBalanceRow,
+        ): void => {
+          let list = rowsByCustomer.get(customerName);
+          if (!list) {
+            list = [];
+            rowsByCustomer.set(customerName, list);
+          }
+          list.push(row);
+        };
+
+        const toRow = (
+          txn: Record<string, unknown>,
+          txnType: string,
+          sign: 1 | -1,
+        ): EntityBalanceRow | null => {
+          const original = extractOriginalTxnAmount(txn, txnType);
+          if (!Number.isFinite(original) || original === 0) return null;
+          const ref = txn.CustomerRef as { FullName?: string } | undefined;
+          const customerName = ref?.FullName ? String(ref.FullName) : null;
+          if (!customerName) return null;
+          const row: EntityBalanceRow = {
+            TxnType: txnType,
+            TxnID: String(txn.TxnID ?? ""),
+            TxnDate: String(txn.TxnDate ?? ""),
+            ...(txn.RefNumber !== undefined ? { RefNumber: String(txn.RefNumber) } : {}),
+            ...(txn.Memo !== undefined ? { Memo: String(txn.Memo) } : {}),
+            Amount: round2(sign * original),
+            ...(txn.TimeCreated !== undefined ? { TimeCreated: String(txn.TimeCreated) } : {}),
+          };
+          pushRow(customerName, row);
+          return row;
+        };
+
+        for (const inv of invoices) toRow(inv, "Invoice", 1);
+        for (const pmt of payments) toRow(pmt, "ReceivePayment", -1);
+        for (const cm of creditMemos) toRow(cm, "CreditMemo", -1);
+
+        // Sort each customer's rows chronologically (TxnDate ascending,
+        // TimeCreated tiebreaker for same-date postings).
+        for (const list of rowsByCustomer.values()) {
+          list.sort((a, b) => {
+            const ad = String(a.TxnDate ?? "");
+            const bd = String(b.TxnDate ?? "");
+            if (ad !== bd) return ad < bd ? -1 : 1;
+            const at = String(a.TimeCreated ?? "");
+            const bt = String(b.TimeCreated ?? "");
+            return at < bt ? -1 : at > bt ? 1 : 0;
+          });
+        }
+
+        // Build sections — one per customer in the target set. Customers
+        // without activity in the window AND zero closing balance are pruned
+        // unless includeZeroBalance is set.
+        const sections: Array<Omit<EntityBalanceSection, "entityName" | "entityListId"> & {
+          customerName: string;
+          customerListId?: string;
+          truncated?: boolean;
+        }> = [];
+
+        // Sort customers alphabetically (matches QB's CustomerBalanceDetail
+        // sort order) before applying the maxCustomers cap.
+        const sortedCustomers = [...targetCustomers].sort((a, b) => {
+          const an = String(a.FullName ?? a.Name ?? "");
+          const bn = String(b.FullName ?? b.Name ?? "");
+          return an < bn ? -1 : an > bn ? 1 : 0;
+        });
+
+        if (sortedCustomers.length > effectiveMaxCustomers) {
+          warnings.push(
+            `Customer fanout (${sortedCustomers.length}) exceeds maxCustomers (${effectiveMaxCustomers}). Truncating alphabetically — re-run with maxCustomers: ${sortedCustomers.length} or scope by customerName / customerListId.`,
+          );
+        }
+        const capped = sortedCustomers.slice(0, effectiveMaxCustomers);
+
+        let totalRowCount = 0;
+        for (const customer of capped) {
+          const cName = String(customer.FullName ?? customer.Name ?? "");
+          const allRows = rowsByCustomer.get(cName) ?? [];
+          const truncated = allRows.length > effectiveMaxRows;
+          const rows = truncated ? allRows.slice(0, effectiveMaxRows) : allRows;
+          const section = buildEntityBalanceSection(customer, rows);
+          totalRowCount += section.count;
+
+          // Prune sections with no activity AND zero closing balance — these
+          // are customers in the master list who happen not to have any
+          // open AR or activity in the window.
+          if (
+            !includeZero
+            && section.count === 0
+            && section.closingBalance === 0
+            && section.openingBalance === 0
+          ) {
+            continue;
+          }
+
+          // Rename the helper's generic entityName/entityListId to the
+          // customer-specific keys the tool surface promises.
+          const { entityName, entityListId, ...rest } = section;
+          sections.push({
+            customerName: entityName,
+            ...(entityListId ? { customerListId: entityListId } : {}),
+            ...rest,
+            ...(truncated ? { truncated: true } : {}),
+          });
+        }
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              fromDate: args.fromDate ?? null,
+              toDate: args.toDate ?? null,
+              basis: args.basis ?? "Accrual",
+              customerCount: sections.length,
+              totalRowCount,
+              sections,
+              ...(warnings.length > 0 ? { warnings } : {}),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "qb_customer_balance_detail failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_vendor_balance_detail (Phase 11 #51)
+  //
+  // Mirror of qb_customer_balance_detail on the AP side — walks Bill +
+  // BillPaymentCheck + BillPaymentCreditCard per vendor with the same
+  // running-balance math. Bill is the outlier on amount extraction because
+  // its AmountDue header field is decremented on every bill payment, so a
+  // fully-paid bill reports AmountDue=0; extractOriginalTxnAmount walks the
+  // line set (ExpenseLineRet + ItemLineRet) for the original face value.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_vendor_balance_detail",
+    "Vendor Balance Detail — for every vendor with AP activity in the date window (or the single vendor selected by vendorName / vendorListId), list every Bill / BillPaymentCheck / BillPaymentCreditCard that hit their AP balance, sorted by TxnDate ascending, with per-row RunningBalance plus per-vendor OpeningBalance / ClosingBalance / periodChange. Composite of BillQueryRq + BillPaymentCheckQueryRq + BillPaymentCreditCardQueryRq with optional EntityFilter — three round trips regardless of vendor count. Sign convention: positive Amount = increases AP (Bill posts the original ExpenseLineRet + ItemLineRet sum, because Bill.AmountDue is decremented on every payment and can't be sourced from there); negative = decreases AP (BillPaymentCheck.TotalAmount, BillPaymentCreditCard.TotalAmount). RunningBalance math: openingBalance = Vendor.Balance − periodSum, then walks forward; exact when toDate ≥ now. JournalEntry postings to the AP account are NOT walked (JE lines don't carry vendor ref reliably in sim — visible via qb_transaction_list_by_account on the AP account directly). VendorCredit is also not walked (no VendorCredit tool exists in this server's first cut — credits applied through bill payments still surface via BillPaymentCheck.DiscountAmount on the underlying bill). Empty sections (vendors with no activity in window AND zero closing balance) are pruned by default — set includeZeroBalance:true to keep them.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the reporting window (YYYY-MM-DD, inclusive). Omit for all-time."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the reporting window (YYYY-MM-DD, inclusive). Omit for through-current. RunningBalance math is exact only when toDate ≥ now."),
+      vendorName: z.string().optional()
+        .describe("Single-vendor scope by FullName. Passes through as EntityFilter.FullName on each underlying query. Takes precedence over vendorListId."),
+      vendorListId: z.string().optional()
+        .describe("Single-vendor scope by ListID. Alternative to vendorName."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual. Currently advisory in simulation; threaded through for parity with other report tools."),
+      maxVendors: z.number().int().positive().optional()
+        .describe("Cap on the number of vendors to emit sections for. Default 200. Sections are sorted alphabetically before truncation."),
+      maxRowsPerVendor: z.number().int().positive().optional()
+        .describe("Per-vendor row cap. Default 500. Hitting this cap on any vendor triggers a `truncated` flag on that section."),
+      includeZeroBalance: z.boolean().optional()
+        .describe("When true, include vendors with no activity in the window AND zero closing balance. Default false."),
+    },
+    async (args) => {
+      const session = getSession();
+      const effectiveMaxVendors = args.maxVendors ?? 200;
+      const effectiveMaxRows = args.maxRowsPerVendor ?? 500;
+      const includeZero = args.includeZeroBalance === true;
+      const warnings: string[] = [];
+
+      try {
+        const allVendors = await session.queryEntity("Vendor", {});
+
+        let targetVendors = allVendors as EntityBalanceEntity[];
+        if (args.vendorListId) {
+          targetVendors = targetVendors.filter(
+            (v) => String(v.ListID ?? "") === args.vendorListId,
+          );
+          if (targetVendors.length === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 500,
+                  statusMessage: `Vendor with ListID '${args.vendorListId}' not found`,
+                  humanReadable: qbStatusCodeMessage(500),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        } else if (args.vendorName) {
+          targetVendors = targetVendors.filter(
+            (v) => String(v.FullName ?? v.Name ?? "") === args.vendorName,
+          );
+          if (targetVendors.length === 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 500,
+                  statusMessage: `Vendor with FullName '${args.vendorName}' not found`,
+                  humanReadable: qbStatusCodeMessage(500),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        }
+
+        // Same listId → fullName canonicalization as the customer tool: the
+        // sim's EntityFilter.ListID path doesn't match against stored
+        // VendorRefs whose ListID hasn't been hydrated (CustomerRef and
+        // VendorRef are handled by the same handleQuery branch — see the
+        // EntityFilter section in simulation-store.ts:236-263).
+        const resolvedVendor = targetVendors.length === 1 ? targetVendors[0] : null;
+        const entityFilter = resolvedVendor
+          ? { FullName: String(resolvedVendor.FullName ?? resolvedVendor.Name ?? "") }
+          : args.vendorName
+            ? { FullName: args.vendorName }
+            : undefined;
+
+        const sharedFilters: Record<string, unknown> = {};
+        if (args.fromDate || args.toDate) {
+          sharedFilters.TxnDateRangeFilter = {
+            FromTxnDate: args.fromDate,
+            ToTxnDate: args.toDate,
+          };
+        }
+        if (entityFilter) sharedFilters.EntityFilter = entityFilter;
+
+        // Bill needs IncludeLineItems on the query because
+        // extractOriginalTxnAmount walks ExpenseLineRet + ItemLineRet for the
+        // original face value (AmountDue is decremented on payment). Lines
+        // are stripped from list responses by default since Phase 10 #41.
+        const billFilters: Record<string, unknown> = { ...sharedFilters, IncludeLineItems: true };
+
+        const [bills, paymentChecks, paymentCards] = await Promise.all([
+          session.queryEntity("Bill", billFilters),
+          session.queryEntity("BillPaymentCheck", sharedFilters),
+          session.queryEntity("BillPaymentCreditCard", sharedFilters),
+        ]);
+
+        const rowsByVendor = new Map<string, EntityBalanceRow[]>();
+        const pushRow = (
+          vendorName: string,
+          row: EntityBalanceRow,
+        ): void => {
+          let list = rowsByVendor.get(vendorName);
+          if (!list) {
+            list = [];
+            rowsByVendor.set(vendorName, list);
+          }
+          list.push(row);
+        };
+
+        const toRow = (
+          txn: Record<string, unknown>,
+          txnType: string,
+          sign: 1 | -1,
+        ): void => {
+          const original = extractOriginalTxnAmount(txn, txnType);
+          if (!Number.isFinite(original) || original === 0) return;
+          const ref = txn.VendorRef as { FullName?: string } | undefined;
+          const vendorName = ref?.FullName ? String(ref.FullName) : null;
+          if (!vendorName) return;
+          const row: EntityBalanceRow = {
+            TxnType: txnType,
+            TxnID: String(txn.TxnID ?? ""),
+            TxnDate: String(txn.TxnDate ?? ""),
+            ...(txn.RefNumber !== undefined ? { RefNumber: String(txn.RefNumber) } : {}),
+            ...(txn.Memo !== undefined ? { Memo: String(txn.Memo) } : {}),
+            Amount: round2(sign * original),
+            ...(txn.TimeCreated !== undefined ? { TimeCreated: String(txn.TimeCreated) } : {}),
+          };
+          pushRow(vendorName, row);
+        };
+
+        for (const bill of bills) toRow(bill, "Bill", 1);
+        for (const pmt of paymentChecks) toRow(pmt, "BillPaymentCheck", -1);
+        for (const pmt of paymentCards) toRow(pmt, "BillPaymentCreditCard", -1);
+
+        for (const list of rowsByVendor.values()) {
+          list.sort((a, b) => {
+            const ad = String(a.TxnDate ?? "");
+            const bd = String(b.TxnDate ?? "");
+            if (ad !== bd) return ad < bd ? -1 : 1;
+            const at = String(a.TimeCreated ?? "");
+            const bt = String(b.TimeCreated ?? "");
+            return at < bt ? -1 : at > bt ? 1 : 0;
+          });
+        }
+
+        const sections: Array<Omit<EntityBalanceSection, "entityName" | "entityListId"> & {
+          vendorName: string;
+          vendorListId?: string;
+          truncated?: boolean;
+        }> = [];
+
+        const sortedVendors = [...targetVendors].sort((a, b) => {
+          const an = String(a.FullName ?? a.Name ?? "");
+          const bn = String(b.FullName ?? b.Name ?? "");
+          return an < bn ? -1 : an > bn ? 1 : 0;
+        });
+
+        if (sortedVendors.length > effectiveMaxVendors) {
+          warnings.push(
+            `Vendor fanout (${sortedVendors.length}) exceeds maxVendors (${effectiveMaxVendors}). Truncating alphabetically — re-run with maxVendors: ${sortedVendors.length} or scope by vendorName / vendorListId.`,
+          );
+        }
+        const capped = sortedVendors.slice(0, effectiveMaxVendors);
+
+        let totalRowCount = 0;
+        for (const vendor of capped) {
+          const vName = String(vendor.FullName ?? vendor.Name ?? "");
+          const allRows = rowsByVendor.get(vName) ?? [];
+          const truncated = allRows.length > effectiveMaxRows;
+          const rows = truncated ? allRows.slice(0, effectiveMaxRows) : allRows;
+          const section = buildEntityBalanceSection(vendor, rows);
+          totalRowCount += section.count;
+
+          if (
+            !includeZero
+            && section.count === 0
+            && section.closingBalance === 0
+            && section.openingBalance === 0
+          ) {
+            continue;
+          }
+
+          const { entityName, entityListId, ...rest } = section;
+          sections.push({
+            vendorName: entityName,
+            ...(entityListId ? { vendorListId: entityListId } : {}),
+            ...rest,
+            ...(truncated ? { truncated: true } : {}),
+          });
+        }
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              fromDate: args.fromDate ?? null,
+              toDate: args.toDate ?? null,
+              basis: args.basis ?? "Accrual",
+              vendorCount: sections.length,
+              totalRowCount,
+              sections,
+              ...(warnings.length > 0 ? { warnings } : {}),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "qb_vendor_balance_detail failed",
               ...(humanReadable ? { humanReadable } : {}),
             }),
           }],

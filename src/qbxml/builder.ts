@@ -207,6 +207,7 @@ export function buildReportRequest(
     toDate?: string;
     basis?: "Accrual" | "Cash";
     entityFilter?: { FullName?: string; ListID?: string };
+    itemFilter?: { FullName?: string; ListID?: string };
   },
   version?: string
 ): string {
@@ -232,6 +233,17 @@ export function buildReportRequest(
     if (params.entityFilter.ListID) ef.ListID = params.entityFilter.ListID;
     else if (params.entityFilter.FullName) ef.FullName = params.entityFilter.FullName;
     if (Object.keys(ef).length > 0) body.ReportEntityFilter = ef;
+  }
+
+  // ReportItemFilter (Phase 11 #50) — narrows reports like SalesByItemSummary to
+  // a single item. Schema position is immediately after ReportEntityFilter
+  // (same relative order as in GeneralDetailReportQueryRq, where they're
+  // already pinned at positions 4/5). Skipped silently when not supplied.
+  if (params.itemFilter) {
+    const itf: Record<string, unknown> = {};
+    if (params.itemFilter.ListID) itf.ListID = params.itemFilter.ListID;
+    else if (params.itemFilter.FullName) itf.FullName = params.itemFilter.FullName;
+    if (Object.keys(itf).length > 0) body.ReportItemFilter = itf;
   }
 
   body.SummarizeColumnsBy = "TotalOnly";
@@ -453,6 +465,9 @@ export function buildDeleteRequest(
     "BillPaymentCreditCard",
     "ReceivePayment",
     "SalesOrder",
+    // Phase 11 #52 — kept in sync with isTransactionType in simulation-store
+    "CreditCardCharge",
+    "CreditCardCredit",
   ].includes(entityType);
 
   if (isTransaction) {

@@ -535,4 +535,216 @@ export function registerInvoiceTools(
       }
     }
   );
+
+  // qb_invoice_write_off — close an open invoice in one atomic call without
+  // collecting payment. Wires as a $0 ReceivePayment whose AppliedToTxnAdd
+  // carries PaymentAmount=0 + DiscountAmount=writeOffAmount +
+  // DiscountAccountRef={FullName: writeOffAccount}. The discount closes
+  // the invoice's BalanceRemaining alongside any payment portion (zero here)
+  // and posts to the named expense account (typically "Bad Debt" or a
+  // similar write-off P&L line). Single QBXML envelope — no compensating
+  // delete needed. This is the same mechanism QB Desktop's "Discounts and
+  // Credits" dialog uses when an accountant writes off an invoice via the
+  // Receive Payments form.
+  server.tool(
+    "qb_invoice_write_off",
+    "Write off an open invoice in QuickBooks Desktop in one atomic call. Reads the source invoice, then submits a $0 ReceivePayment with the invoice's BalanceRemaining (or a partial `amount`) as DiscountAmount posting to `writeOffAccount` (e.g. 'Bad Debt'). The invoice's BalanceRemaining drops to 0 (full write-off) or by `amount` (partial), IsPaid flips true on full write-off, the customer's open AR drops by the written-off amount, and the write-off posts to the named P&L account. Equivalent to QB Desktop's 'Discounts and Credits → Discount Tab → Discount Account' workflow on the Receive Payments form, but a single tool call instead of the multi-step UI dance. Source invoice not found returns statusCode 500; already-closed invoice (BalanceRemaining ≤ 0) returns a structured error. Read-only sessions reject with statusCode 9001 (the ReceivePaymentAdd half is gated).",
+    {
+      txnId: z.string().describe("TxnID of the invoice to write off"),
+      writeOffAccount: z.string()
+        .describe("Full name of the P&L account the write-off posts to (e.g. 'Bad Debt', 'Bad Debts Expense'). Discover via qb_account_list({accountType:'Expense'}) or {accountType:'OtherExpense'}."),
+      amount: z.number().optional()
+        .describe("Write-off amount. Default: the invoice's full BalanceRemaining (closes the invoice). Pass a smaller value for a partial write-off (the remainder stays open). Must be > 0 and ≤ BalanceRemaining."),
+      txnDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Date for the write-off entry (YYYY-MM-DD). Default: today."),
+      refNumber: z.string().optional()
+        .describe("Reference number for the underlying ReceivePayment record. Leave blank to let QB autonumber (when enabled in QB preferences)."),
+      memo: z.string().optional()
+        .describe("Memo for the write-off entry. Default: 'Write off invoice <source ref or TxnID>'."),
+      depositToAccountName: z.string().optional()
+        .describe("Optional 'Deposit To' account on the underlying ReceivePayment. The write-off itself posts to writeOffAccount; this field exists because real QB requires every ReceivePayment to name a deposit account even when TotalAmount is 0. Defaults to your QB file's configured Undeposited Funds / default deposit account."),
+      idempotencyKey: z.string().min(1).optional()
+        .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original write-off without creating a duplicate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+    },
+    async (args) => {
+      const session = getSession();
+
+      // Idempotent-replay detection: a write-off MUTATES its source invoice
+      // (closes BalanceRemaining), so a second call with the same key would
+      // fail the "invoice still open" check before reaching addEntityIdempotent.
+      // Peek the cache up front so we can relax stale-state validation on
+      // replay and let addEntityIdempotent be the authority on fingerprint
+      // match vs. 9002 conflict.
+      const cachedEntry = args.idempotencyKey
+        ? session.peekIdempotencyEntry(args.idempotencyKey)
+        : undefined;
+      const isReplayCandidate = cachedEntry?.entityType === "ReceivePayment";
+
+      let matches: Record<string, unknown>[];
+      try {
+        matches = await session.queryEntity("Invoice", { TxnID: args.txnId });
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "InvoiceQueryRq (write-off source read) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const source = matches[0];
+      if (!source) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 500,
+              statusMessage: `Source invoice "${args.txnId}" not found`,
+              humanReadable: qbStatusCodeMessage(500),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const customerRef = source.CustomerRef as Record<string, unknown> | undefined;
+      if (!customerRef) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Source invoice "${args.txnId}" has no CustomerRef — cannot wire write-off ReceivePayment`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const balanceRemaining = Number(source.BalanceRemaining ?? 0);
+      if (!isReplayCandidate && balanceRemaining <= 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Invoice "${args.txnId}" has BalanceRemaining ${balanceRemaining} — already paid or closed; nothing to write off`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      // On replay, the prior call's writeOffAmount is the only payload that
+      // will fingerprint-match. If the operator didn't pass an explicit
+      // `amount`, pull the cached DiscountAmount; otherwise let their explicit
+      // value flow through and let addEntityIdempotent fingerprint-decide.
+      let writeOffAmount: number;
+      if (isReplayCandidate && args.amount === undefined) {
+        const cachedPayment = cachedEntry!.result as Record<string, unknown>;
+        const applied = cachedPayment.AppliedToTxnRet;
+        const firstApplied = (Array.isArray(applied) ? applied[0] : applied) as
+          | Record<string, unknown>
+          | undefined;
+        writeOffAmount = Number(firstApplied?.DiscountAmount ?? 0);
+      } else {
+        writeOffAmount = args.amount ?? balanceRemaining;
+      }
+
+      if (writeOffAmount <= 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Write-off amount must be > 0 (got ${writeOffAmount})`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+      if (!isReplayCandidate && writeOffAmount > balanceRemaining + 1e-9) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Write-off amount ${writeOffAmount} exceeds invoice BalanceRemaining ${balanceRemaining}`,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const sourceLabel = source.RefNumber
+        ? String(source.RefNumber)
+        : String(source.TxnID ?? args.txnId);
+      const memo = args.memo ?? `Write off invoice ${sourceLabel}`;
+
+      const data: Record<string, unknown> = {
+        CustomerRef: customerRef,
+        TotalAmount: 0,
+        Memo: memo,
+        AppliedToTxnAdd: [
+          {
+            TxnID: args.txnId,
+            PaymentAmount: 0,
+            DiscountAmount: writeOffAmount,
+            DiscountAccountRef: { FullName: args.writeOffAccount },
+          },
+        ],
+      };
+      if (args.txnDate) data.TxnDate = args.txnDate;
+      if (args.refNumber) data.RefNumber = args.refNumber;
+      if (args.depositToAccountName) {
+        data.DepositToAccountRef = { FullName: args.depositToAccountName };
+      }
+
+      try {
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("ReceivePayment", data, args.idempotencyKey)
+          : { entity: await session.addEntity("ReceivePayment", data), replayed: false };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              sourceTxnId: args.txnId,
+              writeOff: {
+                amount: writeOffAmount,
+                account: args.writeOffAccount,
+                memo,
+              },
+              payment: result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "ReceivePaymentAdd (write-off) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
 }

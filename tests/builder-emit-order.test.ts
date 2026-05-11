@@ -341,6 +341,79 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
     expect(plain).not.toContain("ReportEntityFilter");
   });
 
+  it("GeneralSummaryReportQueryRq with ReportItemFilter: type → ReportPeriod → ReportItemFilter → SummarizeColumnsBy → IncludeSubcolumns → ReportBasis", () => {
+    // Phase 11 #50 — qb_sales_by_item_summary passes ReportItemFilter through
+    // buildReportRequest to scope SalesByItemSummary to one item. Schema-order:
+    // ReportItemFilter sits immediately after ReportEntityFilter (whether or
+    // not the entity filter is present) and before the SummarizeColumnsBy /
+    // IncludeSubcolumns / ReportBasis tail. Pin so a future filter-dict edit
+    // can't slot ReportItemFilter after ReportBasis (same bug class as #37).
+    const xml = buildReportRequest({
+      reportType: "SalesByItemSummary",
+      fromDate: "2026-01-01",
+      toDate: "2026-12-31",
+      basis: "Accrual",
+      itemFilter: { FullName: "Consulting Services" },
+    });
+
+    const order = emittedChildOrder(xml, "GeneralSummaryReportQueryRq", [
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "ReportItemFilter",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+
+    expect(order).toEqual([
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "ReportItemFilter",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+
+    // Both filters present together (rare in practice, but the schema allows
+    // it — e.g. "what did we sell of widget X to customer Y"). Pin the
+    // EntityFilter-before-ItemFilter relative order.
+    const both = buildReportRequest({
+      reportType: "SalesByItemSummary",
+      fromDate: "2026-01-01",
+      toDate: "2026-12-31",
+      basis: "Accrual",
+      entityFilter: { FullName: "Acme Corp" },
+      itemFilter: { FullName: "Consulting Services" },
+    });
+    const bothOrder = emittedChildOrder(both, "GeneralSummaryReportQueryRq", [
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "ReportEntityFilter",
+      "ReportItemFilter",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+    expect(bothOrder).toEqual([
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "ReportEntityFilter",
+      "ReportItemFilter",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+
+    // Backwards compatibility: omit itemFilter, the element must NOT appear.
+    const plain = buildReportRequest({
+      reportType: "ProfitAndLossStandard",
+      fromDate: "2026-01-01",
+      toDate: "2026-12-31",
+      basis: "Accrual",
+    });
+    expect(plain).not.toContain("ReportItemFilter");
+  });
+
   it("GeneralDetailReportQueryRq: type → ReportPeriod → ReportAccountFilter → ReportEntityFilter → ReportItemFilter → ReportModifiedDateRangeFilter → ReportBasis → IncludeColumn", () => {
     // Phase 11 #49 — qb_sales_by_customer_detail (and the planned Phase 11
     // #50/#52 sales/expense detail variants) ride on this new wire request.

@@ -132,7 +132,7 @@ export class QBIdempotencyKeyConflictError extends Error {
 // Idempotency cache helpers
 // ---------------------------------------------------------------------------
 
-interface IdempotencyCacheEntry {
+export interface IdempotencyCacheEntry {
   entityType: string;
   payloadFingerprint: string;
   result: unknown;
@@ -696,6 +696,18 @@ export class QBSessionManager {
     return this.idempotencyCache.size;
   }
 
+  /**
+   * Read-only peek at the idempotency cache. Used by composite tools that
+   * mutate the source they read (e.g. qb_invoice_write_off closes the source
+   * invoice — on a replay the read-then-validate path would reject the
+   * second call before addEntityIdempotent gets a chance to fingerprint).
+   * Returning the cached entry lets the tool decide what to do (replay, or
+   * relax stale-state checks so addEntityIdempotent can be the authority).
+   */
+  peekIdempotencyEntry(idempotencyKey: string): IdempotencyCacheEntry | undefined {
+    return this.idempotencyCache.get(idempotencyKey);
+  }
+
   async modifyEntity(
     entityType: string,
     data: Record<string, unknown>
@@ -950,9 +962,15 @@ export class QBSessionManager {
     this.assertWritable(`deleteEntity(${entityType})`);
     const xml = buildDeleteRequest(entityType, listIdOrTxnId, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
+    // Kept in sync with buildDeleteRequest's isTransaction list in
+    // src/qbxml/builder.ts and isTransactionType in simulation-store.ts —
+    // any divergence here mis-routes the response extraction (TxnDelRs vs
+    // ListDelRs) and surfaces as "Unknown QBXML error" from the parser.
     const isTransaction = [
-      "Invoice", "Bill", "Payment", "Estimate", "SalesReceipt",
-      "CreditMemo", "PurchaseOrder", "JournalEntry",
+      "Invoice", "Bill", "Estimate", "SalesReceipt", "CreditMemo",
+      "PurchaseOrder", "JournalEntry", "Deposit", "Transfer", "Check",
+      "BillPaymentCheck", "BillPaymentCreditCard", "ReceivePayment",
+      "SalesOrder", "CreditCardCharge", "CreditCardCredit",
     ].includes(entityType);
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);
@@ -981,6 +999,7 @@ export class QBSessionManager {
       toDate?: string;
       basis?: "Accrual" | "Cash";
       entityFilter?: { FullName?: string; ListID?: string };
+      itemFilter?: { FullName?: string; ListID?: string };
     } = {}
   ): Promise<Record<string, unknown>> {
     const xml = buildReportRequest(

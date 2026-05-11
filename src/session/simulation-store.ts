@@ -442,13 +442,15 @@ export class SimulationStore {
     if (
       reportType !== "ProfitAndLossStandard" &&
       reportType !== "BalanceSheetStandard" &&
-      reportType !== "SalesByCustomerSummary"
+      reportType !== "SalesByCustomerSummary" &&
+      reportType !== "SalesByItemSummary" &&
+      reportType !== "ExpensesByVendorSummary"
     ) {
       return {
         type: rsType,
         statusCode: 3120,
         statusSeverity: "Error",
-        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard, BalanceSheetStandard, and SalesByCustomerSummary are implemented)`,
+        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard, BalanceSheetStandard, SalesByCustomerSummary, SalesByItemSummary, and ExpensesByVendorSummary are implemented)`,
         data: {},
       };
     }
@@ -477,6 +479,48 @@ export class SimulationStore {
         if (c) efName = String(c.FullName ?? c.Name ?? "");
       }
       const reportRet = this.buildSalesByCustomerSummary(fromDate, toDate, basis, efName);
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: reportRet },
+      };
+    }
+
+    if (reportType === "SalesByItemSummary") {
+      // ReportItemFilter scopes to a single item. ListID resolves across the
+      // five Item subtype stores (ItemService / ItemInventory / …) via
+      // findItemByRef; FullName is used directly when ListID is absent or
+      // unknown.
+      const itf = (reqData.ReportItemFilter as Record<string, unknown> | undefined) ?? {};
+      let itemFilterName: string | null = itf.FullName ? String(itf.FullName) : null;
+      if (!itemFilterName && itf.ListID) {
+        const item = this.findItemByRef({ ListID: String(itf.ListID) });
+        if (item) itemFilterName = String(item.FullName ?? item.Name ?? "");
+      }
+      const reportRet = this.buildSalesByItemSummary(fromDate, toDate, basis, itemFilterName);
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: reportRet },
+      };
+    }
+
+    if (reportType === "ExpensesByVendorSummary") {
+      // ReportEntityFilter scopes to a single vendor — QB uses the same
+      // ReportEntityFilter element for the vendor-side summary (vendors are
+      // entities in the broader sense). ListID is resolved against the Vendor
+      // store; the FullName takes over when ListID is unknown.
+      const ef = (reqData.ReportEntityFilter as Record<string, unknown> | undefined) ?? {};
+      let vendorName: string | null = ef.FullName ? String(ef.FullName) : null;
+      if (!vendorName && ef.ListID) {
+        const v = this.getStore("Vendor").get(String(ef.ListID));
+        if (v) vendorName = String(v.FullName ?? v.Name ?? "");
+      }
+      const reportRet = this.buildExpensesByVendorSummary(fromDate, toDate, basis, vendorName);
       return {
         type: rsType,
         statusCode: 0,
@@ -558,6 +602,146 @@ export class SimulationStore {
       ],
       Totals: { TotalSales: totalSales },
     };
+  }
+
+  // Phase 11 #50 — group sale-side line totals by ItemRef.FullName rather than
+  // CustomerRef.FullName. Same line walk as buildSalesByCustomerSummary
+  // (Invoice + SalesReceipt + CreditMemo, CreditMemo subtracts), so a non-item
+  // line (sales-tax line, discount line without ItemRef) drops via the
+  // !itemName guard. Lines without an item don't have a place in an item-keyed
+  // rollup, which matches QB's own SalesByItemSummary behavior.
+  private buildSalesByItemSummary(
+    from: string | null,
+    to: string | null,
+    basis: "Accrual" | "Cash",
+    itemFilter: string | null,
+  ): Record<string, unknown> {
+    const byItem = new Map<string, number>();
+    const accumulate = (storeName: string, lineKey: string, sign: 1 | -1): void => {
+      for (const txn of this.getStore(storeName).values()) {
+        const txnDate = String(txn.TxnDate ?? "");
+        if (from && txnDate < from) continue;
+        if (to && txnDate > to) continue;
+        const lines = txn[lineKey];
+        if (!Array.isArray(lines)) continue;
+        for (const line of lines as Record<string, unknown>[]) {
+          const itemRef = line.ItemRef as Record<string, unknown> | undefined;
+          const itemName = itemRef?.FullName ? String(itemRef.FullName) : "";
+          if (!itemName) continue;
+          if (itemFilter && itemName !== itemFilter) continue;
+          const amt = Number(line.Amount ?? 0);
+          if (!Number.isFinite(amt)) continue;
+          byItem.set(itemName, (byItem.get(itemName) ?? 0) + sign * amt);
+        }
+      }
+    };
+    accumulate("Invoice", "InvoiceLineRet", 1);
+    accumulate("SalesReceipt", "SalesReceiptLineRet", 1);
+    accumulate("CreditMemo", "CreditMemoLineRet", -1);
+
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+    const items = [...byItem.entries()]
+      .map(([Name, Total]) => ({ Name, Total: round2(Total) }))
+      .filter((i) => i.Total !== 0)
+      .sort((a, b) => b.Total - a.Total);
+    const totalSales = round2(items.reduce((s, i) => s + i.Total, 0));
+
+    return {
+      ReportTitle: "Sales by Item Summary",
+      ReportBasis: basis,
+      ...(from ? { FromReportDate: from } : {}),
+      ...(to ? { ToReportDate: to } : {}),
+      Sections: [
+        { Name: "Sales", Accounts: items, Subtotal: totalSales },
+      ],
+      Totals: { TotalSales: totalSales },
+    };
+  }
+
+  // Phase 11 #52 — group expense-side line totals by the parent txn's vendor /
+  // payee name. Walks Bill (VendorRef), Check (PayeeEntityRef → EntityRef
+  // fallback), and CreditCardCharge (PayeeEntityRef). For each, sums Amount
+  // across ExpenseLineRet + ItemLineRet. Lines without a resolvable payee bucket
+  // under "(no vendor)" so the operator can still see the total without losing
+  // it.
+  //
+  // Caveat (sim parity tradeoff, documented on the tool surface): line.Amount
+  // is summed without filtering on the resolved account's AccountType. Real
+  // QB's ExpensesByVendor scopes to Expense/COGS/OtherExpense postings; the
+  // sim's simpler walk picks up the occasional asset purchase that posts via a
+  // Check (e.g. a new computer). Mirrors how #49 sums Invoice/SR/CM line.Amount
+  // without filtering — same simplifying assumption.
+  private buildExpensesByVendorSummary(
+    from: string | null,
+    to: string | null,
+    basis: "Accrual" | "Cash",
+    vendorFilter: string | null,
+  ): Record<string, unknown> {
+    const byVendor = new Map<string, number>();
+    const accumulate = (storeName: string): void => {
+      for (const txn of this.getStore(storeName).values()) {
+        const txnDate = String(txn.TxnDate ?? "");
+        if (from && txnDate < from) continue;
+        if (to && txnDate > to) continue;
+        const vendorName = this.resolveExpensePayeeName(txn, storeName);
+        if (vendorFilter && vendorName !== vendorFilter) continue;
+        let sum = 0;
+        for (const lineKey of ["ExpenseLineRet", "ItemLineRet"]) {
+          const lines = txn[lineKey];
+          if (!Array.isArray(lines)) continue;
+          for (const line of lines as Record<string, unknown>[]) {
+            const amt = Number(line.Amount ?? 0);
+            if (Number.isFinite(amt)) sum += amt;
+          }
+        }
+        if (sum === 0) continue;
+        const display = vendorName || "(no vendor)";
+        byVendor.set(display, (byVendor.get(display) ?? 0) + sum);
+      }
+    };
+    accumulate("Bill");
+    accumulate("Check");
+    accumulate("CreditCardCharge");
+
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+    const vendors = [...byVendor.entries()]
+      .map(([Name, Total]) => ({ Name, Total: round2(Total) }))
+      .filter((v) => v.Total !== 0)
+      .sort((a, b) => b.Total - a.Total);
+    const totalExpenses = round2(vendors.reduce((s, v) => s + v.Total, 0));
+
+    return {
+      ReportTitle: "Expenses by Vendor Summary",
+      ReportBasis: basis,
+      ...(from ? { FromReportDate: from } : {}),
+      ...(to ? { ToReportDate: to } : {}),
+      Sections: [
+        { Name: "Expenses", Accounts: vendors, Subtotal: totalExpenses },
+      ],
+      Totals: { TotalExpenses: totalExpenses },
+    };
+  }
+
+  // Resolve the payee/vendor name on an expense-bearing transaction. Bill
+  // carries VendorRef directly; Check + CreditCardCharge use PayeeEntityRef
+  // (older QBXML versions sometimes surface EntityRef as a fallback).
+  private resolveExpensePayeeName(txn: StoredEntity, storeName: string): string {
+    if (storeName === "Bill") {
+      const r = txn.VendorRef as Record<string, unknown> | undefined;
+      return r?.FullName !== undefined ? String(r.FullName) : "";
+    }
+    const candidates = [
+      txn.PayeeEntityRef,
+      txn.VendorRef,
+      txn.EntityRef,
+    ];
+    for (const r of candidates) {
+      if (r && typeof r === "object") {
+        const fn = (r as Record<string, unknown>).FullName;
+        if (fn !== undefined) return String(fn);
+      }
+    }
+    return "";
   }
 
   // -----------------------------------------------------------------------
@@ -766,12 +950,17 @@ export class SimulationStore {
     const rsType = reqType.replace("Rq", "Rs");
 
     const reportType = String(reqData.GeneralDetailReportType ?? "");
-    if (reportType !== "SalesByCustomerDetail") {
+    const SUPPORTED = new Set([
+      "SalesByCustomerDetail",
+      "SalesByItemDetail",
+      "ExpensesByVendorDetail",
+    ]);
+    if (!SUPPORTED.has(reportType)) {
       return {
         type: rsType,
         statusCode: 3120,
         statusSeverity: "Error",
-        statusMessage: `Unsupported GeneralDetailReportType: ${reportType || "(missing)"} (only SalesByCustomerDetail is implemented in simulation)`,
+        statusMessage: `Unsupported GeneralDetailReportType: ${reportType || "(missing)"} (only SalesByCustomerDetail, SalesByItemDetail, and ExpensesByVendorDetail are implemented in simulation)`,
         data: {},
       };
     }
@@ -779,40 +968,74 @@ export class SimulationStore {
     const reportPeriod = (reqData.ReportPeriod as Record<string, unknown> | undefined) ?? {};
     const fromDate = reportPeriod.FromReportDate ? String(reportPeriod.FromReportDate) : null;
     const toDate = reportPeriod.ToReportDate ? String(reportPeriod.ToReportDate) : null;
+    const basis = String(reqData.ReportBasis ?? "Accrual");
 
-    const ef = (reqData.ReportEntityFilter as Record<string, unknown> | undefined) ?? {};
-    let customerFilter: string | null = ef.FullName ? String(ef.FullName) : null;
-    if (!customerFilter && ef.ListID) {
-      const c = this.getStore("Customer").get(String(ef.ListID));
-      if (c) customerFilter = String(c.FullName ?? c.Name ?? "");
+    if (reportType === "SalesByCustomerDetail") {
+      const ef = (reqData.ReportEntityFilter as Record<string, unknown> | undefined) ?? {};
+      let customerFilter: string | null = ef.FullName ? String(ef.FullName) : null;
+      if (!customerFilter && ef.ListID) {
+        const c = this.getStore("Customer").get(String(ef.ListID));
+        if (c) customerFilter = String(c.FullName ?? c.Name ?? "");
+      }
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: this.buildSalesByCustomerDetail(fromDate, toDate, basis, customerFilter) },
+      };
     }
 
+    if (reportType === "SalesByItemDetail") {
+      const itf = (reqData.ReportItemFilter as Record<string, unknown> | undefined) ?? {};
+      let itemFilterName: string | null = itf.FullName ? String(itf.FullName) : null;
+      if (!itemFilterName && itf.ListID) {
+        const item = this.findItemByRef({ ListID: String(itf.ListID) });
+        if (item) itemFilterName = String(item.FullName ?? item.Name ?? "");
+      }
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: this.buildSalesByItemDetail(fromDate, toDate, basis, itemFilterName) },
+      };
+    }
+
+    // ExpensesByVendorDetail
+    const ef = (reqData.ReportEntityFilter as Record<string, unknown> | undefined) ?? {};
+    let vendorFilter: string | null = ef.FullName ? String(ef.FullName) : null;
+    if (!vendorFilter && ef.ListID) {
+      const v = this.getStore("Vendor").get(String(ef.ListID));
+      if (v) vendorFilter = String(v.FullName ?? v.Name ?? "");
+    }
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { ReportRet: this.buildExpensesByVendorDetail(fromDate, toDate, basis, vendorFilter) },
+    };
+  }
+
+  // SalesByCustomerDetail row builder. Walks Invoice + SR + CM lines that bind
+  // to a customer; sorts by Customer (alpha) → TxnDate (asc) → TxnID. Lines
+  // without a CustomerRef bucket under "(no customer)" so the operator can
+  // still see them in unscoped runs.
+  private buildSalesByCustomerDetail(
+    fromDate: string | null,
+    toDate: string | null,
+    basis: string,
+    customerFilter: string | null,
+  ): Record<string, unknown> {
     type Row = {
-      TxnType: string;
-      Date: string;
-      Num: string;
-      Name: string;
-      Memo: string;
-      Item: string;
-      Quantity: number;
-      Rate: number;
-      Account: string;
-      Amount: number;
-      TxnID: string;
+      TxnType: string; Date: string; Num: string; Name: string; Memo: string;
+      Item: string; Quantity: number; Rate: number; Account: string; Amount: number; TxnID: string;
     };
     const rows: Row[] = [];
-
     const round2 = (n: number): number => Math.round(n * 100) / 100;
 
-    // Aggregate by customer first (so we can sort rows-within-customer
-    // chronologically and emit customers in stable alphabetical order — what
-    // QB's actual SalesByCustomerDetail does on the wire).
-    const emit = (
-      txn: StoredEntity,
-      txnType: string,
-      lineKey: string,
-      sign: 1 | -1,
-    ): void => {
+    const emit = (txn: StoredEntity, txnType: string, lineKey: string, sign: 1 | -1): void => {
       const txnDate = String(txn.TxnDate ?? "");
       if (fromDate && txnDate < fromDate) return;
       if (toDate && txnDate > toDate) return;
@@ -845,19 +1068,10 @@ export class SimulationStore {
       }
     };
 
-    for (const txn of this.getStore("Invoice").values()) {
-      emit(txn, "Invoice", "InvoiceLineRet", 1);
-    }
-    for (const txn of this.getStore("SalesReceipt").values()) {
-      emit(txn, "SalesReceipt", "SalesReceiptLineRet", 1);
-    }
-    for (const txn of this.getStore("CreditMemo").values()) {
-      emit(txn, "CreditMemo", "CreditMemoLineRet", -1);
-    }
+    for (const txn of this.getStore("Invoice").values()) emit(txn, "Invoice", "InvoiceLineRet", 1);
+    for (const txn of this.getStore("SalesReceipt").values()) emit(txn, "SalesReceipt", "SalesReceiptLineRet", 1);
+    for (const txn of this.getStore("CreditMemo").values()) emit(txn, "CreditMemo", "CreditMemoLineRet", -1);
 
-    // Stable sort — primary by customer Name (alpha), secondary by TxnDate
-    // ascending, tertiary by TxnID for repeatability when same customer +
-    // same date.
     rows.sort((a, b) => {
       if (a.Name !== b.Name) return a.Name < b.Name ? -1 : 1;
       if (a.Date !== b.Date) return a.Date < b.Date ? -1 : 1;
@@ -865,32 +1079,194 @@ export class SimulationStore {
     });
 
     return {
-      type: rsType,
-      statusCode: 0,
-      statusSeverity: "Info",
-      statusMessage: "Status OK",
-      data: {
-        ReportRet: {
-          ReportTitle: "Sales by Customer Detail",
-          ReportBasis: String(reqData.ReportBasis ?? "Accrual"),
-          ...(fromDate ? { FromReportDate: fromDate } : {}),
-          ...(toDate ? { ToReportDate: toDate } : {}),
-          Columns: [
-            { Title: "TxnType", Type: "Text" },
-            { Title: "Date", Type: "Date" },
-            { Title: "Num", Type: "Text" },
-            { Title: "Name", Type: "Text" },
-            { Title: "Memo", Type: "Text" },
-            { Title: "Item", Type: "Text" },
-            { Title: "Quantity", Type: "Quantity" },
-            { Title: "Rate", Type: "Price" },
-            { Title: "Account", Type: "Text" },
-            { Title: "Amount", Type: "Amount" },
-            { Title: "TxnID", Type: "Text" },
-          ],
-          Rows: rows,
-        },
-      },
+      ReportTitle: "Sales by Customer Detail",
+      ReportBasis: basis,
+      ...(fromDate ? { FromReportDate: fromDate } : {}),
+      ...(toDate ? { ToReportDate: toDate } : {}),
+      Columns: [
+        { Title: "TxnType", Type: "Text" },
+        { Title: "Date", Type: "Date" },
+        { Title: "Num", Type: "Text" },
+        { Title: "Name", Type: "Text" },
+        { Title: "Memo", Type: "Text" },
+        { Title: "Item", Type: "Text" },
+        { Title: "Quantity", Type: "Quantity" },
+        { Title: "Rate", Type: "Price" },
+        { Title: "Account", Type: "Text" },
+        { Title: "Amount", Type: "Amount" },
+        { Title: "TxnID", Type: "Text" },
+      ],
+      Rows: rows,
+    };
+  }
+
+  // SalesByItemDetail row builder. Same income-side line walk as the
+  // by-customer variant, but lines without an ItemRef drop (no row to emit
+  // when the report is item-keyed) and rows sort by Item (alpha) → TxnDate
+  // (asc) → TxnID. CreditMemo rows emit with negative Amount, matching QB.
+  private buildSalesByItemDetail(
+    fromDate: string | null,
+    toDate: string | null,
+    basis: string,
+    itemFilter: string | null,
+  ): Record<string, unknown> {
+    type Row = {
+      TxnType: string; Date: string; Num: string; Name: string; Memo: string;
+      Item: string; Quantity: number; Rate: number; Account: string; Amount: number; TxnID: string;
+    };
+    const rows: Row[] = [];
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+    const emit = (txn: StoredEntity, txnType: string, lineKey: string, sign: 1 | -1): void => {
+      const txnDate = String(txn.TxnDate ?? "");
+      if (fromDate && txnDate < fromDate) return;
+      if (toDate && txnDate > toDate) return;
+      const ref = txn.CustomerRef as Record<string, unknown> | undefined;
+      const customerName = String(ref?.FullName ?? "");
+
+      const lines = txn[lineKey];
+      if (!Array.isArray(lines)) return;
+      for (const line of lines as Record<string, unknown>[]) {
+        const itemRef = line.ItemRef as Record<string, unknown> | undefined;
+        const itemName = itemRef?.FullName ? String(itemRef.FullName) : "";
+        if (!itemName) continue;
+        if (itemFilter && itemName !== itemFilter) continue;
+
+        const amt = Number(line.Amount ?? 0);
+        if (!Number.isFinite(amt) || amt === 0) continue;
+        const accountName = this.resolveLineAccount(line, "income") ?? "Uncategorized Income";
+        const qty = Number(line.Quantity ?? 0);
+        const rate = Number(line.Rate ?? 0);
+        rows.push({
+          TxnType: txnType,
+          Date: txnDate,
+          Num: txn.RefNumber !== undefined ? String(txn.RefNumber) : "",
+          Name: customerName || "(no customer)",
+          Memo: line.Memo ? String(line.Memo) : (txn.Memo ? String(txn.Memo) : ""),
+          Item: itemName,
+          Quantity: Number.isFinite(qty) ? qty : 0,
+          Rate: Number.isFinite(rate) ? round2(rate) : 0,
+          Account: accountName,
+          Amount: round2(sign * amt),
+          TxnID: String(txn.TxnID ?? ""),
+        });
+      }
+    };
+
+    for (const txn of this.getStore("Invoice").values()) emit(txn, "Invoice", "InvoiceLineRet", 1);
+    for (const txn of this.getStore("SalesReceipt").values()) emit(txn, "SalesReceipt", "SalesReceiptLineRet", 1);
+    for (const txn of this.getStore("CreditMemo").values()) emit(txn, "CreditMemo", "CreditMemoLineRet", -1);
+
+    rows.sort((a, b) => {
+      if (a.Item !== b.Item) return a.Item < b.Item ? -1 : 1;
+      if (a.Date !== b.Date) return a.Date < b.Date ? -1 : 1;
+      return a.TxnID < b.TxnID ? -1 : a.TxnID > b.TxnID ? 1 : 0;
+    });
+
+    return {
+      ReportTitle: "Sales by Item Detail",
+      ReportBasis: basis,
+      ...(fromDate ? { FromReportDate: fromDate } : {}),
+      ...(toDate ? { ToReportDate: toDate } : {}),
+      Columns: [
+        { Title: "TxnType", Type: "Text" },
+        { Title: "Date", Type: "Date" },
+        { Title: "Num", Type: "Text" },
+        { Title: "Name", Type: "Text" },
+        { Title: "Memo", Type: "Text" },
+        { Title: "Item", Type: "Text" },
+        { Title: "Quantity", Type: "Quantity" },
+        { Title: "Rate", Type: "Price" },
+        { Title: "Account", Type: "Text" },
+        { Title: "Amount", Type: "Amount" },
+        { Title: "TxnID", Type: "Text" },
+      ],
+      Rows: rows,
+    };
+  }
+
+  // ExpensesByVendorDetail row builder. Walks Bill / Check / CreditCardCharge
+  // ExpenseLineRet + ItemLineRet. Vendor name comes from the txn header
+  // (resolveExpensePayeeName — see jsdoc). Account is resolved via
+  // resolveLineAccount(direction="expense"); items missing ExpenseAccountRef
+  // fall through to "Uncategorized Expense" (same fallback as qb_pnl_report).
+  // Sorts by Vendor (alpha) → TxnDate (asc) → TxnID.
+  private buildExpensesByVendorDetail(
+    fromDate: string | null,
+    toDate: string | null,
+    basis: string,
+    vendorFilter: string | null,
+  ): Record<string, unknown> {
+    type Row = {
+      TxnType: string; Date: string; Num: string; Name: string; Memo: string;
+      Item: string; Quantity: number; Rate: number; Account: string; Amount: number; TxnID: string;
+    };
+    const rows: Row[] = [];
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+    const emit = (txn: StoredEntity, txnType: string): void => {
+      const txnDate = String(txn.TxnDate ?? "");
+      if (fromDate && txnDate < fromDate) return;
+      if (toDate && txnDate > toDate) return;
+      const vendorName = this.resolveExpensePayeeName(txn, txnType);
+      if (vendorFilter && vendorName !== vendorFilter) return;
+
+      for (const lineKey of ["ExpenseLineRet", "ItemLineRet"]) {
+        const lines = txn[lineKey];
+        if (!Array.isArray(lines)) continue;
+        for (const line of lines as Record<string, unknown>[]) {
+          const amt = Number(line.Amount ?? 0);
+          if (!Number.isFinite(amt) || amt === 0) continue;
+          const accountName = this.resolveLineAccount(line, "expense") ?? "Uncategorized Expense";
+          const itemRef = line.ItemRef as Record<string, unknown> | undefined;
+          const qty = Number(line.Quantity ?? 0);
+          const rate = Number(line.Cost ?? line.Rate ?? 0);
+          rows.push({
+            TxnType: txnType,
+            Date: txnDate,
+            Num: txn.RefNumber !== undefined ? String(txn.RefNumber) : "",
+            Name: vendorName || "(no vendor)",
+            Memo: line.Memo ? String(line.Memo) : (txn.Memo ? String(txn.Memo) : ""),
+            Item: itemRef?.FullName ? String(itemRef.FullName) : "",
+            Quantity: Number.isFinite(qty) ? qty : 0,
+            Rate: Number.isFinite(rate) ? round2(rate) : 0,
+            Account: accountName,
+            Amount: round2(amt),
+            TxnID: String(txn.TxnID ?? ""),
+          });
+        }
+      }
+    };
+
+    for (const txn of this.getStore("Bill").values()) emit(txn, "Bill");
+    for (const txn of this.getStore("Check").values()) emit(txn, "Check");
+    for (const txn of this.getStore("CreditCardCharge").values()) emit(txn, "CreditCardCharge");
+
+    rows.sort((a, b) => {
+      if (a.Name !== b.Name) return a.Name < b.Name ? -1 : 1;
+      if (a.Date !== b.Date) return a.Date < b.Date ? -1 : 1;
+      return a.TxnID < b.TxnID ? -1 : a.TxnID > b.TxnID ? 1 : 0;
+    });
+
+    return {
+      ReportTitle: "Expenses by Vendor Detail",
+      ReportBasis: basis,
+      ...(fromDate ? { FromReportDate: fromDate } : {}),
+      ...(toDate ? { ToReportDate: toDate } : {}),
+      Columns: [
+        { Title: "TxnType", Type: "Text" },
+        { Title: "Date", Type: "Date" },
+        { Title: "Num", Type: "Text" },
+        { Title: "Name", Type: "Text" },
+        { Title: "Memo", Type: "Text" },
+        { Title: "Item", Type: "Text" },
+        { Title: "Quantity", Type: "Quantity" },
+        { Title: "Rate", Type: "Price" },
+        { Title: "Account", Type: "Text" },
+        { Title: "Amount", Type: "Amount" },
+        { Title: "TxnID", Type: "Text" },
+      ],
+      Rows: rows,
     };
   }
 
@@ -1806,6 +2182,7 @@ export class SimulationStore {
 
     // Second pass: apply mutations and build *Ret entries.
     let appliedSum = 0;
+    let discountSum = 0;
     const appliedRet: Record<string, unknown>[] = [];
     for (const line of lines) {
       const txnId = String(line.TxnID);
@@ -1815,13 +2192,12 @@ export class SimulationStore {
       const invoice = invoiceStore.get(txnId)!;
       const balance = Number(invoice.BalanceRemaining ?? 0);
       const applied = Number(invoice.AppliedAmount ?? 0);
-      // Discount closes the invoice alongside the payment but does NOT
-      // reduce customer A/R (the customer didn't pay it — they got it).
       invoice.BalanceRemaining = balance - paymentAmount - discountAmount;
       invoice.AppliedAmount = applied + paymentAmount;
       invoice.IsPaid = invoice.BalanceRemaining === 0;
 
       appliedSum += paymentAmount;
+      discountSum += discountAmount;
 
       const ret: Record<string, unknown> = {
         TxnLineID: this.nextId(),
@@ -1835,10 +2211,14 @@ export class SimulationStore {
       appliedRet.push(ret);
     }
 
-    // Customer.Balance moves by the applied sum, not the gross payment.
-    // Unapplied amount is implicitly tracked by UnusedPayment on the
-    // payment record — it's a credit, not a reduction in current AR.
-    if (appliedSum > 0) {
+    // Customer.Balance reflects total open AR. A discount-close on the
+    // invoice drops invoice.BalanceRemaining alongside any PaymentAmount,
+    // so the customer's open AR drops by both — write-off via discount is
+    // a legitimate AR reduction. UnusedPayment (the unapplied overpayment)
+    // is the only piece that does NOT reduce AR (it sits as a customer
+    // credit, tracked on the payment header).
+    const balanceDelta = appliedSum + discountSum;
+    if (balanceDelta > 0) {
       const customerRef = payment.CustomerRef as Record<string, unknown> | undefined;
       if (customerRef) {
         this.adjustEntityBalance(
@@ -1847,7 +2227,7 @@ export class SimulationStore {
             listID: customerRef.ListID ? String(customerRef.ListID) : undefined,
             fullName: customerRef.FullName ? String(customerRef.FullName) : undefined,
           },
-          -appliedSum
+          -balanceDelta
         );
       }
     }
@@ -1880,12 +2260,14 @@ export class SimulationStore {
 
     const invoiceStore = this.getStore("Invoice");
     let reversedSum = 0;
+    let reversedDiscountSum = 0;
 
     for (const entry of entries) {
       const txnId = String(entry.TxnID ?? "");
       const paymentAmount = Number(entry.PaymentAmount ?? 0);
       const discountAmount = Number(entry.DiscountAmount ?? 0);
       reversedSum += paymentAmount;
+      reversedDiscountSum += discountAmount;
 
       const invoice = invoiceStore.get(txnId);
       if (!invoice) continue;
@@ -1897,7 +2279,8 @@ export class SimulationStore {
       invoice.IsPaid = invoice.BalanceRemaining === 0;
     }
 
-    if (reversedSum > 0) {
+    const reverseBalanceDelta = reversedSum + reversedDiscountSum;
+    if (reverseBalanceDelta > 0) {
       const customerRef = payment.CustomerRef as Record<string, unknown> | undefined;
       if (customerRef) {
         this.adjustEntityBalance(
@@ -1906,7 +2289,7 @@ export class SimulationStore {
             listID: customerRef.ListID ? String(customerRef.ListID) : undefined,
             fullName: customerRef.FullName ? String(customerRef.FullName) : undefined,
           },
-          +reversedSum
+          +reverseBalanceDelta
         );
       }
     }
@@ -3325,6 +3708,15 @@ export class SimulationStore {
       "CreditMemo", "PurchaseOrder", "JournalEntry", "Deposit",
       "Transfer", "Check", "BillPaymentCheck", "BillPaymentCreditCard",
       "ReceivePayment", "SalesOrder",
+      // Phase 11 #52 — CreditCardCharge / CreditCardCredit were missing from
+      // this list despite being in BANK_AFFECTING_TXN_TYPES. The omission
+      // meant ExpenseLineAdd → ExpenseLineRet conversion didn't fire for CC
+      // txns; any report walk that consumes *LineRet (qb_expense_by_vendor_*,
+      // qb_pnl_report's CC expense walk via walkTxnLines) was silently
+      // missing CC line postings in simulation. Both types ARE transactions
+      // in QB Desktop (they carry TxnID and route through TxnDelRq for
+      // deletion); the prior list was simply incomplete.
+      "CreditCardCharge", "CreditCardCredit",
     ].includes(entityType);
   }
 

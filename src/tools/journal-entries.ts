@@ -507,6 +507,154 @@ export function registerJournalEntryTools(
     }
   );
 
+  // Phase 12 #57a mirror — JE-side equivalent of qb_invoice_duplicate. Same
+  // shape: read source JE with IncludeLineItems opt-in (Phase 10 #41 strip),
+  // submit a fresh JournalEntryAddRq with both line sides carried + operator
+  // overrides applied. No new wire types. No entity-retarget arg (re-pointing
+  // per-line EntityRef is qb_journal_entry_update territory — a duplicate
+  // wholesale-carries the source's entity refs).
+  server.tool(
+    "qb_journal_entry_duplicate",
+    "Duplicate an existing journal entry in QuickBooks Desktop. Reads the source JE's JournalDebitLineRet + JournalCreditLineRet (with per-line AccountRef / Amount / Memo / EntityRef / ClassRef) and submits a fresh JournalEntryAddRq with both line sides carried plus operator-supplied header overrides. Carries by default: debit lines, credit lines, IsAdjustment. Does NOT carry: TxnDate (default = today), RefNumber (a duplicate needs a fresh number — supply it via refNumber or let QB autonumber), Memo (defaults to 'Duplicate of <source ref or TxnID>'). The sum(debits) === sum(credits) invariant is preserved by construction since both sides are carried verbatim from the source. Use this to mirror recurring monthly accruals, prepaid amortization, or any standing journal entry. Composite tool — uses existing JE query + add primitives, no new wire request types. Read-only sessions reject with statusCode 9001 (the JournalEntryAddRq half is gated). Source JE not found returns statusCode 500.",
+    {
+      sourceTxnId: z.string().describe("TxnID of the journal entry to duplicate"),
+      txnDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Date for the new journal entry (YYYY-MM-DD). Default: today. The source JE's TxnDate is NOT carried — duplicating to the same date is rarely what you want."),
+      refNumber: z.string().optional()
+        .describe("Reference/entry number for the new JE. The source JE's RefNumber is NOT carried — duplicates need fresh numbers to avoid collisions. Leave blank to let QB autonumber (when enabled in QB preferences)."),
+      memo: z.string().optional()
+        .describe("Memo for the new journal entry. Default: 'Duplicate of <source ref or TxnID>'."),
+      isAdjustment: z.boolean().optional()
+        .describe("Override the adjusting-entry flag. Default: source JE's IsAdjustment value (carried)."),
+      idempotencyKey: z.string().min(1).optional()
+        .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+    },
+    async (args) => {
+      const session = getSession();
+
+      let matches: Record<string, unknown>[];
+      try {
+        matches = await session.queryEntity("JournalEntry", {
+          TxnID: args.sourceTxnId,
+          IncludeLineItems: true,
+        });
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "JournalEntryQueryRq (duplicate source read) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const source = matches[0];
+      if (!source) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 500,
+              statusMessage: `Source journal entry "${args.sourceTxnId}" not found`,
+              humanReadable: qbStatusCodeMessage(500),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const jeData: Record<string, unknown> = {};
+      if (args.txnDate) jeData.TxnDate = args.txnDate;
+      if (args.refNumber) jeData.RefNumber = args.refNumber;
+
+      const sourceLabel = source.RefNumber
+        ? String(source.RefNumber)
+        : String(source.TxnID ?? args.sourceTxnId);
+      jeData.Memo = args.memo ?? `Duplicate of ${sourceLabel}`;
+
+      if (args.isAdjustment !== undefined) {
+        jeData.IsAdjustment = args.isAdjustment;
+      } else if (source.IsAdjustment !== undefined) {
+        jeData.IsAdjustment = source.IsAdjustment;
+      }
+
+      // Map JournalDebitLineRet → JournalDebitLineAdd and JournalCreditLineRet
+      // → JournalCreditLineAdd. TxnLineID is not carried (new JE gets its
+      // own). AccountRef / Amount / Memo / EntityRef / ClassRef pass through.
+      // The Ret/Add field shape is identical, so we copy field-for-field
+      // rather than rebuild via buildJELineAdd (which would round-trip via
+      // accountName/entityName strings and lose AccountRef.ListID if the
+      // source carried only a ListID).
+      const mapLineRet = (line: Record<string, unknown>): Record<string, unknown> => {
+        const out: Record<string, unknown> = {};
+        if (line.AccountRef) out.AccountRef = line.AccountRef;
+        if (line.Amount !== undefined) out.Amount = line.Amount;
+        if (line.Memo !== undefined) out.Memo = line.Memo;
+        if (line.EntityRef) out.EntityRef = line.EntityRef;
+        if (line.ClassRef) out.ClassRef = line.ClassRef;
+        return out;
+      };
+
+      const sourceDebits = Array.isArray(source.JournalDebitLineRet)
+        ? (source.JournalDebitLineRet as Record<string, unknown>[])
+        : source.JournalDebitLineRet
+          ? [source.JournalDebitLineRet as Record<string, unknown>]
+          : [];
+      if (sourceDebits.length > 0) {
+        jeData.JournalDebitLineAdd = sourceDebits.map(mapLineRet);
+      }
+
+      const sourceCredits = Array.isArray(source.JournalCreditLineRet)
+        ? (source.JournalCreditLineRet as Record<string, unknown>[])
+        : source.JournalCreditLineRet
+          ? [source.JournalCreditLineRet as Record<string, unknown>]
+          : [];
+      if (sourceCredits.length > 0) {
+        jeData.JournalCreditLineAdd = sourceCredits.map(mapLineRet);
+      }
+
+      try {
+        const { entity: result, replayed } = args.idempotencyKey
+          ? await session.addEntityIdempotent("JournalEntry", jeData, args.idempotencyKey)
+          : { entity: await session.addEntity("JournalEntry", jeData), replayed: false };
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...(replayed ? { idempotentReplay: true } : {}),
+              sourceTxnId: args.sourceTxnId,
+              journalEntry: result,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "JournalEntryAddRq (duplicate) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   server.tool(
     "qb_journal_entry_delete",
     "Delete a journal entry from QuickBooks Desktop. JEs aren't tracked against AR/AP balances in this server, so there's no balance reversal — this is purely a record removal. WARNING: Irreversible.",

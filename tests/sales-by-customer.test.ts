@@ -326,8 +326,13 @@ describe("session.runGeneralDetailReport('SalesByCustomerDetail')", () => {
   });
 
   it("rejects unsupported GeneralDetailReportType with statusCode 3120", async () => {
+    // VendorBalanceDetail is a real QBXML GeneralDetailReportType but isn't
+    // implemented in the simulation yet (Phase 11 #51). Use it as the
+    // "unsupported" probe so the assertion stays meaningful as more variants
+    // land. (SalesByItemDetail was the original probe but it's now supported
+    // — Phase 11 #50.)
     await expect(
-      session.runGeneralDetailReport({ reportType: "SalesByItemDetail" }),
+      session.runGeneralDetailReport({ reportType: "VendorBalanceDetail" }),
     ).rejects.toThrow(/Unsupported GeneralDetailReportType/);
   });
 
