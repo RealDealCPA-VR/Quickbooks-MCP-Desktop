@@ -243,6 +243,275 @@ export function registerInvoiceTools(
     }
   );
 
+  // Phase 12 #58 — generalizes the multi-request envelope plumbing #43 shipped
+  // for journal entries to the invoice surface. Replaces the Excel intermediate
+  // operators have historically used to bulk-load monthly recurring billing.
+  // Atomic via the same compensating-delete pattern: stopOnError halts the
+  // envelope on the first wire failure, this tool's post-processing tears down
+  // any prior-posted invoices in reverse order (so Customer.Balance reversals
+  // happen most-recent-first via handleTxnDel, matching qb_invoice_delete).
+  server.tool(
+    "qb_invoice_batch_create",
+    "Create multiple invoices atomically in a single QBXML envelope (onError=stopOnError). Each entry follows the same shape as qb_invoice_create — customerName or customerListId, optional header fields, optional `lines` array. Validation runs upfront (each entry needs a customer ref, ≤100 entries per batch); a single missing customer ref rejects the whole batch BEFORE any wire I/O so no posting happens. ATOMICITY: the QBXML wire itself does NOT roll back — stopOnError halts the envelope on the first wire-side failure but leaves prior-posted invoices in place. This tool covers that gap by automatically deleting any already-posted invoices when a later one fails (TxnDelRq per posted TxnID; Customer.Balance reverses via handleTxnDel). The response carries per-entry status: 'posted' (committed), 'rolled-back' (was posted then auto-deleted), 'orphaned' (was posted but rollback delete itself failed — operator must clean up manually using qb_invoice_delete with the surfaced TxnID), 'failed' (rejected on wire), 'skipped' (never ran post-stopOnError). On full success the response carries success=true plus the array of posted TxnIDs. Use this for monthly retainer billing, recurring subscription invoicing, end-of-month time-and-materials runs — anywhere you need ALL OR NONE semantics across multiple invoices. The idempotencyKey fingerprints the whole entries list — reorder, add, or remove and you get statusCode 9002 (use a fresh key).",
+    {
+      invoices: z
+        .array(
+          z.object({
+            customerName: z.string().optional().describe("Customer full name"),
+            customerListId: z.string().optional().describe("Customer ListID (alternative to customerName)"),
+            txnDate: z.string().regex(ISO_DATE_RE).optional()
+              .describe("Invoice date (YYYY-MM-DD, default today)"),
+            dueDate: z.string().regex(ISO_DATE_RE).optional()
+              .describe("Due date (YYYY-MM-DD)"),
+            refNumber: z.string().optional().describe("Reference/invoice number"),
+            memo: z.string().optional().describe("Memo for the invoice"),
+            lines: z.array(invoiceLineSchema).optional()
+              .describe("Invoice line items"),
+          })
+        )
+        .min(1)
+        .max(100)
+        .describe("Array of invoices to post atomically (1–100). Each entry needs customerName or customerListId."),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key for the WHOLE BATCH. Retrying with the same key + identical invoices list returns the original batch outcome without re-running the wire envelope (response carries idempotentReplay: true). Reordering, adding, or removing entries makes the request a different request — that returns statusCode 9002 (use a fresh key). Cache is per company file and clears on qb_company_open. CAVEAT: only fully-successful batches are cached. The upfront customer-ref validation gate runs before the idempotency check (entries missing a customer ref are rejected and not cached regardless of key); partial-failure batches are also not cached — fresh retry is the correct recovery (rollback already cleaned up the originally-posted invoices; orphans, if any, are surfaced to the operator on the failing call)."),
+    },
+    async (args) => {
+      // Upfront customer-ref validation. Bailing here keeps the envelope off
+      // the wire entirely on caller errors — no compensating delete needed and
+      // no QB session state is touched. Mirrors the per-entry balance gate in
+      // qb_journal_entry_batch_create's validation block (statusCode 3120 =
+      // missing required element, the QBXML SDK code for missing CustomerRef).
+      const validationErrors: Array<{ index: number; error: string }> = [];
+      for (let i = 0; i < args.invoices.length; i++) {
+        const inv = args.invoices[i];
+        if (!inv.customerName && !inv.customerListId) {
+          validationErrors.push({
+            index: i,
+            error: `Entry ${i + 1}: customerName or customerListId is required`,
+          });
+        }
+      }
+      if (validationErrors.length > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 3120,
+              statusMessage: "One or more entries are missing a required customer reference",
+              humanReadable: qbStatusCodeMessage(3120),
+              validationErrors,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      const session = getSession();
+
+      const dataList = args.invoices.map((inv) => {
+        const data: Record<string, unknown> = {};
+        if (inv.customerListId) {
+          data.CustomerRef = { ListID: inv.customerListId };
+        } else {
+          data.CustomerRef = { FullName: inv.customerName };
+        }
+        if (inv.txnDate) data.TxnDate = inv.txnDate;
+        if (inv.dueDate) data.DueDate = inv.dueDate;
+        if (inv.refNumber) data.RefNumber = inv.refNumber;
+        if (inv.memo) data.Memo = inv.memo;
+        if (inv.lines && inv.lines.length > 0) {
+          data.InvoiceLineAdd = inv.lines.map((line) => {
+            const lineData: Record<string, unknown> = {};
+            if (line.itemListId) {
+              lineData.ItemRef = { ListID: line.itemListId };
+            } else if (line.itemName) {
+              lineData.ItemRef = { FullName: line.itemName };
+            }
+            if (line.description) lineData.Desc = line.description;
+            if (line.quantity !== undefined) lineData.Quantity = line.quantity;
+            if (line.rate !== undefined) lineData.Rate = line.rate;
+            if (line.amount !== undefined) lineData.Amount = line.amount;
+            return lineData;
+          });
+        }
+        return data;
+      });
+
+      let results;
+      let batchReplayed = false;
+      try {
+        if (args.idempotencyKey) {
+          const out = await session.executeBatchAddIdempotent(
+            "Invoice",
+            dataList,
+            args.idempotencyKey,
+          );
+          results = out.results;
+          batchReplayed = out.replayed;
+        } else {
+          results = await session.executeBatchAdd("Invoice", dataList);
+        }
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "Batch InvoiceAddRq envelope failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const allPosted = results.every((r) => r.status === "posted");
+      if (allPosted) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...(batchReplayed ? { idempotentReplay: true } : {}),
+              count: results.length,
+              invoices: results.map((r, i) => {
+                const ret = (r as { entity: Record<string, unknown> }).entity;
+                return {
+                  index: i,
+                  requestID: r.requestID,
+                  status: "posted",
+                  txnId: String(ret.TxnID ?? ""),
+                  refNumber: args.invoices[i].refNumber,
+                };
+              }),
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Partial-failure path — find the first wire-side failure, identify
+      // earlier posted entries, attempt a compensating delete on each in
+      // REVERSE post order. Mirrors qb_journal_entry_batch_create's rollback
+      // exactly — see that handler's comments for the rationale.
+      const failedIdx = results.findIndex((r) => r.status === "failed");
+      const failedResult = failedIdx >= 0
+        ? results[failedIdx] as { statusCode: number; statusMessage: string }
+        : undefined;
+
+      const postedTxnIds: { index: number; txnId: string }[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "posted") {
+          const entity = (results[i] as { entity: Record<string, unknown> }).entity;
+          const txnId = String(entity.TxnID ?? "");
+          if (txnId) postedTxnIds.push({ index: i, txnId });
+        }
+      }
+
+      const rollbackOutcomes = new Map<
+        string,
+        { ok: true } | { ok: false; error: string }
+      >();
+      for (const { txnId } of [...postedTxnIds].reverse()) {
+        try {
+          await session.deleteEntity("Invoice", txnId);
+          rollbackOutcomes.set(txnId, { ok: true });
+        } catch (err) {
+          const e = err as { message?: string };
+          rollbackOutcomes.set(txnId, {
+            ok: false,
+            error: e.message ?? "Compensating TxnDelRq failed",
+          });
+        }
+      }
+
+      const rolledBackTxnIds: string[] = [];
+      const orphanedEntries: Array<{ txnId: string; reason: string }> = [];
+      for (const { txnId } of postedTxnIds) {
+        const outcome = rollbackOutcomes.get(txnId);
+        if (outcome?.ok) rolledBackTxnIds.push(txnId);
+        else orphanedEntries.push({
+          txnId,
+          reason: outcome?.ok === false ? outcome.error : "Unknown rollback failure",
+        });
+      }
+
+      const entriesPayload = results.map((r, i) => {
+        const refNumber = args.invoices[i].refNumber;
+        if (r.status === "posted") {
+          const entity = (r as { entity: Record<string, unknown> }).entity;
+          const txnId = String(entity.TxnID ?? "");
+          const outcome = rollbackOutcomes.get(txnId);
+          if (outcome?.ok) {
+            return {
+              index: i,
+              requestID: r.requestID,
+              status: "rolled-back" as const,
+              originalTxnId: txnId,
+              refNumber,
+            };
+          }
+          return {
+            index: i,
+            requestID: r.requestID,
+            status: "orphaned" as const,
+            txnId,
+            refNumber,
+            rollbackError: outcome?.ok === false ? outcome.error : "Unknown rollback failure",
+          };
+        }
+        if (r.status === "failed") {
+          return {
+            index: i,
+            requestID: r.requestID,
+            status: "failed" as const,
+            refNumber,
+            statusCode: r.statusCode,
+            statusMessage: r.statusMessage,
+            ...(qbStatusCodeMessage(r.statusCode)
+              ? { humanReadable: qbStatusCodeMessage(r.statusCode) }
+              : {}),
+          };
+        }
+        return {
+          index: i,
+          requestID: r.requestID,
+          status: "skipped" as const,
+          refNumber,
+        };
+      });
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            atomic: true,
+            rolledBack: orphanedEntries.length === 0,
+            failedAt: failedIdx >= 0 ? failedIdx : undefined,
+            failedReason: failedResult ? {
+              statusCode: failedResult.statusCode,
+              statusMessage: failedResult.statusMessage,
+              humanReadable: qbStatusCodeMessage(failedResult.statusCode) || undefined,
+            } : undefined,
+            summary: {
+              posted: 0,
+              failed: results.filter((r) => r.status === "failed").length,
+              skipped: results.filter((r) => r.status === "skipped").length,
+              rolledBack: rolledBackTxnIds.length,
+              rolledBackTxnIds,
+              ...(orphanedEntries.length > 0 ? { orphaned: orphanedEntries } : {}),
+            },
+            invoices: entriesPayload,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+  );
+
   server.tool(
     "qb_invoice_update",
     "Update an existing invoice in QuickBooks Desktop. Pass txnId + editSequence (from a prior qb_invoice_list) plus any header fields and/or a replacement `lines` array. When `lines` is provided it REPLACES the invoice's existing line set wholesale — list every line you want the invoice to keep. A line with a txnLineID matching an existing line preserves that TxnLineID and merges any fields you pass over the existing values; a line without txnLineID (or with '-1') is added as new. Subtotal / BalanceRemaining / IsPaid recompute automatically; AppliedAmount is preserved (paid portions don't disappear when lines change). If a line mod drops Subtotal below AppliedAmount, BalanceRemaining goes negative — that's the over-applied state and matches real QB. Customer balance moves by the change in BalanceRemaining (not Subtotal).",

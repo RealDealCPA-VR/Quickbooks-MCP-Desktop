@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (95 total)
+## Tools (97 total)
 
 ### Customers
 | Tool | Description |
@@ -49,6 +49,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 |------|-------------|
 | `qb_invoice_list` | List/search invoices with date/status filters |
 | `qb_invoice_create` | Create an invoice with line items |
+| `qb_invoice_batch_create` | Post 1–100 invoices atomically in one envelope (`onError=stopOnError`). Each entry follows the `qb_invoice_create` shape. Upfront customer-ref validation rejects the whole batch before any wire I/O on a missing `customerName`/`customerListId`; mid-wire failures trigger compensating delete of any prior-posted invoices in REVERSE post order (Customer.Balance reverses via the underlying `handleTxnDel`). Per-entry status: `posted` / `rolled-back` / `orphaned` (rollback delete itself failed — clean up via `qb_invoice_delete` with the surfaced TxnID) / `failed` / `skipped`. Use for monthly retainer billing, recurring subscription invoicing, end-of-month time-and-materials runs. Optional `idempotencyKey` fingerprints the whole entries list. |
 | `qb_invoice_update` | Modify an existing invoice. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. Customer balance adjusts by `newBalanceRemaining - oldBalanceRemaining` (or full reverse-then-apply if `customerName` / `customerListId` re-points the invoice). |
 | `qb_invoice_delete` | Delete an invoice |
 | `qb_invoice_duplicate` | Duplicate an existing invoice. Pass `sourceTxnId`; the tool reads the source's `CustomerRef` + lines (and optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PORefNumber`) and submits a fresh `InvoiceAddRq` with that payload. Defaults: `TxnDate` → today, `DueDate` / `RefNumber` → unset (avoids ref-number collisions on monthly retainer flows), `Memo` → `"Duplicate of <source ref or TxnID>"`. Operator overrides win: `txnDate`, `dueDate`, `refNumber`, `memo`, `customerName` / `customerListId` (retarget at a different customer). Workflow stand-in for QB Desktop's memorized-template "Use" command (which the QBXML SDK doesn't expose). |
@@ -119,6 +120,7 @@ A `SalesReceipt` is the cash-sale equivalent of an `Invoice` — same line shape
 |------|-------------|
 | `qb_sales_receipt_list` | List/search sales receipts with customer/date/refNumber filters. |
 | `qb_sales_receipt_create` | Create a cash-sale receipt. Takes `lines: [{itemName, quantity, rate, amount?, description?}]` plus optional `paymentMethodName` and `depositToAccountName`. `Subtotal` + `TotalAmount` derive from the line set. |
+| `qb_sales_receipt_batch_create` | Post 1–100 cash-sale receipts atomically in one envelope (same shape as `qb_invoice_batch_create`). Cash-sale rollback is structurally simpler than invoice rollback (no AR-balance reversal — cash sales don't post to AR). Use for point-of-sale day-end reconciliation, batch import of online-sale receipts, fundraiser bulk entry. Optional `idempotencyKey` fingerprints the whole entries list. |
 | `qb_sales_receipt_update` | Modify an existing receipt. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. `Subtotal` + `TotalAmount` recompute after line mods. |
 | `qb_sales_receipt_duplicate` | Duplicate an existing sales receipt. Reads source via `sourceTxnId`, carries `CustomerRef` + `PaymentMethodRef` + `DepositToAccountRef` + lines onto a fresh `SalesReceiptAddRq`. Defaults: `TxnDate` → today, `RefNumber` → unset, `Memo` → `"Duplicate of <source ref or TxnID>"`. Override via `txnDate` / `refNumber` / `memo` / `customerName` / `customerListId` / `paymentMethodName` / `depositToAccountName`. Cash-sale mirror of `qb_invoice_duplicate`. |
 | `qb_sales_receipt_delete` | Delete a sales receipt. No AR balance to reverse; the deposit posting against `depositToAccountRef` is rolled back implicitly. |
@@ -257,7 +259,7 @@ End-to-end month-end-close workflow through the MCP:
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (95 tools)      │──│──────────────┐
+                                    │  │ (97 tools)      │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

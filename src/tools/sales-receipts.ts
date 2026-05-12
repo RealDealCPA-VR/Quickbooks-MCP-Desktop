@@ -218,6 +218,281 @@ export function registerSalesReceiptTools(
     }
   );
 
+  // Phase 12 #58 — SR batch mirror of qb_invoice_batch_create. Differs in two
+  // small ways: SR-specific header refs (PaymentMethodRef / DepositToAccountRef)
+  // are accepted per-entry, and the rollback path has no Customer.Balance
+  // reversal to worry about (cash sales don't post to AR — handleTxnDel on a
+  // SalesReceipt is a pure record removal). The compensating-delete envelope
+  // shape is otherwise identical.
+  server.tool(
+    "qb_sales_receipt_batch_create",
+    "Create multiple sales receipts (cash sales) atomically in a single QBXML envelope (onError=stopOnError). Each entry follows the same shape as qb_sales_receipt_create — customerName or customerListId, optional header fields (paymentMethodName / depositToAccountName), optional `lines` array. Validation runs upfront (each entry needs a customer ref, ≤100 entries per batch); a single missing customer ref rejects the whole batch BEFORE any wire I/O so no posting happens. ATOMICITY: the QBXML wire itself does NOT roll back — stopOnError halts the envelope on the first wire-side failure but leaves prior-posted receipts in place. This tool covers that gap by automatically deleting any already-posted receipts when a later one fails (TxnDelRq per posted TxnID). The response carries per-entry status: 'posted' (committed), 'rolled-back' (was posted then auto-deleted), 'orphaned' (was posted but rollback delete itself failed — operator must clean up manually using qb_sales_receipt_delete with the surfaced TxnID), 'failed' (rejected on wire), 'skipped' (never ran post-stopOnError). On full success the response carries success=true plus the array of posted TxnIDs. Use this for high-volume same-day cash-sale entry (point-of-sale day-end reconciliation, batch import of online-sale receipts, fundraiser bulk entry) — anywhere you need ALL OR NONE semantics across multiple receipts. Sales receipts settle instantly to the named deposit account; there is no AR-balance reversal on rollback (cash sales don't post to AR — rollback is a pure record removal). The idempotencyKey fingerprints the whole entries list — reorder, add, or remove and you get statusCode 9002 (use a fresh key).",
+    {
+      receipts: z
+        .array(
+          z.object({
+            customerName: z.string().optional().describe("Customer full name"),
+            customerListId: z.string().optional().describe("Customer ListID (alternative to customerName)"),
+            txnDate: z.string().regex(ISO_DATE_RE).optional()
+              .describe("Sale date (YYYY-MM-DD, default today)"),
+            refNumber: z.string().optional().describe("Reference/sales receipt number"),
+            memo: z.string().optional().describe("Memo"),
+            paymentMethodName: z.string().optional()
+              .describe("Payment method (e.g., Check, Cash, Credit Card)"),
+            depositToAccountName: z.string().optional()
+              .describe("Deposit account full name (e.g., 'Undeposited Funds' or a bank account)"),
+            depositToAccountListId: z.string().optional()
+              .describe("Deposit account ListID (alternative to depositToAccountName)"),
+            lines: z.array(salesReceiptLineSchema).optional()
+              .describe("Sales receipt line items"),
+          })
+        )
+        .min(1)
+        .max(100)
+        .describe("Array of sales receipts to post atomically (1–100). Each entry needs customerName or customerListId."),
+      idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key for the WHOLE BATCH. Retrying with the same key + identical receipts list returns the original batch outcome without re-running the wire envelope (response carries idempotentReplay: true). Reordering, adding, or removing entries makes the request a different request — that returns statusCode 9002 (use a fresh key). Cache is per company file and clears on qb_company_open. CAVEAT: only fully-successful batches are cached. The upfront customer-ref validation gate runs before the idempotency check (entries missing a customer ref are rejected and not cached regardless of key); partial-failure batches are also not cached — fresh retry is the correct recovery (rollback already cleaned up the originally-posted receipts; orphans, if any, are surfaced to the operator on the failing call)."),
+    },
+    async (args) => {
+      // Upfront customer-ref validation — same pattern as qb_invoice_batch_create.
+      const validationErrors: Array<{ index: number; error: string }> = [];
+      for (let i = 0; i < args.receipts.length; i++) {
+        const sr = args.receipts[i];
+        if (!sr.customerName && !sr.customerListId) {
+          validationErrors.push({
+            index: i,
+            error: `Entry ${i + 1}: customerName or customerListId is required`,
+          });
+        }
+      }
+      if (validationErrors.length > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 3120,
+              statusMessage: "One or more entries are missing a required customer reference",
+              humanReadable: qbStatusCodeMessage(3120),
+              validationErrors,
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      const session = getSession();
+
+      const dataList = args.receipts.map((sr) => {
+        const data: Record<string, unknown> = {};
+        if (sr.customerListId) {
+          data.CustomerRef = { ListID: sr.customerListId };
+        } else {
+          data.CustomerRef = { FullName: sr.customerName };
+        }
+        if (sr.txnDate) data.TxnDate = sr.txnDate;
+        if (sr.refNumber) data.RefNumber = sr.refNumber;
+        if (sr.memo) data.Memo = sr.memo;
+        if (sr.paymentMethodName) {
+          data.PaymentMethodRef = { FullName: sr.paymentMethodName };
+        }
+        if (sr.depositToAccountListId) {
+          data.DepositToAccountRef = { ListID: sr.depositToAccountListId };
+        } else if (sr.depositToAccountName) {
+          data.DepositToAccountRef = { FullName: sr.depositToAccountName };
+        }
+        if (sr.lines && sr.lines.length > 0) {
+          data.SalesReceiptLineAdd = sr.lines.map((line) => {
+            const lineData: Record<string, unknown> = {};
+            if (line.itemListId) {
+              lineData.ItemRef = { ListID: line.itemListId };
+            } else if (line.itemName) {
+              lineData.ItemRef = { FullName: line.itemName };
+            }
+            if (line.description) lineData.Desc = line.description;
+            if (line.quantity !== undefined) lineData.Quantity = line.quantity;
+            if (line.rate !== undefined) lineData.Rate = line.rate;
+            if (line.amount !== undefined) lineData.Amount = line.amount;
+            return lineData;
+          });
+        }
+        return data;
+      });
+
+      let results;
+      let batchReplayed = false;
+      try {
+        if (args.idempotencyKey) {
+          const out = await session.executeBatchAddIdempotent(
+            "SalesReceipt",
+            dataList,
+            args.idempotencyKey,
+          );
+          results = out.results;
+          batchReplayed = out.replayed;
+        } else {
+          results = await session.executeBatchAdd("SalesReceipt", dataList);
+        }
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "Batch SalesReceiptAddRq envelope failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const allPosted = results.every((r) => r.status === "posted");
+      if (allPosted) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ...(batchReplayed ? { idempotentReplay: true } : {}),
+              count: results.length,
+              salesReceipts: results.map((r, i) => {
+                const ret = (r as { entity: Record<string, unknown> }).entity;
+                return {
+                  index: i,
+                  requestID: r.requestID,
+                  status: "posted",
+                  txnId: String(ret.TxnID ?? ""),
+                  refNumber: args.receipts[i].refNumber,
+                };
+              }),
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Partial-failure rollback. Identical shape to qb_invoice_batch_create —
+      // SR's handleTxnDel doesn't have a Customer.Balance reversal (cash sales
+      // never moved it in the first place), so the rollback is structurally
+      // simpler in the sim, but the tool-side dance is the same.
+      const failedIdx = results.findIndex((r) => r.status === "failed");
+      const failedResult = failedIdx >= 0
+        ? results[failedIdx] as { statusCode: number; statusMessage: string }
+        : undefined;
+
+      const postedTxnIds: { index: number; txnId: string }[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "posted") {
+          const entity = (results[i] as { entity: Record<string, unknown> }).entity;
+          const txnId = String(entity.TxnID ?? "");
+          if (txnId) postedTxnIds.push({ index: i, txnId });
+        }
+      }
+
+      const rollbackOutcomes = new Map<
+        string,
+        { ok: true } | { ok: false; error: string }
+      >();
+      for (const { txnId } of [...postedTxnIds].reverse()) {
+        try {
+          await session.deleteEntity("SalesReceipt", txnId);
+          rollbackOutcomes.set(txnId, { ok: true });
+        } catch (err) {
+          const e = err as { message?: string };
+          rollbackOutcomes.set(txnId, {
+            ok: false,
+            error: e.message ?? "Compensating TxnDelRq failed",
+          });
+        }
+      }
+
+      const rolledBackTxnIds: string[] = [];
+      const orphanedEntries: Array<{ txnId: string; reason: string }> = [];
+      for (const { txnId } of postedTxnIds) {
+        const outcome = rollbackOutcomes.get(txnId);
+        if (outcome?.ok) rolledBackTxnIds.push(txnId);
+        else orphanedEntries.push({
+          txnId,
+          reason: outcome?.ok === false ? outcome.error : "Unknown rollback failure",
+        });
+      }
+
+      const entriesPayload = results.map((r, i) => {
+        const refNumber = args.receipts[i].refNumber;
+        if (r.status === "posted") {
+          const entity = (r as { entity: Record<string, unknown> }).entity;
+          const txnId = String(entity.TxnID ?? "");
+          const outcome = rollbackOutcomes.get(txnId);
+          if (outcome?.ok) {
+            return {
+              index: i,
+              requestID: r.requestID,
+              status: "rolled-back" as const,
+              originalTxnId: txnId,
+              refNumber,
+            };
+          }
+          return {
+            index: i,
+            requestID: r.requestID,
+            status: "orphaned" as const,
+            txnId,
+            refNumber,
+            rollbackError: outcome?.ok === false ? outcome.error : "Unknown rollback failure",
+          };
+        }
+        if (r.status === "failed") {
+          return {
+            index: i,
+            requestID: r.requestID,
+            status: "failed" as const,
+            refNumber,
+            statusCode: r.statusCode,
+            statusMessage: r.statusMessage,
+            ...(qbStatusCodeMessage(r.statusCode)
+              ? { humanReadable: qbStatusCodeMessage(r.statusCode) }
+              : {}),
+          };
+        }
+        return {
+          index: i,
+          requestID: r.requestID,
+          status: "skipped" as const,
+          refNumber,
+        };
+      });
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            atomic: true,
+            rolledBack: orphanedEntries.length === 0,
+            failedAt: failedIdx >= 0 ? failedIdx : undefined,
+            failedReason: failedResult ? {
+              statusCode: failedResult.statusCode,
+              statusMessage: failedResult.statusMessage,
+              humanReadable: qbStatusCodeMessage(failedResult.statusCode) || undefined,
+            } : undefined,
+            summary: {
+              posted: 0,
+              failed: results.filter((r) => r.status === "failed").length,
+              skipped: results.filter((r) => r.status === "skipped").length,
+              rolledBack: rolledBackTxnIds.length,
+              rolledBackTxnIds,
+              ...(orphanedEntries.length > 0 ? { orphaned: orphanedEntries } : {}),
+            },
+            salesReceipts: entriesPayload,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+  );
+
   server.tool(
     "qb_sales_receipt_update",
     "Update an existing sales receipt in QuickBooks Desktop. Pass txnId + editSequence (from a prior qb_sales_receipt_list) plus any header fields and/or a replacement `lines` array. When `lines` is provided it REPLACES the receipt's existing line set wholesale — list every line you want kept. A line with a txnLineID matching an existing line preserves that TxnLineID and merges any fields you pass over the existing values; a line without txnLineID (or with '-1') is added as new. Subtotal + TotalAmount recompute automatically. Sales receipts are cash sales — there is no AR balance to track and no customer-balance side effect. A stale editSequence rejects with statusCode 3170.",
