@@ -7,6 +7,8 @@
  */
 
 import { XMLParser } from "fast-xml-parser";
+import { statSync } from "node:fs";
+import { basename, extname } from "node:path";
 import type { QBXMLResponse, QBXMLResponseBody } from "../types/qbxml.js";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +101,16 @@ export class SimulationStore {
         let response: QBXMLResponseBody;
         if (key === "GeneralSummaryReportQueryRq") {
           response = this.handleReportQuery(key, reqData);
+        } else if (key === "PayrollSummaryReportQueryRq") {
+          // Phase 11 #55 — qb_w2_summary. Distinct request element from
+          // GeneralSummaryReportQueryRq (different report-type discriminator
+          // child, no ReportBasis). Sim handler walks seeded employees +
+          // their PayrollYTD<year> blocks to synthesize W-2 totals; live
+          // mode dispatches the same envelope to QB. Must precede the
+          // `endsWith("QueryRq")` catch-all (handleQuery would treat it as
+          // a per-type query against a "PayrollSummaryReport" store and
+          // return empty).
+          response = this.handlePayrollSummaryReportQuery(key, reqData);
         } else if (key === "CustomDetailReportQueryRq") {
           // Phase 11 #56 + #56a — bank-rec read side. Distinct from
           // GeneralSummaryReport (which returns Sections/Totals account-level
@@ -125,6 +137,15 @@ export class SimulationStore {
           response = this.handleTransactionQuery(key, reqData);
         } else if (key.endsWith("QueryRq")) {
           response = this.handleQuery(key, reqData);
+        } else if (key === "AttachableAddRq") {
+          // Phase 12 #59 — attachments. Custom path because AttachableAdd has
+          // a non-standard payload shape (FileReference + ObjectRef) and the
+          // sim needs to derive FileName / FileSize / FileExtension from the
+          // disk path AND validate the ObjectRef target exists across any
+          // store. Generic handleAdd would just store the input verbatim and
+          // would surface no error if the target txn or file path was invalid.
+          // Must precede the `endsWith("AddRq")` catch-all.
+          response = this.handleAttachableAdd(reqData);
         } else if (key.endsWith("AddRq")) {
           response = this.handleAdd(key, reqData);
         } else if (key === "ClearedStatusModRq") {
@@ -255,6 +276,39 @@ export class SimulationStore {
             return true;
           }
           if (targetNames && targetNames.includes(String(ref.FullName ?? ""))) {
+            return true;
+          }
+          return false;
+        });
+      }
+    }
+
+    // ObjectFilter (Phase 12 #59 — Attachable). Real QB scopes
+    // AttachableQueryRq via ObjectFilter.{ListID|TxnID}, which matches
+    // against the Attachable's ObjectRef. Only Attachable carries an
+    // ObjectRef in this server's first cut (other entities use EntityFilter
+    // for analogous scoping); skipped silently for entity types that don't
+    // store an ObjectRef.
+    if (reqData.ObjectFilter && typeof reqData.ObjectFilter === "object") {
+      const of = reqData.ObjectFilter as Record<string, unknown>;
+      const targetTxnIds = of.TxnID
+        ? (Array.isArray(of.TxnID)
+            ? (of.TxnID as unknown[]).map(String)
+            : [String(of.TxnID)])
+        : null;
+      const targetListIds = of.ListID
+        ? (Array.isArray(of.ListID)
+            ? (of.ListID as unknown[]).map(String)
+            : [String(of.ListID)])
+        : null;
+      if (targetTxnIds || targetListIds) {
+        results = results.filter((e) => {
+          const ref = e.ObjectRef as Record<string, unknown> | undefined;
+          if (!ref) return false;
+          if (targetTxnIds && targetTxnIds.includes(String(ref.TxnID ?? ""))) {
+            return true;
+          }
+          if (targetListIds && targetListIds.includes(String(ref.ListID ?? ""))) {
             return true;
           }
           return false;
@@ -754,6 +808,227 @@ export class SimulationStore {
       }
     }
     return "";
+  }
+
+  // -----------------------------------------------------------------------
+  // PayrollSummaryReportQueryRq handler (Phase 11 #55 — qb_w2_summary)
+  // -----------------------------------------------------------------------
+
+  // Walks the Employee store and synthesizes per-employee YTD payroll totals
+  // from each employee's seeded `PayrollYTDByYear` block. Real QB derives
+  // these from per-paycheck history (which the sim doesn't model — paychecks
+  // are payroll-subscription-only and out of scope for the simulation's wire
+  // contract). The tool layer (qb_w2_summary) maps the response onto W-2 box
+  // numbers — the sim emits the underlying gross / withholding values as
+  // EmployeeWagesTaxesRet rows and lets the tool name the boxes.
+  //
+  // Scope: only `PayrollSummaryReportType=EmployeeWagesTaxesAdjustments` is
+  // implemented today. Real QB exposes ~10 PayrollSummaryReportType values
+  // (PayrollLiability / PayrollItem / PayrollDetailReview / etc.) — those are
+  // out of #55 scope; statusCode 3120 surfaces them clearly so callers don't
+  // silently get empty data.
+  //
+  // ReportPeriod selects which year's PayrollYTDByYear block to surface
+  // (the year inferred from FromReportDate; if both bounds are present they
+  // must fall in the same calendar year — cross-year payroll periods don't
+  // map onto the W-2 box model). When no period is supplied, the most-
+  // recent seeded year wins.
+  //
+  // ReportEntityFilter (ListID or FullName) scopes the report to a single
+  // employee. Live mode is verified-by-construction — adaptLiveReportRet
+  // does not yet have a row-tree adapter for the payroll report shape; the
+  // first live exercise against a real QB Desktop will reveal the
+  // EmployeeWagesTaxesRet wire shape and the close-label patterns to
+  // recognize.
+  private handlePayrollSummaryReportQuery(
+    reqType: string,
+    reqData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const rsType = reqType.replace("Rq", "Rs");
+    const reportType = String(reqData.PayrollSummaryReportType ?? "");
+
+    if (reportType !== "EmployeeWagesTaxesAdjustments") {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage: `Unsupported PayrollSummaryReportType: ${reportType || "(missing)"} (only EmployeeWagesTaxesAdjustments is implemented in simulation)`,
+        data: {},
+      };
+    }
+
+    const reportPeriod = (reqData.ReportPeriod as Record<string, unknown> | undefined) ?? {};
+    const fromDate = reportPeriod.FromReportDate ? String(reportPeriod.FromReportDate) : null;
+    const toDate = reportPeriod.ToReportDate ? String(reportPeriod.ToReportDate) : null;
+
+    // Resolve target tax year from the period. Both bounds must fall in the
+    // same calendar year for the W-2 box model to apply cleanly. If only one
+    // bound is supplied, infer from that. If neither, the most-recent seeded
+    // PayrollYTDByYear key wins (per-employee).
+    let targetYear: number | null = null;
+    if (fromDate) {
+      const fy = Number(fromDate.slice(0, 4));
+      if (Number.isFinite(fy)) targetYear = fy;
+    }
+    if (toDate) {
+      const ty = Number(toDate.slice(0, 4));
+      if (Number.isFinite(ty)) {
+        if (targetYear !== null && targetYear !== ty) {
+          return {
+            type: rsType,
+            statusCode: 3120,
+            statusSeverity: "Error",
+            statusMessage: `ReportPeriod spans multiple calendar years (${targetYear} → ${ty}); PayrollSummary requires both bounds in the same year for the W-2 box model.`,
+            data: {},
+          };
+        }
+        targetYear = ty;
+      }
+    }
+
+    const ef = (reqData.ReportEntityFilter as Record<string, unknown> | undefined) ?? {};
+    let efName: string | null = ef.FullName ? String(ef.FullName) : null;
+    if (!efName && ef.ListID) {
+      const e = this.getStore("Employee").get(String(ef.ListID));
+      if (e) efName = String(e.FullName ?? e.Name ?? "");
+    }
+
+    const employees = Array.from(this.getStore("Employee").values()).filter((emp) => {
+      if (!efName) return true;
+      const name = String(emp.FullName ?? emp.Name ?? "");
+      return name === efName;
+    });
+
+    type WagesRow = {
+      EmployeeRef: { ListID: string; FullName: string };
+      SSN: string;
+      GrossWages: number;
+      FederalIncomeTaxWithheld: number;
+      SocialSecurityWages: number;
+      SocialSecurityTaxWithheld: number;
+      MedicareWages: number;
+      MedicareTaxWithheld: number;
+      StateAbbreviation?: string;
+      StateWages?: number;
+      StateIncomeTaxWithheld?: number;
+    };
+    const rows: WagesRow[] = [];
+
+    for (const emp of employees) {
+      const ytdByYear = (emp.PayrollYTDByYear as Record<string, Record<string, unknown>> | undefined) ?? {};
+      const seededYears = Object.keys(ytdByYear)
+        .map((s) => Number(s))
+        .filter((n) => Number.isFinite(n))
+        .sort((a, b) => b - a);
+      if (seededYears.length === 0) continue;
+
+      // Pick the year: explicit target → exact match (skip employee if no
+      // seeded data for that year, matching real QB's behavior of returning
+      // an empty row for an employee with no payroll activity in the period);
+      // no target → most-recent seeded year.
+      const year = targetYear !== null ? targetYear : seededYears[0];
+      const ytd = ytdByYear[String(year)];
+      if (!ytd) continue;
+
+      const fullName = String(emp.FullName ?? emp.Name ?? "");
+      const listID = String(emp.ListID ?? "");
+      const ssnRaw = String(emp.SSN ?? "");
+      // Mask SSN to last 4 — sim never surfaces full SSN even though the
+      // seed carries it (matches real QB's report behavior, which masks SSN
+      // on payroll summary printouts).
+      const last4 = ssnRaw.slice(-4);
+      const ssn = last4 ? `XXX-XX-${last4}` : "";
+
+      const row: WagesRow = {
+        EmployeeRef: { ListID: listID, FullName: fullName },
+        SSN: ssn,
+        GrossWages: Number(ytd.GrossWages ?? 0),
+        FederalIncomeTaxWithheld: Number(ytd.FederalIncomeTaxWithheld ?? 0),
+        SocialSecurityWages: Number(ytd.SocialSecurityWages ?? ytd.GrossWages ?? 0),
+        SocialSecurityTaxWithheld: Number(ytd.SocialSecurityTaxWithheld ?? 0),
+        MedicareWages: Number(ytd.MedicareWages ?? ytd.GrossWages ?? 0),
+        MedicareTaxWithheld: Number(ytd.MedicareTaxWithheld ?? 0),
+      };
+      if (ytd.StateAbbreviation !== undefined) row.StateAbbreviation = String(ytd.StateAbbreviation);
+      if (ytd.StateWages !== undefined) row.StateWages = Number(ytd.StateWages);
+      if (ytd.StateIncomeTaxWithheld !== undefined) row.StateIncomeTaxWithheld = Number(ytd.StateIncomeTaxWithheld);
+      rows.push(row);
+    }
+
+    if (rows.length === 0) {
+      // Real QB returns statusCode 1 (no matching object) for an entirely
+      // empty payroll report — the tool layer maps this to the synthetic
+      // 9004 (subscription required) when no rows came back at all, since
+      // the most common cause of empty payroll data IS no subscription. The
+      // tool's heuristic distinguishes "no employees matched" (entityFilter
+      // mismatch) from "no rows at all" (subscription / no payroll history).
+      return {
+        type: rsType,
+        statusCode: 1,
+        statusSeverity: "Info",
+        statusMessage: "A query request did not find a matching object in QuickBooks",
+        data: {},
+      };
+    }
+
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+    const totals = rows.reduce(
+      (acc, r) => ({
+        TotalGrossWages: acc.TotalGrossWages + r.GrossWages,
+        TotalFederalIncomeTaxWithheld: acc.TotalFederalIncomeTaxWithheld + r.FederalIncomeTaxWithheld,
+        TotalSocialSecurityWages: acc.TotalSocialSecurityWages + r.SocialSecurityWages,
+        TotalSocialSecurityTaxWithheld: acc.TotalSocialSecurityTaxWithheld + r.SocialSecurityTaxWithheld,
+        TotalMedicareWages: acc.TotalMedicareWages + r.MedicareWages,
+        TotalMedicareTaxWithheld: acc.TotalMedicareTaxWithheld + r.MedicareTaxWithheld,
+      }),
+      {
+        TotalGrossWages: 0,
+        TotalFederalIncomeTaxWithheld: 0,
+        TotalSocialSecurityWages: 0,
+        TotalSocialSecurityTaxWithheld: 0,
+        TotalMedicareWages: 0,
+        TotalMedicareTaxWithheld: 0,
+      }
+    );
+
+    const period = targetYear !== null ? targetYear : (rows.length > 0 ? null : null);
+    const subtitle = period !== null
+      ? `January 1 through December 31, ${period}`
+      : "Most-recent payroll year";
+
+    const reportRet: Record<string, unknown> = {
+      ReportTitle: "Employee Wages, Taxes and Adjustments",
+      ReportSubtitle: subtitle,
+      ReportBasis: "Cash",
+      ...(targetYear !== null ? { ReportYear: targetYear } : {}),
+      EmployeeWagesTaxesRet: rows.map((r) => ({
+        ...r,
+        GrossWages: round2(r.GrossWages),
+        FederalIncomeTaxWithheld: round2(r.FederalIncomeTaxWithheld),
+        SocialSecurityWages: round2(r.SocialSecurityWages),
+        SocialSecurityTaxWithheld: round2(r.SocialSecurityTaxWithheld),
+        MedicareWages: round2(r.MedicareWages),
+        MedicareTaxWithheld: round2(r.MedicareTaxWithheld),
+        ...(r.StateWages !== undefined ? { StateWages: round2(r.StateWages) } : {}),
+        ...(r.StateIncomeTaxWithheld !== undefined ? { StateIncomeTaxWithheld: round2(r.StateIncomeTaxWithheld) } : {}),
+      })),
+      Totals: {
+        TotalGrossWages: round2(totals.TotalGrossWages),
+        TotalFederalIncomeTaxWithheld: round2(totals.TotalFederalIncomeTaxWithheld),
+        TotalSocialSecurityWages: round2(totals.TotalSocialSecurityWages),
+        TotalSocialSecurityTaxWithheld: round2(totals.TotalSocialSecurityTaxWithheld),
+        TotalMedicareWages: round2(totals.TotalMedicareWages),
+        TotalMedicareTaxWithheld: round2(totals.TotalMedicareTaxWithheld),
+      },
+    };
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { ReportRet: reportRet },
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -3700,6 +3975,174 @@ export class SimulationStore {
   }
 
   // -----------------------------------------------------------------------
+  // Attachable add handler (Phase 12 #59)
+  // -----------------------------------------------------------------------
+
+  // AttachableAddRq has a non-standard payload shape relative to the
+  // generic *AddRq path:
+  //   - FileReference.FullPath references a file on the QB host's disk;
+  //     real QB COPIES the file into its attached-documents folder during
+  //     ProcessRequest. The sim doesn't copy anything but DOES validate
+  //     the path exists (mirrors QB's "file not found" error behavior so
+  //     callers see the same failure mode in both modes).
+  //   - ObjectRef points at a target entity (TxnID for transactions,
+  //     ListID for lists). Real QB rejects an Attachable whose target
+  //     doesn't exist; the sim walks every store looking for the target,
+  //     surfaces 500 if none match.
+  //   - The response (AttachableRet) carries derived FileName /
+  //     FileSize / FileExtension fields — NOT the FileReference shape
+  //     the caller sent. Sim derives these from disk via fs.statSync
+  //     and path.basename/extname.
+  //
+  // Returns the AttachableRet wrapped in {AttachableRet: <entity>} so
+  // extractResponseData → flattenEntityArray works uniformly.
+  private handleAttachableAdd(reqData: Record<string, unknown>): QBXMLResponseBody {
+    const rsType = "AttachableAddRs";
+    const addData = (reqData.AttachableAdd ?? reqData) as Record<string, unknown>;
+
+    // Validate FileReference.FullPath
+    const fileRef = addData.FileReference as Record<string, unknown> | undefined;
+    const fullPath = fileRef?.FullPath ? String(fileRef.FullPath) : "";
+    if (!fullPath) {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage: "There is a missing element: FileReference.FullPath",
+        data: {},
+      };
+    }
+
+    let fileSize = 0;
+    try {
+      const st = statSync(fullPath);
+      if (!st.isFile()) {
+        return {
+          type: rsType,
+          statusCode: 500,
+          statusSeverity: "Error",
+          statusMessage: `Attachment source path is not a regular file: ${fullPath}`,
+          data: {},
+        };
+      }
+      fileSize = st.size;
+    } catch {
+      return {
+        type: rsType,
+        statusCode: 500,
+        statusSeverity: "Error",
+        statusMessage: `Attachment source file not found: ${fullPath}`,
+        data: {},
+      };
+    }
+
+    // Validate ObjectRef target. ObjectRef is required AND must point at
+    // an entity that exists in some store. Real QB rejects with a similar
+    // 500 error when the txn/list ID doesn't resolve — the sim walks every
+    // store looking for the target ID rather than maintaining a separate
+    // "every TxnID/ListID ever issued" set.
+    const objRef = addData.ObjectRef as Record<string, unknown> | undefined;
+    if (!objRef) {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage: "There is a missing element: ObjectRef",
+        data: {},
+      };
+    }
+    const txnID = objRef.TxnID ? String(objRef.TxnID) : "";
+    const listID = objRef.ListID ? String(objRef.ListID) : "";
+    if (!txnID && !listID) {
+      return {
+        type: rsType,
+        statusCode: 3120,
+        statusSeverity: "Error",
+        statusMessage: "ObjectRef requires exactly one of TxnID or ListID",
+        data: {},
+      };
+    }
+
+    let targetEntity: StoredEntity | null = null;
+    let targetType: string | null = null;
+    for (const [storeName, store] of this.stores.entries()) {
+      // Skip Attachable itself — an attachable can't be the target of
+      // another attachable (real QB also rejects this — Attachable's
+      // ObjectType enum doesn't include "Attachable").
+      if (storeName === "Attachable") continue;
+      const id = txnID || listID;
+      const candidate = store.get(id);
+      if (!candidate) continue;
+      if (txnID && candidate.TxnID === txnID) {
+        targetEntity = candidate;
+        targetType = storeName;
+        break;
+      }
+      if (listID && candidate.ListID === listID) {
+        targetEntity = candidate;
+        targetType = storeName;
+        break;
+      }
+    }
+    if (!targetEntity || !targetType) {
+      const idLabel = txnID ? `TxnID '${txnID}'` : `ListID '${listID}'`;
+      return {
+        type: rsType,
+        statusCode: 500,
+        statusSeverity: "Error",
+        statusMessage: `Attachment target ${idLabel} not found in any QuickBooks store`,
+        data: {},
+      };
+    }
+
+    // Derive file metadata. FileExtension is the extension WITHOUT the
+    // leading dot, lowercased — matches QB's emit format (e.g. "pdf",
+    // not ".pdf" or "PDF").
+    const fileName = basename(fullPath);
+    const ext = extname(fullPath).slice(1).toLowerCase();
+
+    const id = this.nextId();
+    const now = new Date().toISOString();
+    // ShowAsImage accepts boolean true (in-process) or string "true" (wire).
+    // Normalize to boolean for the stored entity. Defaults to false (icon
+    // display) — matches QB's default for non-image attachments.
+    const showAsImage =
+      addData.ShowAsImage === true ||
+      String(addData.ShowAsImage ?? "").toLowerCase() === "true";
+
+    const entity: StoredEntity = {
+      ListID: id,
+      EditSequence: this.nextEditSequence(),
+      TimeCreated: now,
+      TimeModified: now,
+      FileName: fileName,
+      FileSize: fileSize,
+      FileExtension: ext,
+      ...(addData.AttachmentType
+        ? { AttachmentType: String(addData.AttachmentType) }
+        : { AttachmentType: "Normal" }),
+      ShowAsImage: showAsImage,
+      ...(addData.Note ? { Note: String(addData.Note) } : {}),
+      ObjectRef: {
+        ...(txnID ? { TxnID: txnID } : { ListID: listID }),
+        FullName: String(targetEntity.FullName ?? targetEntity.Name ?? ""),
+        ObjectType: targetType,
+      },
+      IsActive: true,
+    };
+
+    this.getStore("Attachable").set(id, entity);
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { AttachableRet: entity },
+    };
+  }
+
+  // -----------------------------------------------------------------------
   // Delete handlers
   // -----------------------------------------------------------------------
 
@@ -4376,6 +4819,162 @@ export class SimulationStore {
       QBFileMode: "SingleUser",
     };
     this.getStore("Host").set("HOST", hostSeed);
+
+    // Employee seeds (Phase 11 #55 — qb_w2_summary). Three employees with
+    // realistic YTD payroll totals for the 2024 + 2025 tax years. The
+    // PayrollYTDByYear block is a sim-only extension (real QB derives these
+    // from per-paycheck history, which the sim doesn't model — paychecks
+    // require a payroll subscription). Tax-year keys are strings so they
+    // serialize cleanly in JSON.
+    //
+    // Withholdings are computed against typical employer-side rates so the
+    // numbers look plausible, not fabricated:
+    //   FICA SS:    6.2% of gross (employee side; employer matches)
+    //   FICA Med:   1.45% of gross (employee side; employer matches)
+    //   Federal IT: ~10-15% effective (varies; uses round figures here)
+    //   State IT:   varies by state — round figures, not exact
+    const employeeSeeds: StoredEntity[] = [
+      {
+        ListID: "80000020-1234567890",
+        Name: "Alice Johnson",
+        FullName: "Alice Johnson",
+        FirstName: "Alice",
+        LastName: "Johnson",
+        IsActive: true,
+        SSN: "123-45-6789",
+        Phone: "555-1010",
+        Email: "alice@demo.co",
+        HiredDate: "2022-03-15",
+        HomeAddress: {
+          Addr1: "123 Maple Street",
+          City: "Springfield",
+          State: "IL",
+          PostalCode: "62701",
+          Country: "US",
+        },
+        EditSequence: now,
+        TimeCreated: "2022-03-15T09:00:00",
+        TimeModified: now,
+        PayrollYTDByYear: {
+          "2024": {
+            GrossWages: 65000.00,
+            FederalIncomeTaxWithheld: 8125.00,
+            SocialSecurityWages: 65000.00,
+            SocialSecurityTaxWithheld: 4030.00,
+            MedicareWages: 65000.00,
+            MedicareTaxWithheld: 942.50,
+            StateAbbreviation: "IL",
+            StateWages: 65000.00,
+            StateIncomeTaxWithheld: 3217.50,
+          },
+          "2025": {
+            GrossWages: 68000.00,
+            FederalIncomeTaxWithheld: 8500.00,
+            SocialSecurityWages: 68000.00,
+            SocialSecurityTaxWithheld: 4216.00,
+            MedicareWages: 68000.00,
+            MedicareTaxWithheld: 986.00,
+            StateAbbreviation: "IL",
+            StateWages: 68000.00,
+            StateIncomeTaxWithheld: 3366.00,
+          },
+        },
+      },
+      {
+        ListID: "80000021-1234567890",
+        Name: "Bob Martinez",
+        FullName: "Bob Martinez",
+        FirstName: "Bob",
+        LastName: "Martinez",
+        IsActive: true,
+        SSN: "987-65-4321",
+        Phone: "555-1020",
+        Email: "bob@demo.co",
+        HiredDate: "2021-07-01",
+        HomeAddress: {
+          Addr1: "456 Oak Avenue",
+          City: "Denver",
+          State: "CO",
+          PostalCode: "80201",
+          Country: "US",
+        },
+        EditSequence: now,
+        TimeCreated: "2021-07-01T09:00:00",
+        TimeModified: now,
+        PayrollYTDByYear: {
+          "2024": {
+            GrossWages: 95000.00,
+            FederalIncomeTaxWithheld: 14250.00,
+            SocialSecurityWages: 95000.00,
+            SocialSecurityTaxWithheld: 5890.00,
+            MedicareWages: 95000.00,
+            MedicareTaxWithheld: 1377.50,
+            StateAbbreviation: "CO",
+            StateWages: 95000.00,
+            StateIncomeTaxWithheld: 4180.00,
+          },
+          "2025": {
+            GrossWages: 98000.00,
+            FederalIncomeTaxWithheld: 14700.00,
+            SocialSecurityWages: 98000.00,
+            SocialSecurityTaxWithheld: 6076.00,
+            MedicareWages: 98000.00,
+            MedicareTaxWithheld: 1421.00,
+            StateAbbreviation: "CO",
+            StateWages: 98000.00,
+            StateIncomeTaxWithheld: 4312.00,
+          },
+        },
+      },
+      {
+        ListID: "80000022-1234567890",
+        Name: "Carla Nguyen",
+        FullName: "Carla Nguyen",
+        FirstName: "Carla",
+        LastName: "Nguyen",
+        IsActive: true,
+        SSN: "555-44-3333",
+        Phone: "555-1030",
+        Email: "carla@demo.co",
+        HiredDate: "2023-11-08",
+        HomeAddress: {
+          Addr1: "789 Pine Road",
+          City: "Austin",
+          State: "TX",
+          PostalCode: "78701",
+          Country: "US",
+        },
+        EditSequence: now,
+        TimeCreated: "2023-11-08T09:00:00",
+        TimeModified: now,
+        // Texas — no state income tax, so StateAbbreviation surfaces but
+        // StateWages / StateIncomeTaxWithheld are absent. Exercises the
+        // optional-state-fields branch in handlePayrollSummaryReportQuery.
+        PayrollYTDByYear: {
+          "2024": {
+            GrossWages: 52000.00,
+            FederalIncomeTaxWithheld: 5720.00,
+            SocialSecurityWages: 52000.00,
+            SocialSecurityTaxWithheld: 3224.00,
+            MedicareWages: 52000.00,
+            MedicareTaxWithheld: 754.00,
+            StateAbbreviation: "TX",
+          },
+          "2025": {
+            GrossWages: 55000.00,
+            FederalIncomeTaxWithheld: 6050.00,
+            SocialSecurityWages: 55000.00,
+            SocialSecurityTaxWithheld: 3410.00,
+            MedicareWages: 55000.00,
+            MedicareTaxWithheld: 797.50,
+            StateAbbreviation: "TX",
+          },
+        },
+      },
+    ];
+    for (const e of employeeSeeds) {
+      this.getStore("Employee").set(e.ListID as string, e);
+    }
 
     // Set ID counter beyond seed data
     this.idCounter = 10000;

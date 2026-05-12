@@ -64,7 +64,12 @@
       "PowerShell($env:QB_DEBUG_QBXML=\"1\"; $env:QB_DEBUG_LOG_PATH=\"$env:TEMP\\\\qbxml-smoke\"; $output = \"\" | & node dist/index.js 2>&1; $exit = $LASTEXITCODE; Write-Output \"---EXITCODE---$exit\"; Write-Output \"---BANNER---\"; Write-Output $output; Remove-Item env:QB_DEBUG_QBXML, env:QB_DEBUG_LOG_PATH)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; \"\" | & node dist/index.js 2>&1 | Select-String \"Mode:|qb_host\"; Write-Output \"---EXIT---$LASTEXITCODE\")"
+      "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; \"\" | & node dist/index.js 2>&1 | Select-String \"Mode:|qb_host\"; Write-Output \"---EXIT---$LASTEXITCODE\")",
+      "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; $banner = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; $exit = $LASTEXITCODE; \"EXIT=$exit\"; $banner)",
+      "PowerShell($env:QB_DEBUG_QBXML=\"1\"; $env:QB_DEBUG_LOG_PATH=\"$env:TEMP\\\\qbxml-smoke\"; $banner = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; $exit = $LASTEXITCODE; \"EXIT=$exit\"; $banner; Remove-Item env:QB_DEBUG_QBXML, env:QB_DEBUG_LOG_PATH -ErrorAction SilentlyContinue)",
+      "PowerShell($cfg = \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\"; if \\(Test-Path $cfg\\) { \\(Get-Content $cfg -Raw | ConvertFrom-Json\\).mcpServers.PSObject.Properties | ForEach-Object { \"$\\($_.Name\\) -> $\\($_.Value.command\\)\" } } else { \"CONFIG_MISSING: $cfg\" })",
+      "Bash(awk '/private buildPnLReport/{print NR; exit}' src/session/simulation-store.ts)",
+      "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; $banner = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $banner)"
     ]
   }
 }

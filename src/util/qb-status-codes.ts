@@ -33,6 +33,21 @@ const TABLE: Record<number, string> = {
   // with the exact original payload returns the cached result silently;
   // diverging payloads under the same key is treated as a caller bug.
   9002: "Idempotency key conflict — a different request was already processed under this key. Use a fresh idempotency key, or replay with the exact original payload.",
+  // 9003 — synthetic, client-side. Issued by qb_w2_summary (Phase 11 #55)
+  // when the resolved edition is "Pro". The QBXML SDK technically allows
+  // PayrollSummaryReportQueryRq on Pro builds, but in practice Pro does not
+  // ship with payroll-subscription-eligible features (Pro Plus / Premier
+  // Plus / Enterprise are the supported tiers post-2022). Surfaced as a
+  // pre-flight error so the caller can avoid a wire round trip that would
+  // either return empty data or a confusing QB-side subscription error.
+  9003: "Edition does not support QB Payroll. Pro builds (without Plus) do not surface payroll data via the SDK; upgrade to Pro Plus, Premier Plus, or Enterprise for payroll features.",
+  // 9004 — synthetic, client-side. Issued by qb_w2_summary when the wire
+  // call succeeds but returns no payroll data (statusCode 1 / empty
+  // EmployeeWagesTaxesRet) OR when QB returns a known payroll-subscription
+  // error pattern. Distinguishes "no payroll subscription" from "no
+  // matching employees" — the first means the operator can't get W-2 data
+  // until they subscribe; the second is a legitimate empty result.
+  9004: "QB Payroll subscription required or not active. PayrollSummaryReportQueryRq returned no data — verify the subscription status in QB Desktop (Employees → My Payroll Service → Account/Billing Info) before retrying.",
 };
 
 export function qbStatusCodeMessage(statusCode: number): string | undefined {

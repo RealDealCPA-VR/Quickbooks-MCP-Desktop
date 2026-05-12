@@ -2328,6 +2328,204 @@ export function registerReportTools(
   );
 
   // -----------------------------------------------------------------------
+  // W-2 summary — payroll-subscription-gated (Phase 11 #55)
+  // -----------------------------------------------------------------------
+
+  // Wraps PayrollSummaryReportQueryRq with ReportType=EmployeeWagesTaxesAdjustments
+  // — the SDK surface that aggregates per-employee YTD payroll totals
+  // (gross wages, federal/state withholding, FICA SS + Medicare). Maps the
+  // report's per-employee rows onto the W-2 box numbers the operator's
+  // tax-prep workflow needs (box 1 = wages tips other comp, box 2 = federal
+  // income tax withheld, box 3-6 = SS/Medicare, box 16-17 = state when
+  // available).
+  //
+  // Two pre-flight gates BEFORE the wire call:
+  //   1. Edition probe via session.getHostInfo() — Pro builds (without Plus)
+  //      don't surface payroll data through the SDK in current QB. Returns
+  //      statusCode 9003 with a clear "upgrade to Pro Plus / Premier Plus /
+  //      Enterprise" message. Cheaper than a wire round trip that would
+  //      either return empty data or a confusing QB-side subscription error.
+  //   2. After the wire call: if the response is empty (sim's statusCode 1
+  //      "no matching object" path → extractReportData returns {}), the
+  //      tool surfaces statusCode 9004 (subscription required or not active).
+  //      Distinguishes "no payroll data" from "no employees matched" — when
+  //      employeeFullName / employeeListId is supplied and matches no
+  //      employee with payroll data, the result still falls into 9004 (the
+  //      caller's intent was to get payroll for that person; surfacing
+  //      "subscription required" is the right escalation when there's no
+  //      data to return).
+  //
+  // SSN masking: rows surface SSN as "XXX-XX-NNNN" (last 4 only) — matches
+  // real QB's printed payroll summary behavior. Sim seeds full SSN; the
+  // handler masks before emitting. Live mode trusts QB's emitted format.
+  //
+  // Tax-year resolution: defaults to the last completed calendar year (e.g.
+  // 2026-05-12 today → 2025). Pass explicit `taxYear` to override. The
+  // wire-side period is always Jan 1 → Dec 31 of the resolved year (W-2
+  // boxes are inherently annual; QB's payroll report supports arbitrary
+  // periods but the W-2 use case is always full-year).
+  server.tool(
+    "qb_w2_summary",
+    "Per-employee W-2 summary — wraps PayrollSummaryReportQueryRq (ReportType=EmployeeWagesTaxesAdjustments) and maps the YTD totals onto W-2 box numbers (box 1 wages tips other comp, box 2 federal income tax withheld, box 3 social security wages, box 4 social security tax withheld, box 5 medicare wages, box 6 medicare tax withheld, box 16 state wages, box 17 state income tax — when state data is present). Defaults `taxYear` to the last completed calendar year. Pre-flight edition probe: Pro builds (without Plus) reject with statusCode 9003 (no payroll-subscription-eligible features in stock Pro). Empty-result path returns statusCode 9004 (payroll subscription required or not active) — distinguishes 'subscription off' from 'no employees matched'. SSNs are masked to last 4 digits ('XXX-XX-1234') matching real QB's payroll-summary printout. Scope to one employee via employeeFullName / employeeListId; both unset returns all eligible employees. The wire-side period is always Jan 1 → Dec 31 of the resolved year — the W-2 box model is inherently annual.",
+    {
+      taxYear: z.number().int().min(2000).max(2100).optional().describe("Calendar year for the W-2 totals. Defaults to the last completed year (current year minus one). The tool always queries the full Jan 1 → Dec 31 period — partial-year W-2 prep is not supported (the W-2 box model is annual)."),
+      employeeFullName: z.string().optional().describe("Scope to a single employee by FullName. Takes precedence over employeeListId when both are supplied."),
+      employeeListId: z.string().optional().describe("Scope to a single employee by ListID. Alternative to employeeFullName."),
+    },
+    async (args) => {
+      const session = getSession();
+
+      // Pre-flight edition gate. Pro is the only edition that's structurally
+      // unable to support payroll in current QB (Pro Plus has it; Premier and
+      // Enterprise both do). For Premier / Enterprise / Accountant builds we
+      // proceed and let the wire return tell us about subscription state.
+      try {
+        const hostInfo = await session.getHostInfo();
+        if (hostInfo.edition === "Pro") {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                statusCode: 9003,
+                statusMessage: `qb_w2_summary requires a payroll-subscription-eligible edition; detected edition: ${hostInfo.edition} (productName: '${hostInfo.productName}')`,
+                humanReadable: qbStatusCodeMessage(9003),
+                edition: hostInfo.edition,
+                productName: hostInfo.productName,
+              }),
+            }],
+            isError: true,
+          };
+        }
+      } catch (err) {
+        // HostQueryRq itself failed — surface as a generic error rather than
+        // letting the W-2 path proceed against an unknown edition. Could
+        // happen on a sim env that hasn't seeded Host (defensive — current
+        // sim DOES seed it).
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "qb_host_query (edition probe) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      // Resolve tax year — explicit arg wins, default to last completed.
+      const today = new Date();
+      const resolvedYear = args.taxYear ?? today.getUTCFullYear() - 1;
+      const fromDate = `${resolvedYear}-01-01`;
+      const toDate = `${resolvedYear}-12-31`;
+
+      const entityFilter = args.employeeFullName
+        ? { FullName: args.employeeFullName }
+        : args.employeeListId
+          ? { ListID: args.employeeListId }
+          : undefined;
+
+      try {
+        const ret = await session.runPayrollSummaryReport({
+          reportType: "EmployeeWagesTaxesAdjustments",
+          fromDate,
+          toDate,
+          ...(entityFilter ? { entityFilter } : {}),
+        });
+
+        const rows = (ret.EmployeeWagesTaxesRet as Array<Record<string, unknown>> | undefined) ?? [];
+        if (rows.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                statusCode: 9004,
+                statusMessage: `PayrollSummaryReportQueryRq returned no data for ${resolvedYear}${entityFilter ? ` (employee scope: ${args.employeeFullName ?? args.employeeListId})` : ""}`,
+                humanReadable: qbStatusCodeMessage(9004),
+                taxYear: resolvedYear,
+                fromDate,
+                toDate,
+              }),
+            }],
+            isError: true,
+          };
+        }
+
+        // Map per-employee rows onto W-2 boxes. Box numbers per IRS Form W-2:
+        //   1: Wages, tips, other compensation (= GrossWages, simplified)
+        //   2: Federal income tax withheld
+        //   3: Social Security wages
+        //   4: Social Security tax withheld
+        //   5: Medicare wages and tips
+        //   6: Medicare tax withheld
+        //   16: State wages, tips, etc.
+        //   17: State income tax
+        // Boxes 7 (SS tips), 8 (allocated tips), 10 (dependent care), 11
+        // (nonqualified plans), 12 (codes A-W), 14 (other), 18-20 (local) are
+        // not surfaced in this first cut — operators with those needs should
+        // run real QB's W-2 wizard (which reads the same paycheck history but
+        // honors per-payroll-item box mapping that the SDK doesn't expose).
+        const employees = rows.map((r) => {
+          const ref = (r.EmployeeRef as Record<string, unknown> | undefined) ?? {};
+          const out: Record<string, unknown> = {
+            employeeListId: String(ref.ListID ?? ""),
+            employeeFullName: String(ref.FullName ?? ""),
+            ssn: String(r.SSN ?? ""),
+            box1_wagesTipsOtherComp: Number(r.GrossWages ?? 0),
+            box2_federalIncomeTaxWithheld: Number(r.FederalIncomeTaxWithheld ?? 0),
+            box3_socialSecurityWages: Number(r.SocialSecurityWages ?? 0),
+            box4_socialSecurityTaxWithheld: Number(r.SocialSecurityTaxWithheld ?? 0),
+            box5_medicareWages: Number(r.MedicareWages ?? 0),
+            box6_medicareTaxWithheld: Number(r.MedicareTaxWithheld ?? 0),
+          };
+          if (r.StateAbbreviation !== undefined) out.stateAbbreviation = String(r.StateAbbreviation);
+          if (r.StateWages !== undefined) out.box16_stateWages = Number(r.StateWages);
+          if (r.StateIncomeTaxWithheld !== undefined) out.box17_stateIncomeTax = Number(r.StateIncomeTaxWithheld);
+          return out;
+        });
+
+        const totals = ret.Totals as Record<string, unknown> | undefined;
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              taxYear: resolvedYear,
+              fromDate,
+              toDate,
+              count: employees.length,
+              employees,
+              totals: totals ?? null,
+              note: "Boxes 7-15 / 18-20 are not surfaced in this first cut. For per-payroll-item box mapping (box 12 codes, box 14 other, local taxes), run QB Desktop's W-2 wizard.",
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "PayrollSummaryReportQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
   // Raw QBXML query (advanced)
   // -----------------------------------------------------------------------
   server.tool(

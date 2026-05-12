@@ -20,6 +20,7 @@ import {
   buildReportRequest,
   buildCustomDetailReportRequest,
   buildGeneralDetailReportRequest,
+  buildPayrollSummaryReportRequest,
 } from "../src/qbxml/builder.js";
 
 // Returns the names of `candidates` that appear inside the given request
@@ -658,6 +659,46 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
       (m) => m[1],
     );
     expect(idMatches).toEqual(["1", "2", "3"]);
+  });
+
+  it("PayrollSummaryReportQueryRq: PayrollSummaryReportType → ReportPeriod → SummarizeColumnsBy → ReportEntityFilter (Phase 11 #55)", () => {
+    // Conservative subset of PayrollSummaryReportQueryRq's <xs:sequence>
+    // emitted by buildPayrollSummaryReportRequest. Distinct from
+    // GeneralSummaryReportQueryRq — different report-type discriminator
+    // (PayrollSummaryReportType, not GeneralSummaryReportType) and no
+    // ReportBasis child (payroll reports are inherently cash). The first
+    // live exercise of qb_w2_summary may surface a schema-order rejection
+    // (statusCode -1 "found an error when parsing") if the actual XSD
+    // requires a different position for SummarizeColumnsBy or
+    // ReportEntityFilter — same class as the 2026-05-09 #37 P&L bug. This
+    // test pins the conservative subset so any future builder edit can't
+    // re-introduce the regression class undetected.
+    const xml = buildPayrollSummaryReportRequest({
+      reportType: "EmployeeWagesTaxesAdjustments",
+      fromDate: "2024-01-01",
+      toDate: "2024-12-31",
+      entityFilter: { FullName: "Alice Johnson" },
+    });
+
+    const order = emittedChildOrder(xml, "PayrollSummaryReportQueryRq", [
+      "PayrollSummaryReportType",
+      "ReportPeriod",
+      "SummarizeColumnsBy",
+      "ReportEntityFilter",
+    ]);
+
+    expect(order).toEqual([
+      "PayrollSummaryReportType",
+      "ReportPeriod",
+      "SummarizeColumnsBy",
+      "ReportEntityFilter",
+    ]);
+
+    // Defensive: payroll reports are inherently cash — there is NO
+    // ReportBasis child in PayrollSummaryReportQueryRq. If a future edit
+    // accidentally adds one (e.g. via a copy-paste from buildReportRequest),
+    // this assertion catches it before live mode rejects.
+    expect(xml).not.toContain("<ReportBasis>");
   });
 
   it("preserves arbitrary insertion order — does not silently sort", () => {

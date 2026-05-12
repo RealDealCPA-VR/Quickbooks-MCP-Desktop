@@ -78,6 +78,14 @@ const arrayElements = new Set([
   "TextRow",
   "SubtotalRow",
   "TotalRow",
+  // Phase 11 #55 — qb_w2_summary. PayrollSummaryReportQueryRq sim shape emits
+  // one EmployeeWagesTaxesRet per employee under ReportRet; the row is what
+  // the tool layer maps onto W-2 boxes.
+  "EmployeeWagesTaxesRet",
+  // Phase 12 #59 — attachments. AttachableQueryRq returns N AttachableRet rows;
+  // a single hit must still surface as an array for the tool layer's filter
+  // path to work uniformly.
+  "AttachableRet",
 ]);
 
 // ---------------------------------------------------------------------------

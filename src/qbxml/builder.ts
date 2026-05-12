@@ -443,6 +443,68 @@ export function buildCustomDetailReportRequest(
   );
 }
 
+/**
+ * Build a PayrollSummaryReportQueryRq for payroll/W-2 reporting (Phase 11 #55).
+ *
+ * Distinct from buildReportRequest (GeneralSummaryReportQueryRq):
+ *   - Different request element + different report-type discriminator
+ *     (`PayrollSummaryReportType`, not `GeneralSummaryReportType`).
+ *   - Always cash-basis in real QB — there is no `ReportBasis` child on
+ *     PayrollSummaryReportQueryRq (payroll reports are inherently cash).
+ *   - Has `SummarizeColumnsBy="TotalOnly"` and a `ReportEntityFilter` for
+ *     scoping to a single employee.
+ *
+ * Schema-required <xs:sequence> emit order, conservative subset (the report
+ * supports more children — DisplayReport / IncludeColumn / SummarizeRowsBy —
+ * but for the W-2 use case we only need these). Pinned in
+ * tests/builder-emit-order.test.ts:
+ *   1. PayrollSummaryReportType
+ *   2. ReportPeriod (FromReportDate?, ToReportDate?)
+ *   3. SummarizeColumnsBy
+ *   4. ReportEntityFilter (FullName | ListID)
+ *
+ * NOTE: as with the other report builders, the exact schema-position numbers
+ * per the QBXML 16.0 SDK XSD have not been verified line-by-line against
+ * qbxmlops130/140 in this session — if live QBXMLRP2 surfaces statusCode -1
+ * "found an error when parsing" against this builder, that's the same class
+ * of bug as the 2026-05-09 #37 P&L bug; the fix is to reorder children to
+ * match the actual XSD <xs:sequence>.
+ */
+export function buildPayrollSummaryReportRequest(
+  params: {
+    reportType: string;
+    fromDate?: string;
+    toDate?: string;
+    entityFilter?: { FullName?: string; ListID?: string };
+  },
+  version?: string
+): string {
+  const body: Record<string, unknown> = {
+    PayrollSummaryReportType: params.reportType,
+  };
+
+  const reportPeriod: Record<string, unknown> = {};
+  if (params.fromDate) reportPeriod.FromReportDate = params.fromDate;
+  if (params.toDate) reportPeriod.ToReportDate = params.toDate;
+  if (Object.keys(reportPeriod).length > 0) {
+    body.ReportPeriod = reportPeriod;
+  }
+
+  // SummarizeColumnsBy=TotalOnly mirrors buildReportRequest's default — single
+  // total column per employee row. The W-2 use case is YTD totals; period
+  // slicing is out of #55 scope.
+  body.SummarizeColumnsBy = "TotalOnly";
+
+  if (params.entityFilter) {
+    const ef: Record<string, unknown> = {};
+    if (params.entityFilter.ListID) ef.ListID = params.entityFilter.ListID;
+    else if (params.entityFilter.FullName) ef.FullName = params.entityFilter.FullName;
+    if (Object.keys(ef).length > 0) body.ReportEntityFilter = ef;
+  }
+
+  return buildSingleRequest("PayrollSummaryReportQueryRq", body, version);
+}
+
 export function buildDeleteRequest(
   entityType: string,
   listIdOrTxnId: string,

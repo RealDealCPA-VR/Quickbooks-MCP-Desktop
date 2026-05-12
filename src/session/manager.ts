@@ -25,6 +25,7 @@ import {
   buildReportRequest,
   buildCustomDetailReportRequest,
   buildGeneralDetailReportRequest,
+  buildPayrollSummaryReportRequest,
   buildClearedStatusModRequest,
 } from "../qbxml/builder.js";
 import {
@@ -1275,6 +1276,36 @@ export class QBSessionManager {
    * would have failed live with statusCode 3120. See DECISIONS.md
    * 2026-05-10.
    */
+  /**
+   * Run a PayrollSummaryReportQueryRq (Phase 11 #55 — qb_w2_summary). Wraps
+   * the wire surface end-to-end: builds the envelope via
+   * buildPayrollSummaryReportRequest, sends it, returns the extracted ReportRet
+   * via the same extractReportData path P&L / BS / SCF go through (which
+   * routes live ReportData row trees through adaptLiveReportRet — for the
+   * payroll report variant the live shape has not been pinned yet, so live
+   * mode is verified-by-construction; sim mode emits the simplified shape
+   * directly via handlePayrollSummaryReportQuery).
+   *
+   * Distinct from runReport: payroll reports are inherently cash-basis (no
+   * `basis` arg) and use a different report-type discriminator. Tool layer
+   * (qb_w2_summary) is responsible for edition gating + W-2 box mapping.
+   */
+  async runPayrollSummaryReport(
+    params: {
+      reportType: string;
+      fromDate?: string;
+      toDate?: string;
+      entityFilter?: { FullName?: string; ListID?: string };
+    }
+  ): Promise<Record<string, unknown>> {
+    const xml = buildPayrollSummaryReportRequest(
+      params,
+      this.config.qbxmlVersion
+    );
+    const response = await this.sendRequest(xml);
+    return extractReportData(response, "PayrollSummaryReportQueryRs");
+  }
+
   async runGeneralDetailReport(
     params: {
       reportType: string;
