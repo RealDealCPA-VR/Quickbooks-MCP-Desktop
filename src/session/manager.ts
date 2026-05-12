@@ -309,6 +309,72 @@ function fingerprintPayload(entityType: string, payload: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// Live-mode transient-error retry (Phase 18 #84)
+// ---------------------------------------------------------------------------
+
+/**
+ * Backoff schedule between auto-reconnect retries on transient QBXMLRP2
+ * failures. Three retries after the initial attempt = four total wire calls
+ * worst case. Total sleep budget 1.75s — enough for QB Desktop to recover
+ * from a brief stall without blocking the agent for an unreasonably long
+ * time. Frozen so tests can assert against the canonical schedule.
+ *
+ * Tuning rationale: QB Desktop's request processor occasionally rejects a
+ * call with `0x80040408 "QBSession not open"` when QB is mid-operation
+ * (autosave, background indexing). Typical recovery is sub-second; the 250
+ * → 500 → 1000 ladder hits the 99th percentile of those without inflating
+ * latency for the common case. If we ever see a recoverable error pattern
+ * that needs >1.75s, add a fourth tier rather than stretching the existing
+ * ones — the existing values are pinned by the test schedule.
+ */
+export const RECONNECT_BACKOFF_MS: readonly number[] = Object.freeze([250, 500, 1000]);
+
+/**
+ * Classify whether a QBXMLRP2 error is recoverable by tearing down the
+ * session and re-opening. Conservative whitelist — only retry on signals we
+ * have direct evidence are transient. Anything else propagates to the
+ * caller immediately so the operator can see the real failure.
+ *
+ * Matched signals:
+ *   - `0x80040408` — the canonical "QBSession not open" HRESULT QBXMLRP2
+ *     returns when QB Desktop drops the ticket mid-session (autosave,
+ *     background indexing, brief stall). Also surfaces as the decimal form
+ *     `-2147220472` from some winax error paths. Match on both hex string
+ *     and the descriptive text "QBSession not open" since winax sometimes
+ *     formats only one or the other.
+ *
+ * Not retried:
+ *   - `0x80040409` / general "connection lost" — observed only in scenarios
+ *     where QB Desktop crashed and won't accept a fresh OpenConnection2
+ *     either. Retrying just wastes the budget; bubble the error so the
+ *     operator can act.
+ *   - `RPC_E_*` codes — too ambiguous; some are transient, others are
+ *     terminal. Wait until we see one in the wild before adding it.
+ *   - QB-status-code-shaped errors (3120 / 3170 / 500) — these are
+ *     application-level, not transport-level. Retrying would not change
+ *     the outcome.
+ */
+export function isTransientLiveError(err: unknown): boolean {
+  if (err === null || err === undefined) return false;
+  const raw = err instanceof Error ? err.message : String(err);
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  return (
+    lower.includes("0x80040408") ||
+    lower.includes("-2147220472") ||
+    lower.includes("qbsession not open")
+  );
+}
+
+/**
+ * Real-clock sleep. Overridable per-instance via `QBSessionManager.sleepImpl`
+ * so the retry loop is testable without `vi.useFakeTimers()` pollution.
+ */
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
 // Session manager
 // ---------------------------------------------------------------------------
 
@@ -389,6 +455,16 @@ export class QBSessionManager {
    * the correct behavior, not a bug.
    */
   private static readonly MAX_IDEMPOTENCY_CACHE_SIZE = 1000;
+
+  /**
+   * Backoff sleep implementation (Phase 18 #84). Defaults to a real-clock
+   * `setTimeout`-based sleep; tests override via
+   * `(sm as any).sleepImpl = stub` so the retry loop can run without burning
+   * real wall-clock time. Public-ish (private field, but reachable via
+   * `as any`) matches the existing test-seam pattern used for
+   * `store.processRequest` / `getHostInfo` overrides.
+   */
+  private sleepImpl: (ms: number) => Promise<void> = defaultSleep;
 
   constructor(config: QBConnectionConfig) {
     this.config = config;
@@ -632,41 +708,135 @@ export class QBSessionManager {
     }
 
     const logger = getQbxmlLogger();
-    const mode: "live" | "simulation" = this.simulationMode ? "simulation" : "live";
-    const marker = logger?.logRequest(qbxmlRequest, mode);
 
     if (this.simulationMode) {
+      const marker = logger?.logRequest(qbxmlRequest, "simulation");
       try {
         const response = this.store.processRequest(qbxmlRequest);
-        if (logger && marker) logger.logResponse(response, mode, marker);
+        if (logger && marker) logger.logResponse(response, "simulation", marker);
         return response;
       } catch (err) {
-        if (logger && marker) logger.logError(err, mode, marker);
+        if (logger && marker) logger.logError(err, "simulation", marker);
         throw err;
       }
     }
 
-    // LIVE MODE — round-trip the QBXML string through QBXMLRP2 and parse the
-    // response with the same parser the simulation results would have flowed
-    // through. Errors from ProcessRequest bubble out so the existing tool-side
-    // error machinery (Item 25 path) can translate them into structured tool
-    // responses.
-    if (!this.rp || !this.session) {
-      throw new Error(
-        "Live mode is active but no session is open — openSession was expected to be called first."
-      );
+    // LIVE MODE — round-trip the QBXML string through QBXMLRP2 with auto-
+    // reconnect retry on transient errors (Phase 18 #84). Each attempt is
+    // logged as a separate request/response pair so debug logs surface the
+    // full retry sequence; the response parser runs on the FINAL successful
+    // attempt only. Non-transient errors bubble out on the first failure for
+    // the existing tool-side error machinery (Item 25 path) to translate.
+    return this.sendLiveRequestWithRetry(qbxmlRequest, logger);
+  }
+
+  /**
+   * Live-mode wire call with automatic reconnect on transient QBXMLRP2
+   * failures (Phase 18 #84). Caller has already gone through the sim-vs-live
+   * branch and the session has been opened at least once.
+   *
+   * Retry schedule: initial attempt + up to `RECONNECT_BACKOFF_MS.length`
+   * (3) retries, with sleeps drawn from `RECONNECT_BACKOFF_MS` between
+   * attempts. After each transient failure the session is torn down (best-
+   * effort EndSession + CloseConnection on the stale ticket, then null state)
+   * and re-opened via `openSession()` before retrying.
+   *
+   * Failure modes:
+   *   - Transient `ProcessRequest` error → sleep + reconnect + retry.
+   *   - Non-transient `ProcessRequest` error → throw immediately.
+   *   - Reconnect itself fails (e.g. QB Desktop fully closed) → throw a
+   *     wrapped error naming both the reconnect failure and the original
+   *     transient error. The retry budget is forfeit at that point — if QB
+   *     won't accept a fresh OpenConnection2 right now, looping won't help.
+   *   - All retries exhausted with transient errors only → throw the last
+   *     transient error.
+   *
+   * State invariants preserved across reconnect:
+   *   - `readOnly` flag (intentionally documented as surviving close/open).
+   *   - `idempotencyCache` (per-companyFile; only cleared by switchCompanyFile).
+   *   - `hostInfoCache` (installation-scoped; same process, same edition).
+   *   - Live `companyFile` config (the new openSession uses the same path).
+   */
+  private async sendLiveRequestWithRetry(
+    qbxmlRequest: string,
+    logger: ReturnType<typeof getQbxmlLogger>,
+  ): Promise<QBXMLResponse> {
+    const maxRetries = RECONNECT_BACKOFF_MS.length;
+    let lastErr: unknown = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (!this.rp || !this.session) {
+        // Either initial state was empty (shouldn't reach here — sendRequest
+        // calls openSession first), or a prior reconnect attempt left state
+        // null. Treat as a hard error rather than auto-recovering further.
+        throw new Error(
+          "Live mode is active but no session is open — openSession was expected to be called first."
+        );
+      }
+
+      const marker = logger?.logRequest(qbxmlRequest, "live");
+      try {
+        const responseXml: string = this.rp.ProcessRequest(this.session.ticket, qbxmlRequest);
+        // Log the raw response XML BEFORE parsing — a parser throw is one of
+        // the main reasons to enable this logger in the first place (the wire
+        // bytes are the only useful artifact at that point).
+        if (logger && marker) logger.logResponse(responseXml, "live", marker);
+        return parseQBXMLResponse(responseXml);
+      } catch (err) {
+        if (logger && marker) logger.logError(err, "live", marker);
+        lastErr = err;
+
+        const haveRetriesLeft = attempt < maxRetries;
+        if (!haveRetriesLeft || !isTransientLiveError(err)) {
+          throw err;
+        }
+
+        const backoffMs = RECONNECT_BACKOFF_MS[attempt];
+        console.error(
+          `[QB Session] Transient QBXMLRP2 error on attempt ${attempt + 1}/${maxRetries + 1} ` +
+          `(${(err as Error).message}). Reconnecting and retrying after ${backoffMs}ms.`
+        );
+        await this.sleepImpl(backoffMs);
+        try {
+          await this.reconnectAfterTransientError();
+        } catch (reconnectErr) {
+          throw new Error(
+            `Reconnect after transient QBXMLRP2 error failed: ${(reconnectErr as Error).message}. ` +
+            `Original transient error: ${(err as Error).message}`
+          );
+        }
+      }
     }
-    try {
-      const responseXml: string = this.rp.ProcessRequest(this.session.ticket, qbxmlRequest);
-      // Log the raw response XML BEFORE parsing — a parser throw is one of
-      // the main reasons to enable this logger in the first place (the wire
-      // bytes are the only useful artifact at that point).
-      if (logger && marker) logger.logResponse(responseXml, mode, marker);
-      return parseQBXMLResponse(responseXml);
-    } catch (err) {
-      if (logger && marker) logger.logError(err, mode, marker);
-      throw err;
+
+    // Unreachable in practice — the loop either returns on success or throws
+    // on the final attempt. Defensive throw to satisfy the return-type check
+    // and surface a clearly-labelled bug if the loop bounds ever drift.
+    throw lastErr ?? new Error("sendLiveRequestWithRetry: exited loop without resolving");
+  }
+
+  /**
+   * Tear down the current live-mode session in preparation for an
+   * auto-reconnect (Phase 18 #84). Best-effort EndSession + CloseConnection
+   * on the stale ticket — both can throw if QB Desktop already considers the
+   * session dead, and we swallow those throws because we're already in the
+   * recovery path. Then null out `rp` + `session` so `openSession()` will
+   * actually re-run OpenConnection2 + BeginSession (it short-circuits when
+   * `this.session` is non-null).
+   *
+   * Intentionally does NOT clear `readOnly`, `idempotencyCache`, or
+   * `hostInfoCache` — those carry per-process state that survives a
+   * connection reset by design.
+   */
+  private async reconnectAfterTransientError(): Promise<void> {
+    if (this.rp) {
+      if (this.session) {
+        try { this.rp.EndSession(this.session.ticket); } catch { /* swallow — ticket likely already dead */ }
+      }
+      try { this.rp.CloseConnection(); } catch { /* swallow — connection likely already dropped */ }
     }
+    this.rp = null;
+    this.session = null;
+    await this.openSession();
   }
 
   /**
