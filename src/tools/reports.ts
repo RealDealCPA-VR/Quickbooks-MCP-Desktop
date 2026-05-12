@@ -434,6 +434,66 @@ export function registerReportTools(
   );
 
   // -----------------------------------------------------------------------
+  // Host info — QB edition / version detection (Phase 18 #82)
+  // -----------------------------------------------------------------------
+
+  // Wraps HostQueryRq. The response describes the QB Desktop INSTALLATION
+  // (ProductName, MajorVersion, SupportedQBXMLVersionList, IsAutomaticLogin,
+  // QBFileMode) — distinct from CompanyQueryRq's file-scoped properties.
+  // Cached at the session manager (first call hits the wire, subsequent calls
+  // return the cache) — invalidated on qb_company_open. Pass refresh:true to
+  // force a fresh round trip (e.g. after a QB Desktop upgrade mid-process).
+  //
+  // The derived `edition` field is the gating signal downstream tools should
+  // use — never parse `productName` directly. `isEnterprise` gates Enterprise-
+  // only features (item 66 audit log); `isAccountant` flags Accountant-edition
+  // builds (which have a different report set). Payroll-gated tools (item 55
+  // qb_w2_summary) need a separate subscription probe — Payroll subscription
+  // is not derivable from HostRet alone.
+  server.tool(
+    "qb_host_query",
+    "Run HostQueryRq for QB Desktop installation metadata — productName / majorVersion / minorVersion / country / supportedQbxmlVersions / isAutomaticLogin / qbFileMode (SingleUser | MultiUser) — plus derived `edition` (Pro | Premier | PremierAccountant | Enterprise | EnterpriseAccountant | Unknown), `isEnterprise`, `isAccountant`, and `maxQbxmlVersion`. Cached at the session manager after the first call; pass refresh:true to force a re-query. Use `edition` to gate edition-specific features (Enterprise-only audit log, Premier-only payroll variants, etc.) — do NOT parse `productName` directly. Payroll subscription is NOT derivable from this response (it requires a separate subscription probe).",
+    {
+      refresh: z.boolean().optional().describe("Force a fresh HostQueryRq round trip, bypassing the cache. Default false — first call populates the cache, subsequent calls return it until qb_company_open clears it."),
+    },
+    async ({ refresh }) => {
+      const session = getSession();
+      try {
+        // Snapshot cache state BEFORE the call — `cached: true` means the
+        // response came from cache, not that the cache is populated now (it
+        // always is after the call returns).
+        const wasCached = session.peekHostInfoCache() !== null;
+        const hostInfo = await session.getHostInfo({ refresh: refresh ?? false });
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              ...hostInfo,
+              cached: !refresh && wasCached,
+              simulationMode: session.isSimulation(),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "HostQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
   // Company file management — open / list (Items 34-35)
   // -----------------------------------------------------------------------
 

@@ -130,6 +130,140 @@ export class QBIdempotencyKeyConflictError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Host info — QB edition / version detection (Phase 18 #82)
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalized shape returned by `QBSessionManager.getHostInfo()`. Derived from
+ * the raw `HostRet` wire shape (camelCased fields + flattened version list +
+ * derived `edition` discriminant). Surfaced verbatim by `qb_host_query`.
+ *
+ * `edition` is the gating signal used by tools that require a specific QB
+ * edition (item 66 audit log → Enterprise, item 55 W-2 → Payroll subscription
+ * which is a separate query). Tools should NOT parse `productName` themselves —
+ * use `edition` / `isEnterprise` / `isAccountant`.
+ */
+export type HostEdition =
+  | "Pro"
+  | "Premier"
+  | "PremierAccountant"
+  | "Enterprise"
+  | "EnterpriseAccountant"
+  | "Unknown";
+
+export interface HostInfo {
+  productName: string;
+  majorVersion: string;
+  minorVersion: string;
+  country: string;
+  supportedQbxmlVersions: string[];
+  maxQbxmlVersion: string | null;
+  isAutomaticLogin: boolean;
+  qbFileMode: string;
+  edition: HostEdition;
+  isEnterprise: boolean;
+  isAccountant: boolean;
+}
+
+/**
+ * Derive the edition discriminant from QB's free-form ProductName string.
+ *
+ * Product-name samples seen in the wild:
+ *   "QuickBooks Pro 2024"
+ *   "QuickBooks Premier Edition 2024"
+ *   "QuickBooks Premier Accountant Edition 2024"
+ *   "QuickBooks Accountant Desktop 2024"   ← standalone Accountant brand = Premier Accountant
+ *   "QuickBooks Enterprise Solutions 24.0"
+ *   "QuickBooks Enterprise Solutions: Accountant 24.0"
+ *
+ * Match order matters — Enterprise must precede Premier (an Enterprise build
+ * with "Premier" anywhere in the marketing copy would otherwise misclassify),
+ * and the +Accountant variants check both the family marker and "accountant"
+ * in one pass. Standalone "Accountant" (no Premier / Enterprise) is a
+ * rebranded Premier Accountant — classified as PremierAccountant.
+ */
+export function deriveHostEdition(productName: string): HostEdition {
+  const p = productName.toLowerCase();
+  const hasAccountant = p.includes("accountant");
+  if (p.includes("enterprise")) {
+    return hasAccountant ? "EnterpriseAccountant" : "Enterprise";
+  }
+  if (p.includes("premier")) {
+    return hasAccountant ? "PremierAccountant" : "Premier";
+  }
+  if (hasAccountant) return "PremierAccountant";
+  if (p.includes("pro")) return "Pro";
+  return "Unknown";
+}
+
+/**
+ * Normalize a raw HostRet wire shape into the camelCased HostInfo shape.
+ * Tolerant of two SupportedQBXMLVersionList encodings: fast-xml-parser
+ * produces `{Version: ["1.0", "1.1", ...]}` for multi-version lists and
+ * `{Version: "16.0"}` for a single-version list (Version isn't in the
+ * parser's arrayElements set — we coerce here rather than pollute the
+ * global set with a name as generic as "Version").
+ *
+ * Defensive about every input — a malformed HostRet (missing fields, wrong
+ * types) produces a HostInfo with empty-string / false / "Unknown" defaults
+ * rather than throwing. The caller (qb_host_query) shouldn't fail open on a
+ * shape it didn't expect.
+ */
+export function normalizeHostInfo(raw: Record<string, unknown>): HostInfo {
+  const productName = String(raw.ProductName ?? "");
+  const majorVersion = String(raw.MajorVersion ?? "");
+  const minorVersion = String(raw.MinorVersion ?? "");
+  const country = String(raw.Country ?? "");
+  const qbFileMode = String(raw.QBFileMode ?? "");
+
+  const isAutomaticLogin = (() => {
+    const v = raw.IsAutomaticLogin;
+    if (typeof v === "boolean") return v;
+    if (typeof v === "string") return v.toLowerCase() === "true";
+    return false;
+  })();
+
+  const supportedQbxmlVersions = (() => {
+    const v = raw.SupportedQBXMLVersionList;
+    if (!v || typeof v !== "object") return [];
+    const inner = (v as Record<string, unknown>).Version;
+    if (inner === undefined || inner === null) return [];
+    if (Array.isArray(inner)) return inner.map((x) => String(x));
+    return [String(inner)];
+  })();
+
+  const maxQbxmlVersion = supportedQbxmlVersions.length > 0
+    ? supportedQbxmlVersions.reduce((acc, v) => {
+        // Compare as numeric tuples so "16.0" > "9.0" (string compare fails here).
+        const av = acc.split(".").map(Number);
+        const bv = v.split(".").map(Number);
+        for (let i = 0; i < Math.max(av.length, bv.length); i++) {
+          const a = av[i] ?? 0;
+          const b = bv[i] ?? 0;
+          if (a !== b) return a > b ? acc : v;
+        }
+        return acc;
+      })
+    : null;
+
+  const edition = deriveHostEdition(productName);
+
+  return {
+    productName,
+    majorVersion,
+    minorVersion,
+    country,
+    supportedQbxmlVersions,
+    maxQbxmlVersion,
+    isAutomaticLogin,
+    qbFileMode,
+    edition,
+    isEnterprise: edition === "Enterprise" || edition === "EnterpriseAccountant",
+    isAccountant: edition === "PremierAccountant" || edition === "EnterpriseAccountant",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Idempotency cache helpers
 // ---------------------------------------------------------------------------
 
@@ -230,6 +364,21 @@ export class QBSessionManager {
    * underlying problem without being shadowed by a stale failure.
    */
   private idempotencyCache: Map<string, IdempotencyCacheEntry> = new Map();
+
+  /**
+   * Cached host info (Phase 18 #82). Lazily populated on the first
+   * `getHostInfo()` call and held until `switchCompanyFile` clears it.
+   *
+   * HostQueryRq returns properties of the QB Desktop INSTALLATION
+   * (ProductName, MajorVersion, SupportedQBXMLVersionList, IsAutomaticLogin,
+   * QBFileMode) — not the company file. In practice these don't change within
+   * a single process's lifetime, so caching one round trip per session is the
+   * right tradeoff. The cache is cleared on `switchCompanyFile` defensively
+   * (the operator might be switching to a file backed by a different QB
+   * process in some future remote-mode setup — current localQBD doesn't allow
+   * this, but the cost of an extra round trip on switch is negligible).
+   */
+  private hostInfoCache: HostInfo | null = null;
 
   /**
    * Cap on the per-companyFile idempotency cache. Sized for a long-running
@@ -454,6 +603,12 @@ export class QBSessionManager {
     // (live QB does persist across switches, but the in-memory cache here
     // only holds keys observed in this process).
     this.idempotencyCache.clear();
+    // Host info is installation-scoped (ProductName / MajorVersion / etc.),
+    // not company-file-scoped — under localQBD it's the same QB process either
+    // way. But the operator might be reconnecting to a freshly-installed /
+    // upgraded QB, and the cost of re-querying is one round trip. Cheaper to
+    // be defensive here than to ship stale edition info.
+    this.hostInfoCache = null;
     return this.openSession();
   }
 
@@ -1002,6 +1157,47 @@ export class QBSessionManager {
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);
     return Array.isArray(data) ? data[0] ?? {} : data;
+  }
+
+  // -------------------------------------------------------------------------
+  // Host info (Phase 18 #82)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Return the QB Desktop host info (edition / version / supported QBXML
+   * versions / file mode / etc.). First call hits the wire via HostQueryRq;
+   * subsequent calls return the cached value until `switchCompanyFile`
+   * invalidates it.
+   *
+   * Pass `{ refresh: true }` to force a fresh round trip — useful after the
+   * operator upgrades QB Desktop mid-process (rare, but cheap to support).
+   *
+   * Ungated by the read-only flag — HostQueryRq is a pure read. Errors from
+   * the wire (e.g. QB Desktop crashed since last call) propagate as
+   * QBXMLResponseError; the tool wrapper translates to structured isError.
+   *
+   * Reuses queryEntity("Host", {}) for the envelope — HostQueryRq has no
+   * request body, so the generic builder emits exactly the right shape
+   * (`<HostQueryRq requestID="1"></HostQueryRq>`). The sim handler is the
+   * generic handleQuery path; a Host singleton in the seed satisfies the
+   * Map-based store lookup.
+   */
+  async getHostInfo(options: { refresh?: boolean } = {}): Promise<HostInfo> {
+    if (this.hostInfoCache && !options.refresh) return this.hostInfoCache;
+    const records = await this.queryEntity("Host", {});
+    const raw = (records[0] ?? {}) as Record<string, unknown>;
+    this.hostInfoCache = normalizeHostInfo(raw);
+    return this.hostInfoCache;
+  }
+
+  /**
+   * Test/diagnostic accessor — returns the currently-cached HostInfo without
+   * triggering a wire call. `null` if `getHostInfo` hasn't been called yet
+   * (or was cleared by `switchCompanyFile`). Production code should use
+   * `getHostInfo()` instead.
+   */
+  peekHostInfoCache(): HostInfo | null {
+    return this.hostInfoCache;
   }
 
   // -------------------------------------------------------------------------

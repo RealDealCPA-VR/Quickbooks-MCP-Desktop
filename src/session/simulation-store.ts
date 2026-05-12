@@ -4351,6 +4351,32 @@ export class SimulationStore {
     };
     this.getStore("Company").set("COMPANY", companySeed);
 
+    // Host — singleton describing the QB Desktop installation hosting this
+    // company file (Phase 18 #82). Real QB returns this via HostQueryRq with no
+    // filter inputs; sim returns the seeded shape verbatim through the generic
+    // handleQuery path (HostQueryRq → handleQuery → returns [hostSeed] →
+    // wrapped as {HostRet: [...]}).
+    //
+    // Sim default is Premier Accountant — most common CPA-firm edition and
+    // exercises the "Accountant" branch of deriveHostEdition. The 16-version
+    // SupportedQBXMLVersionList matches what a QB 2024 install advertises.
+    const hostSeed: StoredEntity = {
+      ProductName: "QuickBooks Premier Accountant Edition 2024",
+      MajorVersion: "34",
+      MinorVersion: "0",
+      Country: "US",
+      SupportedQBXMLVersionList: {
+        Version: [
+          "1.0", "1.1", "2.0", "2.1", "3.0", "4.0", "4.1",
+          "5.0", "6.0", "7.0", "8.0", "9.0", "10.0", "11.0",
+          "12.0", "13.0", "14.0", "15.0", "16.0",
+        ],
+      },
+      IsAutomaticLogin: false,
+      QBFileMode: "SingleUser",
+    };
+    this.getStore("Host").set("HOST", hostSeed);
+
     // Set ID counter beyond seed data
     this.idCounter = 10000;
   }

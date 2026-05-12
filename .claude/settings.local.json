@@ -63,7 +63,8 @@
       "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; $output = \"\" | & node dist/index.js 2>&1; $exit = $LASTEXITCODE; Write-Output \"---EXITCODE---$exit\"; Write-Output \"---BANNER---\"; Write-Output $output)",
       "PowerShell($env:QB_DEBUG_QBXML=\"1\"; $env:QB_DEBUG_LOG_PATH=\"$env:TEMP\\\\qbxml-smoke\"; $output = \"\" | & node dist/index.js 2>&1; $exit = $LASTEXITCODE; Write-Output \"---EXITCODE---$exit\"; Write-Output \"---BANNER---\"; Write-Output $output; Remove-Item env:QB_DEBUG_QBXML, env:QB_DEBUG_LOG_PATH)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; \"\" | & node dist/index.js 2>&1 | Select-String \"Mode:|qb_host\"; Write-Output \"---EXIT---$LASTEXITCODE\")"
     ]
   }
 }

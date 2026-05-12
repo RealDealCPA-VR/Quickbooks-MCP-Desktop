@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (98 total)
+## Tools (99 total)
 
 ### Customers
 | Tool | Description |
@@ -204,6 +204,7 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 | Tool | Description |
 |------|-------------|
 | `qb_company_info` | Run `CompanyQueryRq` for company name/legal name/address/fiscal year/tax form/EIN, plus session state (connected/simulationMode/sessionTicket/openedAt). Auto-connects on first call. |
+| `qb_host_query` | Run `HostQueryRq` for QB Desktop installation metadata — `productName` / `majorVersion` / `minorVersion` / `country` / `supportedQbxmlVersions` (flattened) / `isAutomaticLogin` / `qbFileMode` (`SingleUser` \| `MultiUser`) plus derived `edition` (`Pro` \| `Premier` \| `PremierAccountant` \| `Enterprise` \| `EnterpriseAccountant` \| `Unknown`), `isEnterprise`, `isAccountant`, and `maxQbxmlVersion`. **Cached** at the session manager: first call hits the wire, subsequent calls return the cached value until `qb_company_open` invalidates it. Pass `refresh: true` to force a re-query (rare — for QB Desktop upgraded mid-process). Use `edition` to gate edition-specific tools (Enterprise-only audit log, Accountant-edition reports, etc.) — **never parse `productName` directly**. Payroll subscription is NOT derivable from this response. |
 | `qb_balance_summary` | Balance summary across all accounts as of a specified date, grouped by AccountType in canonical QB order (Assets → Liabilities → Equity → Income → Expenses → NonPosting) with category subtotals (assets/liabilities/equity/income/expenses/netIncome). Asset/Liability/Equity figures are sourced from `BalanceSheetStandard` (toDate=asOfDate); Income/Expense figures are sourced from `ProfitAndLossStandard` (lifetime through asOfDate). NonPosting accounts fall back to `Account.Balance`. Optional `asOfDate` (YYYY-MM-DD, defaults to today) and `basis` (`Accrual` \| `Cash`). Note: in simulation mode, `BalanceSheetStandard` reads `Account.Balance` for AS/LI/EQ (a snapshot — `asOfDate` is advisory for those buckets); the P&L walk IS date-bounded in both modes. |
 | `qb_ar_aging` | Accounts receivable aging — walks open invoices (`IsPaid !== true`, `BalanceRemaining > 0`), ages each by `(asOfDate − DueDate ?? TxnDate)`, buckets into `0-30` / `31-60` / `61-90` / `90+` days. Returns per-customer aging with bucket breakdown plus top-level `bucketTotals`. Optional `asOfDate` (YYYY-MM-DD, defaults to today). Single invoice = single bucket. |
 | `qb_ap_aging` | Accounts payable aging — walks open bills (`IsPaid !== true`, `AmountDue > 0`), ages each by `(asOfDate − DueDate ?? TxnDate)`, buckets into `0-30` / `31-60` / `61-90` / `90+` days. Returns per-vendor aging with bucket breakdown plus top-level `bucketTotals`. Optional `asOfDate` (YYYY-MM-DD, defaults to today). Single bill = single bucket. |
@@ -260,7 +261,7 @@ End-to-end month-end-close workflow through the MCP:
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (98 tools)      │──│──────────────┐
+                                    │  │ (99 tools)      │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │
