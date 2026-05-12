@@ -29,6 +29,62 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-12 — Persistent QBXML wire logger (Phase 18 #83) hooks at the manager.sendRequest chokepoint
+
+**Chosen:** A single `QbxmlLogger` module in [src/util/qbxml-logger.ts](src/util/qbxml-logger.ts), env-gated by `QB_DEBUG_QBXML=1`, accessed as a process-wide singleton through `getQbxmlLogger()`. Wired into [src/session/manager.ts](src/session/manager.ts) `sendRequest` — the single chokepoint that every QBXML envelope (live + sim) flows through. Writes paired `request` / `response` entries with a per-process monotonic `seq=N` so concurrent in-flight pairs are unambiguous. File name is date-stamped (`qbxml-YYYYMMDD.log`); date is recomputed per write so a long-running process rolls over at midnight without restart. Tag-regex redaction over `VendorTaxIdent` / `SSN` / `BankAccountNumber` / `CreditCardNumber` runs before write; first write failure latches `disabled=true` and stderr-warns once so a logging fault never poisons request flow.
+
+**Why:**
+- **One chokepoint, two modes for free.** `sendRequest` is the only method that touches QBXMLRP2 in live mode AND `SimulationStore.processRequest` in sim mode. Hooking there covers both with one diff — no per-tool / per-helper instrumentation, no risk of a future tool bypassing logging.
+- **Direct unblock for the deferred Phase 11 #54 live verification.** Last session shipped `qb_statement_of_cash_flows` with best-guess live adapter labels that haven't been validated against a real QB Desktop SCF dump. The first live SCF run can now write the actual `TextRow` / `SubtotalRow` / `TotalRow` labels to disk for direct inspection — no rebuild + `console.error` loop, no transient stdout that gets swallowed by the MCP transport.
+- **Same need surfaces for every future schema-order bug.** Phase 9 #37's P&L parse error was the same shape: live returned `statusCode -1` with no useful info; the only fix was to capture the wire bytes by adding `console.error` and rebuilding. A persistent log makes that diagnosis available without code changes.
+- **Sim-mode logging is useful too.** Even in sim, debugging schema-order test fixtures or new sim handler branches benefits from seeing the exact envelope shape and the parsed-response JSON. Logging both modes uniformly is strictly more useful than gating it to live.
+
+**Alternatives rejected:**
+- **Per-tool logging hooks.** Considered — would let each tool decide what to log. Rejected because the failure modes that need logging are wire-level (schema order, raw response parse), not tool-level. Per-tool hooks would duplicate the log-format logic across 98 tools and almost certainly drift.
+- **Async writes (`fs.promises.appendFile`).** Considered for throughput. Rejected because a synchronous `appendFileSync` per request is fast enough for the operator's typical request volume (10s/min, not 1000s/sec), AND ensures the envelope is on disk before the next line of code runs — so a request that crashes after send still leaves its envelope to inspect.
+- **Structured log format (JSONL).** Considered. Rejected because the primary consumer is a human reading the file in an editor — wrapping the XML in JSON string escaping makes the XML painful to read. The current `=== header ===` + raw body block is grep-friendly AND copyable into a QBXML validator.
+- **Log everywhere (every helper, every transformer).** Rejected — would 10x the log volume with no diagnostic value. The bug class that needs logging lives in the request/response pair, not in intermediate transformations.
+- **Include ALL personally-identifying fields in the redaction list** (e.g. `Phone`, `Email`, `Address1`, customer `FullName`). Rejected — overbroad scope makes the log less useful for debugging without meaningfully improving safety. The conservative four-field list covers actual credentials (TIN, SSN, bank account, card number) without obscuring the legitimate debugging signal. Easy to extend if a new sensitive field is discovered.
+- **Detect rollover via filesystem mtime / stat.** Rejected for the date-comparison approach — recomputing the date string on every write is one `Date.prototype.toISOString()` call (microseconds) versus a stat syscall (milliseconds). The cached `currentDate` short-circuit means real cost is only paid once per day.
+
+**Tradeoffs:**
+- **Redaction is regex-based, not parse-based.** A malformed QBXML envelope where `<VendorTaxIdent>` spans a line break or is inside a CDATA section would not be redacted. Acceptable — the envelope builder always produces well-formed single-line tags for these fields, and the worst case is a sensitive value leaking into a debug log that the operator can rm.
+- **Sim mode response is JSON-serialized, not raw XML.** The sim store never produces raw XML — it goes parsed-shape directly. The JSON output is still useful for inspection but isn't byte-for-byte what live would emit. Acceptable — sim debugging is rarely about wire bytes.
+- **Process-wide seq counter doesn't reset across QB sessions.** If the operator does qb_session_disconnect / qb_session_connect mid-process, seq numbers continue incrementing rather than restarting at 1. Considered a feature — global ordering is what a forensic reader actually wants.
+- **Concurrent writes from a single process are atomic at the appendFileSync syscall level.** If a future change introduces true multi-process MCP serving (not on the roadmap), the log file could interleave. Document if/when that happens.
+
+**Revisit when:**
+- A new sensitive field type is added to the QBXML SDK (e.g. routing-number, employee bank account). Append to `SENSITIVE_TAGS` in [src/util/qbxml-logger.ts](src/util/qbxml-logger.ts) and add a redaction test.
+- Log volume becomes a problem (rare — typical day is < 1MB of logs). At that point add a size cap + rotate-by-size in addition to rotate-by-date.
+- A multi-process MCP serving model is introduced. The single-process-atomic-append assumption breaks.
+
+---
+
+## 2026-05-12 — qb_statement_of_cash_flows ships sim-side + live adapter verified-by-construction
+
+**Chosen:** Phase 11 #54 `qb_statement_of_cash_flows` ships in one session with: (a) full sim handler implementing a narrower indirect-method model (Operating = NetIncome + ΔAR + ΔAP only; Investing = period postings to FixedAsset+OtherAsset; Financing = period postings to LongTermLiability+Equity), (b) live adapter that detects QB's SCF section labels (`OPERATING/INVESTING/FINANCING Activities` plus the `Cash from/provided by` variants) and routes through `adaptLiveReportRet`'s existing section-based row-tree walker with SCF-specific close-label patterns, (c) tool surface + tests + schema-order pin, all without first live-validating against a real QB Desktop SCF dump.
+
+**Why:**
+- **The HANDOFF's "verify live shape first" caveat was conservative but unblockable in-session.** No Windows + QB Desktop available; the operator would have had to capture an SCF dump and feed it back. That's a multi-session round-trip that blocks shipping the sim + tool work that would have to happen anyway.
+- **The structural pattern is already proven.** The PnL/BS section walker in `adaptLiveReportRet` is the same algorithm: TextRow opens section, DataRow inside is a leaf account, SubtotalRow/TotalRow closes section. SCF differs only in (1) section labels and (2) close-label patterns ("Net cash provided by X" vs "Total X"). Both extensions are localized, additive, and easy to fix if the live capture surfaces a variant the map doesn't cover.
+- **Sim handler is necessary regardless.** Even with a perfect live adapter, the simulation needs an SCF implementation so every other test that exercises the report subsystem (sim CRUD round-trip, idempotency, etc.) doesn't break with an empty payload. The sim-side work is the bulk of the implementation.
+- **The narrower indirect-method model is a known sim-fidelity tradeoff, not a bug.** Real QB pulls inventory changes, prepaid asset changes, accrued liability changes, and depreciation add-back from JE postings to a Depreciation Expense account. The sim's narrower walk is documented loudly in the tool description and DECISIONS.md; for accurate cash-flow numbers operators run against live QB.
+- **CashAtBeginningOfPeriod is derived, not observed.** The sim has only `Account.Balance` as a snapshot — no historical series to back-calculate `Bank.Balance` at the start of the period from. The derived form `CashAtBeginningOfPeriod = CashAtEnd − NetCashIncrease` reconciles totals by construction. In live mode QB computes both independently and the two should agree (modulo the indirect-method math being non-trivial to externally verify).
+
+**Alternatives rejected:**
+- **Block on live verification.** Defers the sim handler, tool surface, and test coverage to a future session. The sim work is independent of the live adapter — sim CRUD and tests don't care what QB's actual SCF row labels look like — so blocking gains nothing.
+- **Skip the live adapter entirely.** The flat-summary fork (Phase 11 #49) would have fired for SCF in the absence of section detection, producing a single-section "Sales" payload — actively wrong. The new `isScf` detection branch + section-based walker is required.
+- **Add a separate `adaptLiveScfReportRet` function.** Considered. Rejected because the existing P&L/BS walker is 95% reusable — the only SCF-specific bits are the section name map and close-label list, both small enough to inline.
+- **Use the direct method (cash inflows from customers / cash outflows to vendors / etc.) in sim.** Rejected because real QB defaults to indirect method (Net Income + adjustments) — the operator's expectation is indirect, and a direct-method sim would diverge from live in shape, not just precision.
+
+**Tradeoffs:**
+- **Live adapter label variants are best-guess from QBXML SDK reference docs.** The HANDOFF "verify before continuing" check on the next session covers this — first live SCF run against `VR Tax & Consulting Inc..qbw` should capture actual TextRow / SubtotalRow / TotalRow labels and, if they diverge from the seeded variants in `CASH_FLOWS_SECTION_NAMES`, extend the map or the close-label patterns to match. Same pattern Phase 9 #37 followed for P&L (initial shape was wrong, live capture surfaced the schema-order + row-tree fixes).
+- **Sim Operating section misses inventory/prepaid/accrued/depreciation.** Operator running SCF in sim mode against a seeded inventory chart won't see those adjustments. Documented on the tool surface and acceptable for a personal tool whose primary mode is live.
+- **Sim's `cashAtBeginningOfPeriod` is non-observable.** Derived from `cashAtEnd − netCashIncrease`. Reconciles by construction but doesn't reflect what `Bank.Balance` actually was at the start of the period (the sim doesn't track that). Live mode is the authoritative source for beginning-of-period cash.
+- **No JE-to-Equity for Net Income closure.** The sim doesn't run year-end close, so Net Income closure to Retained Earnings never appears as an Equity-section JE — the period NetIncome stays in Operating's first row. This matches QB's actual SCF behavior (Net Income is the starting line of the indirect method, not a financing entry), so it's accurate-by-construction.
+
+---
+
 ## 2026-05-11 — qb_invoice_write_off ships via ReceivePayment + Discount, NOT CreditMemo + apply
 
 **Chosen:** Ship Phase 12 #57 `qb_invoice_write_off(txnId, writeOffAccount, …)` as a single-call composite that submits a $0 `ReceivePayment` whose `AppliedToTxnAdd` carries `PaymentAmount=0 + DiscountAmount=writeOffAmount + DiscountAccountRef={FullName: writeOffAccount}`. Single QBXML envelope. The operator's `writeOffAccount` arg maps directly to `DiscountAccountRef.FullName` — no item indirection.

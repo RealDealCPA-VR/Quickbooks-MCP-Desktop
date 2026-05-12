@@ -43,6 +43,7 @@ import type {
 } from "../types/qbxml.js";
 import type { ComDispatchObject } from "winax";
 import { SimulationStore } from "./simulation-store.js";
+import { getQbxmlLogger } from "../util/qbxml-logger.js";
 
 // ---------------------------------------------------------------------------
 // QBXMLRP2 SDK constants (Intuit QuickBooks SDK 16.0)
@@ -462,14 +463,31 @@ export class QBSessionManager {
 
   /**
    * Send a raw QBXML request string and return the parsed response.
+   *
+   * Hosts the QBXML debug logger (Phase 18 #83) hook point — every envelope
+   * in/out flows through here, so wiring at this method covers both live and
+   * sim paths uniformly. Logger is the singleton from
+   * src/util/qbxml-logger.ts; null when QB_DEBUG_QBXML is unset, in which
+   * case the log overhead is one null-check per request.
    */
   async sendRequest(qbxmlRequest: string): Promise<QBXMLResponse> {
     if (!this.session) {
       await this.openSession();
     }
 
+    const logger = getQbxmlLogger();
+    const mode: "live" | "simulation" = this.simulationMode ? "simulation" : "live";
+    const marker = logger?.logRequest(qbxmlRequest, mode);
+
     if (this.simulationMode) {
-      return this.store.processRequest(qbxmlRequest);
+      try {
+        const response = this.store.processRequest(qbxmlRequest);
+        if (logger && marker) logger.logResponse(response, mode, marker);
+        return response;
+      } catch (err) {
+        if (logger && marker) logger.logError(err, mode, marker);
+        throw err;
+      }
     }
 
     // LIVE MODE — round-trip the QBXML string through QBXMLRP2 and parse the
@@ -482,8 +500,17 @@ export class QBSessionManager {
         "Live mode is active but no session is open — openSession was expected to be called first."
       );
     }
-    const responseXml: string = this.rp.ProcessRequest(this.session.ticket, qbxmlRequest);
-    return parseQBXMLResponse(responseXml);
+    try {
+      const responseXml: string = this.rp.ProcessRequest(this.session.ticket, qbxmlRequest);
+      // Log the raw response XML BEFORE parsing — a parser throw is one of
+      // the main reasons to enable this logger in the first place (the wire
+      // bytes are the only useful artifact at that point).
+      if (logger && marker) logger.logResponse(responseXml, mode, marker);
+      return parseQBXMLResponse(responseXml);
+    } catch (err) {
+      if (logger && marker) logger.logError(err, mode, marker);
+      throw err;
+    }
   }
 
   /**

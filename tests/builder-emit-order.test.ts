@@ -291,6 +291,38 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
     ]);
   });
 
+  it("GeneralSummaryReportQueryRq StatementOfCashFlows: type → ReportPeriod → SummarizeColumnsBy → IncludeSubcolumns → ReportBasis", () => {
+    // Phase 11 #54 — qb_statement_of_cash_flows rides the same buildReportRequest
+    // emit path as P&L / BS, just with a different reportType payload. Pin
+    // explicitly so a future SCF-specific child (e.g. a SummarizeColumnsBy
+    // override) can't accidentally slot itself out of order. Schema position
+    // for StatementOfCashFlows is identical to the other GeneralSummaryReport
+    // types — no SCF-specific children in QBXML 16.0.
+    const xml = buildReportRequest({
+      reportType: "StatementOfCashFlows",
+      fromDate: "2026-01-01",
+      toDate: "2026-12-31",
+      basis: "Accrual",
+    });
+
+    const order = emittedChildOrder(xml, "GeneralSummaryReportQueryRq", [
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+
+    expect(order).toEqual([
+      "GeneralSummaryReportType",
+      "ReportPeriod",
+      "SummarizeColumnsBy",
+      "IncludeSubcolumns",
+      "ReportBasis",
+    ]);
+    expect(xml).toContain("<GeneralSummaryReportType>StatementOfCashFlows</GeneralSummaryReportType>");
+  });
+
   it("GeneralSummaryReportQueryRq with ReportEntityFilter: type → ReportPeriod → ReportEntityFilter → SummarizeColumnsBy → IncludeSubcolumns → ReportBasis", () => {
     // Phase 11 #49 — qb_sales_by_customer_summary passes ReportEntityFilter
     // through buildReportRequest to scope SalesByCustomerSummary to one

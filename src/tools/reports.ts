@@ -942,6 +942,68 @@ export function registerReportTools(
   );
 
   // -----------------------------------------------------------------------
+  // Statement of Cash Flows (Phase 11 #54)
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_statement_of_cash_flows",
+    "Run a Statement of Cash Flows (GeneralSummaryReportType=StatementOfCashFlows, indirect method). Returns Operating Activities / Investing Activities / Financing Activities sections plus totals (NetCashIncrease, CashAtBeginningOfPeriod, CashAtEndOfPeriod). Simulation mode uses a narrower indirect-method model than real QB: Operating section walks NetIncome + ΔAR + ΔAP only (no inventory / prepaid / accrued / depreciation add-back); Investing walks period postings to FixedAsset + OtherAsset accounts; Financing walks period postings to LongTermLiability + Equity accounts. CashAtBeginningOfPeriod in sim mode is derived as CashAtEnd − NetCashIncrease (no historical Bank.Balance series). For accurate cash-flow numbers run against live QuickBooks Desktop, which uses QB's own indirect-method engine.",
+    {
+      fromDate: z.string().regex(ISO_DATE_RE).optional().describe("Start of reporting window (YYYY-MM-DD), inclusive. Omit for no lower bound."),
+      toDate: z.string().regex(ISO_DATE_RE).optional().describe("End of reporting window (YYYY-MM-DD), inclusive. Omit for no upper bound."),
+      basis: z.enum(["Accrual", "Cash"]).optional().describe("Accounting basis. Defaults to Accrual."),
+    },
+    async ({ fromDate, toDate, basis }) => {
+      const session = getSession();
+      try {
+        const reportRet = await session.runReport("StatementOfCashFlows", {
+          fromDate,
+          toDate,
+          basis,
+        });
+        const totals = (reportRet.Totals as Record<string, unknown> | undefined) ?? {};
+        const sections = (reportRet.Sections as Array<{ Name: string; Accounts: Array<{ Name: string; Total: number }>; Subtotal: number }> | undefined) ?? [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              reportTitle: reportRet.ReportTitle ?? "Statement of Cash Flows",
+              reportBasis: reportRet.ReportBasis ?? basis ?? "Accrual",
+              reportPeriod: {
+                from: reportRet.FromReportDate ?? fromDate ?? null,
+                to: reportRet.ToReportDate ?? toDate ?? null,
+              },
+              sections: sections.map((s) => ({
+                name: s.Name,
+                accounts: s.Accounts.map((a) => ({ name: a.Name, total: a.Total })),
+                subtotal: s.Subtotal,
+              })),
+              netCashIncrease: Number(totals.NetCashIncrease ?? 0),
+              cashAtBeginningOfPeriod: Number(totals.CashAtBeginningOfPeriod ?? 0),
+              cashAtEndOfPeriod: Number(totals.CashAtEndOfPeriod ?? 0),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "GeneralSummaryReportQueryRq (StatementOfCashFlows) failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
   // qb_general_ledger (Phase 11 #53)
   //
   // Composite tool — multi-account version of qb_transaction_list_by_account.

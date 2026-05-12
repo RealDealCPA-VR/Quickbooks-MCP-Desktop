@@ -250,6 +250,28 @@ const BS_SECTION_NAMES = new Map<string, string>([
   ["equity", "Equity"],
 ]);
 
+// Statement of Cash Flows section labels. QB emits these in TextRow @_value
+// using a mix of casings and an optional "OPERATING/INVESTING/FINANCING
+// ACTIVITIES" or "Cash from operating/investing/financing activities" prefix.
+// Map covers the variants observed in the QBXML SDK reference docs; lookup is
+// case-insensitive against the lowercased label. Section closes match the
+// "Net cash provided by <activity>" / "Total <activity>" labels — handled
+// inline in adaptLiveReportRet so we don't need a parallel close-label map.
+const SCF_SECTION_NAMES = new Map<string, string>([
+  ["operating activities", "Operating Activities"],
+  ["operating", "Operating Activities"],
+  ["cash from operating activities", "Operating Activities"],
+  ["cash provided by operating activities", "Operating Activities"],
+  ["investing activities", "Investing Activities"],
+  ["investing", "Investing Activities"],
+  ["cash from investing activities", "Investing Activities"],
+  ["cash provided by investing activities", "Investing Activities"],
+  ["financing activities", "Financing Activities"],
+  ["financing", "Financing Activities"],
+  ["cash from financing activities", "Financing Activities"],
+  ["cash provided by financing activities", "Financing Activities"],
+]);
+
 // Decode the numeric character references QB embeds in account names (the
 // middle-dot &#183; in "60200 · Automobile Expense" being the common case).
 // fast-xml-parser handles the five named XML entities but leaves numeric refs
@@ -330,17 +352,22 @@ export function adaptLiveReportRet(
     .map((r) => decodeXmlEntities(String(r.data["@_value"] ?? "")).toLowerCase());
   const isPnl = textLabels.some((l) => PNL_SECTION_NAMES.has(l));
   const hasBs = !isPnl && textLabels.some((l) => BS_SECTION_NAMES.has(l));
+  // SCF detection: distinct section labels (Operating/Investing/Financing
+  // Activities) — locale-stable. Skipped when P&L or BS labels already matched
+  // to avoid mis-routing a P&L with an "Operating Income" account header
+  // (would never carry the "Activities" suffix on its own).
+  const isScf = !isPnl && !hasBs && textLabels.some((l) => SCF_SECTION_NAMES.has(l));
 
   // Flat-summary fork (Phase 11 #49 — SalesByCustomerSummary, plus future
   // expense-by-vendor-summary / sales-by-item-summary variants). These reports
   // have no per-section TextRows the adapter can open against; QB emits a
   // single flat list of DataRows with a closing TotalRow. Synthesize one
   // section keyed by the report's natural domain (e.g. "Sales") and route
-  // every DataRow into it. Detection: neither PnL nor BS section labels were
-  // present in TextRows — that's locale-stable (the labels QB emits in TextRow
-  // ARE the section names being opened; their absence means the report isn't
-  // section-shaped).
-  if (!isPnl && !hasBs) {
+  // every DataRow into it. Detection: neither PnL nor BS nor SCF section
+  // labels were present in TextRows — that's locale-stable (the labels QB
+  // emits in TextRow ARE the section names being opened; their absence means
+  // the report isn't section-shaped).
+  if (!isPnl && !hasBs && !isScf) {
     // Empty-data short-circuit: when QB returned no rows at all (status 1
     // "no matching object" path or a genuinely empty period), don't
     // synthesize a phantom section — return Sections: [] like the prior
@@ -417,7 +444,7 @@ export function adaptLiveReportRet(
     return out;
   }
 
-  const sectionMap = isPnl ? PNL_SECTION_NAMES : BS_SECTION_NAMES;
+  const sectionMap = isPnl ? PNL_SECTION_NAMES : isScf ? SCF_SECTION_NAMES : BS_SECTION_NAMES;
 
   type Section = {
     Name: string;
@@ -426,9 +453,26 @@ export function adaptLiveReportRet(
   };
   const sections: Section[] = [];
   let openSection: Section | null = null;
-  // Match closing rows by lower-cased "Total <section>" label.
-  let openCloseLabel: string | null = null;
+  // Match closing rows by lower-cased close labels. PnL/BS use "Total <section>";
+  // SCF uses richer variants ("Net cash provided by operating activities",
+  // "Total operating activities") so we maintain a candidate list per section.
+  let openCloseLabels: string[] = [];
   const totalsByLabel = new Map<string, number>();
+
+  const scfCloseLabelsFor = (sectionName: string): string[] => {
+    // SectionName is "Operating Activities" etc. — derive the activity word
+    // for the various close-label patterns QB emits.
+    const activity = sectionName.toLowerCase(); // e.g. "operating activities"
+    const verb = activity.replace(/\s+activities$/, ""); // "operating"
+    return [
+      `total ${activity}`,
+      `net cash provided by ${activity}`,
+      `net cash used in ${activity}`,
+      `net cash from ${activity}`,
+      `net cash provided by ${verb} activities`,
+      `cash provided by ${activity}`,
+    ];
+  };
 
   for (const row of timeline) {
     if (row.kind === "text") {
@@ -440,7 +484,7 @@ export function adaptLiveReportRet(
         // never explicitly closed (rare — defensive), close it now.
         openSection = { Name: sectionName, Accounts: [], Subtotal: 0 };
         sections.push(openSection);
-        openCloseLabel = `total ${labelLc}`;
+        openCloseLabels = isScf ? scfCloseLabelsFor(sectionName) : [`total ${labelLc}`];
       }
       // Non-section TextRows (account-group headers, meta-headers like
       // "Ordinary Income/Expense") are skipped — they don't change which
@@ -457,19 +501,18 @@ export function adaptLiveReportRet(
       const value = Number(colValue(row.data, 2) ?? 0);
       if (Number.isFinite(value)) totalsByLabel.set(labelLc, value);
 
-      // Section close: the row's label matches the open section's expected
-      // close label ("total income" → closes Income). SubtotalRows WITH
-      // RowData are nested rollups (e.g. "Total 60200 · Automobile Expense")
-      // — those don't close the top-level section.
+      // Section close: the row's label matches one of the open section's
+      // expected close labels. SubtotalRows WITH RowData are nested rollups
+      // (e.g. "Total 60200 · Automobile Expense") — those don't close the
+      // top-level section.
       if (
         openSection &&
-        openCloseLabel &&
-        labelLc === openCloseLabel &&
+        openCloseLabels.includes(labelLc) &&
         !row.data.RowData
       ) {
         openSection.Subtotal = Number.isFinite(value) ? value : 0;
         openSection = null;
-        openCloseLabel = null;
+        openCloseLabels = [];
       }
     }
   }
@@ -498,6 +541,28 @@ export function adaptLiveReportRet(
     Totals.TotalExpenses = round2(tExpense);
     Totals.GrossProfit = round2(grossProfit);
     Totals.NetIncome = round2(netIncome);
+  } else if (isScf) {
+    // SCF totals: NetCashIncrease (sum of three section subtotals), plus
+    // CashAtBeginningOfPeriod and CashAtEndOfPeriod which QB usually emits
+    // as standalone Subtotal/Total rows AFTER the three sections close.
+    const netCashIncrease = lookup(
+      "Net cash increase for period",
+      "Net cash decrease for period",
+      "Net increase in cash",
+      "Net decrease in cash",
+      "Net change in cash",
+    );
+    Totals.NetCashIncrease = round2(
+      netCashIncrease !== undefined
+        ? netCashIncrease
+        : sections.reduce((s, sec) => s + sec.Subtotal, 0)
+    );
+    Totals.CashAtBeginningOfPeriod = round2(
+      lookup("Cash at beginning of period", "Cash at beginning") ?? 0,
+    );
+    Totals.CashAtEndOfPeriod = round2(
+      lookup("Cash at end of period", "Cash at end") ?? 0,
+    );
   } else {
     // BS: TOTAL ASSETS appears as a TotalRow; Total Liabilities and Total
     // Equity appear as SubtotalRows. Net Income (period) is typically a

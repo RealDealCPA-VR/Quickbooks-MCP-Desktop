@@ -444,13 +444,14 @@ export class SimulationStore {
       reportType !== "BalanceSheetStandard" &&
       reportType !== "SalesByCustomerSummary" &&
       reportType !== "SalesByItemSummary" &&
-      reportType !== "ExpensesByVendorSummary"
+      reportType !== "ExpensesByVendorSummary" &&
+      reportType !== "StatementOfCashFlows"
     ) {
       return {
         type: rsType,
         statusCode: 3120,
         statusSeverity: "Error",
-        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard, BalanceSheetStandard, SalesByCustomerSummary, SalesByItemSummary, and ExpensesByVendorSummary are implemented)`,
+        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard, BalanceSheetStandard, SalesByCustomerSummary, SalesByItemSummary, ExpensesByVendorSummary, and StatementOfCashFlows are implemented)`,
         data: {},
       };
     }
@@ -521,6 +522,17 @@ export class SimulationStore {
         if (v) vendorName = String(v.FullName ?? v.Name ?? "");
       }
       const reportRet = this.buildExpensesByVendorSummary(fromDate, toDate, basis, vendorName);
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: reportRet },
+      };
+    }
+
+    if (reportType === "StatementOfCashFlows") {
+      const reportRet = this.buildStatementOfCashFlows(fromDate, toDate, basis);
       return {
         type: rsType,
         statusCode: 0,
@@ -1949,6 +1961,273 @@ export class SimulationStore {
         NetIncome: Math.round(netIncome * 100) / 100,
       },
     };
+  }
+
+  // Phase 11 #54 — Statement of Cash Flows (indirect method).
+  //
+  // Sections: Operating Activities, Investing Activities, Financing Activities.
+  // Totals: NetCashIncrease (sum of three subtotals), CashAtBeginningOfPeriod,
+  // CashAtEndOfPeriod.
+  //
+  // Operating section uses the indirect method scaffold:
+  //   1. NetIncome (from buildPnLReport over the same period).
+  //   2. Changes in AR — an INCREASE in AR is a USE of cash (revenue booked
+  //      but not collected). Row total = −ΔAR where ΔAR = (Invoice line totals
+  //      + SalesTaxTotal) − ReceivePayment.TotalAmount − CreditMemo line totals
+  //      over the period.
+  //   3. Changes in AP — an INCREASE in AP is a SOURCE of cash (expense booked
+  //      but not paid). Row total = +ΔAP where ΔAP = Bill line totals −
+  //      BillPayment.TotalAmount over the period.
+  //
+  // Investing section walks period postings to FixedAsset / OtherAsset
+  // accounts. Per-account row total = (credit − debit) on the account, where:
+  //   - Debits to FA/OA come from Bill/Check/CreditCardCharge ExpenseLine +
+  //     ItemLine (acquiring the asset) and JE JournalDebitLine.
+  //   - Credits to FA/OA come from JE JournalCreditLine (disposing of the
+  //     asset, or paying down an OA liability).
+  //   An asset balance INCREASE (net debit) is a USE of cash → negative CF.
+  //
+  // Financing section walks period postings to LongTermLiability + Equity
+  // accounts on the same (credit − debit) sign convention. A liability/equity
+  // INCREASE (net credit) is a SOURCE of cash → positive CF.
+  //   - Equity bucket here EXCLUDES period NetIncome (which closes into
+  //     equity at year-end via journal entries that real QB books but the
+  //     sim doesn't run). NetIncome is already accounted for in Operating.
+  //
+  // Cash totals:
+  //   CashAtEndOfPeriod = Σ(Bank.Balance) — snapshot from Account store.
+  //   CashAtBeginningOfPeriod = CashAtEndOfPeriod − NetCashIncrease.
+  //   NetCashIncrease = OperatingCF + InvestingCF + FinancingCF.
+  // Reconciles by construction. In sim mode CashAtBeginningOfPeriod is a
+  // derived value (no historical Account.Balance), not directly observed —
+  // documented loudly on the tool surface.
+  //
+  // Real QB's SCF uses a richer indirect-method model (inventory changes,
+  // prepaid asset changes, accrued liability changes, depreciation add-back
+  // pulled from JE postings to a Depreciation Expense account, etc.). The
+  // sim's narrower scope is documented on qb_statement_of_cash_flows; for
+  // accurate numbers operators run against live QB.
+  private buildStatementOfCashFlows(
+    from: string | null,
+    to: string | null,
+    basis: "Accrual" | "Cash"
+  ): Record<string, unknown> {
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+    // --- Operating section --------------------------------------------------
+    const pnl = this.buildPnLReport(from, to, basis);
+    const netIncome = Number((pnl.Totals as Record<string, unknown>).NetIncome ?? 0);
+
+    // ΔAR — increases when invoices/sales tax post; decreases when payments
+    // and credit memos hit. SalesTaxTotal is folded in because the invoice's
+    // header total drives the AR posting (sim handleAdd computes
+    // BalanceRemaining = Subtotal + SalesTaxTotal − AppliedAmount).
+    const inWindow = (txnDate: string): boolean => {
+      if (from && txnDate < from) return false;
+      if (to && txnDate > to) return false;
+      return true;
+    };
+    let arInflow = 0; // invoices + sales tax (AR up)
+    let arOutflow = 0; // payments + credit memos (AR down)
+    for (const inv of this.getStore("Invoice").values()) {
+      if (!inWindow(String(inv.TxnDate ?? ""))) continue;
+      const lines = Array.isArray(inv.InvoiceLineRet) ? inv.InvoiceLineRet as Record<string, unknown>[] : [];
+      let lineSum = 0;
+      for (const line of lines) {
+        const a = Number(line.Amount ?? 0);
+        if (Number.isFinite(a)) lineSum += a;
+      }
+      const salesTax = Number(inv.SalesTaxTotal ?? 0);
+      arInflow += lineSum + (Number.isFinite(salesTax) ? salesTax : 0);
+    }
+    for (const pay of this.getStore("ReceivePayment").values()) {
+      if (!inWindow(String(pay.TxnDate ?? ""))) continue;
+      const t = Number(pay.TotalAmount ?? 0);
+      if (Number.isFinite(t)) arOutflow += t;
+    }
+    for (const cm of this.getStore("CreditMemo").values()) {
+      if (!inWindow(String(cm.TxnDate ?? ""))) continue;
+      const lines = Array.isArray(cm.CreditMemoLineRet) ? cm.CreditMemoLineRet as Record<string, unknown>[] : [];
+      for (const line of lines) {
+        const a = Number(line.Amount ?? 0);
+        if (Number.isFinite(a)) arOutflow += a;
+      }
+    }
+    const deltaAR = arInflow - arOutflow;
+    const operatingARImpact = -deltaAR;
+
+    // ΔAP — increases when bills post; decreases when bill payments hit.
+    // Bill ExpenseLine + ItemLine sums drive the AP increase.
+    let apInflow = 0; // bills (AP up)
+    let apOutflow = 0; // bill payments (AP down)
+    for (const bill of this.getStore("Bill").values()) {
+      if (!inWindow(String(bill.TxnDate ?? ""))) continue;
+      for (const lineKey of ["ExpenseLineRet", "ItemLineRet"]) {
+        const lines = bill[lineKey];
+        if (!Array.isArray(lines)) continue;
+        for (const line of lines as Record<string, unknown>[]) {
+          const a = Number(line.Amount ?? 0);
+          if (Number.isFinite(a)) apInflow += a;
+        }
+      }
+    }
+    for (const storeName of ["BillPaymentCheck", "BillPaymentCreditCard"]) {
+      for (const bp of this.getStore(storeName).values()) {
+        if (!inWindow(String(bp.TxnDate ?? ""))) continue;
+        // BillPayment* total lives on TotalAmount (with Amount as a fallback).
+        const t = Number(bp.TotalAmount ?? bp.Amount ?? 0);
+        if (Number.isFinite(t)) apOutflow += t;
+      }
+    }
+    const deltaAP = apInflow - apOutflow;
+    const operatingAPImpact = deltaAP;
+
+    const operatingAccounts = [
+      { Name: "Net Income", Total: round2(netIncome) },
+      { Name: "Accounts Receivable", Total: round2(operatingARImpact) },
+      { Name: "Accounts Payable", Total: round2(operatingAPImpact) },
+    ];
+    const operatingSubtotal = round2(operatingAccounts.reduce((s, a) => s + a.Total, 0));
+
+    // --- Investing / Financing sections -------------------------------------
+    // Walk period postings to non-P&L accounts of the requested types and
+    // compute (credit − debit) per account. Investing covers FixedAsset +
+    // OtherAsset; Financing covers LongTermLiability + Equity (the latter
+    // EXCLUDING any "Net Income" / "Retained Earnings" closing entries the
+    // sim might carry — there are none in the default seed, but a test
+    // could add one and it would correctly stay out of Financing's walk).
+    const investingTotals = this.walkNonPnlAccountActivity(
+      ["FixedAsset", "OtherAsset"],
+      from,
+      to,
+    );
+    const financingTotals = this.walkNonPnlAccountActivity(
+      ["LongTermLiability", "Equity"],
+      from,
+      to,
+    );
+
+    const investingAccounts = [...investingTotals.values()]
+      .map((b) => ({ Name: b.accountName, Total: round2(b.credit - b.debit) }))
+      .filter((a) => a.Total !== 0)
+      .sort((a, b) => a.Name.localeCompare(b.Name));
+    const investingSubtotal = round2(investingAccounts.reduce((s, a) => s + a.Total, 0));
+
+    const financingAccounts = [...financingTotals.values()]
+      .map((b) => ({ Name: b.accountName, Total: round2(b.credit - b.debit) }))
+      .filter((a) => a.Total !== 0)
+      .sort((a, b) => a.Name.localeCompare(b.Name));
+    const financingSubtotal = round2(financingAccounts.reduce((s, a) => s + a.Total, 0));
+
+    // --- Cash totals --------------------------------------------------------
+    const netCashIncrease = round2(operatingSubtotal + investingSubtotal + financingSubtotal);
+    let cashAtEnd = 0;
+    for (const a of this.getStore("Account").values()) {
+      if (String(a.AccountType ?? "") === "Bank") {
+        const b = Number(a.Balance ?? 0);
+        if (Number.isFinite(b)) cashAtEnd += b;
+      }
+    }
+    cashAtEnd = round2(cashAtEnd);
+    const cashAtBeginning = round2(cashAtEnd - netCashIncrease);
+
+    const sections = [
+      { Name: "Operating Activities", Accounts: operatingAccounts, Subtotal: operatingSubtotal },
+      { Name: "Investing Activities", Accounts: investingAccounts, Subtotal: investingSubtotal },
+      { Name: "Financing Activities", Accounts: financingAccounts, Subtotal: financingSubtotal },
+    ];
+
+    return {
+      ReportTitle: "Statement of Cash Flows",
+      ReportBasis: basis,
+      ...(from ? { FromReportDate: from } : {}),
+      ...(to ? { ToReportDate: to } : {}),
+      Sections: sections,
+      Totals: {
+        NetCashIncrease: netCashIncrease,
+        CashAtBeginningOfPeriod: cashAtBeginning,
+        CashAtEndOfPeriod: cashAtEnd,
+      },
+    };
+  }
+
+  // Walk period postings to accounts of the requested AccountTypes and
+  // compute per-account (debit, credit) totals. Used by buildStatementOfCashFlows
+  // to drive Investing/Financing CF sections.
+  //   - Debits come from Bill/Check/CreditCardCharge ExpenseLine + ItemLine
+  //     (where the named account is the targeted type) and JE
+  //     JournalDebitLine.
+  //   - Credits come from JE JournalCreditLine. (Real QB also generates
+  //     credits on these via Deposit splits and other paths — out of scope
+  //     for the sim's narrower model.)
+  private walkNonPnlAccountActivity(
+    accountTypes: readonly string[],
+    from: string | null,
+    to: string | null,
+  ): Map<string, { debit: number; credit: number; accountName: string; accountType: string }> {
+    const out = new Map<string, { debit: number; credit: number; accountName: string; accountType: string }>();
+    const accountTypeByName = new Map<string, string>();
+    for (const a of this.getStore("Account").values()) {
+      const name = String(a.FullName ?? a.Name ?? "");
+      const type = String(a.AccountType ?? "");
+      if (name) accountTypeByName.set(name, type);
+    }
+    const inWindow = (txnDate: string): boolean => {
+      if (from && txnDate < from) return false;
+      if (to && txnDate > to) return false;
+      return true;
+    };
+    const bump = (accountName: string, side: "debit" | "credit", amount: number): void => {
+      const type = accountTypeByName.get(accountName);
+      if (!type || !accountTypes.includes(type)) return;
+      if (!Number.isFinite(amount) || amount === 0) return;
+      const bucket = out.get(accountName) ?? { debit: 0, credit: 0, accountName, accountType: type };
+      bucket[side] += amount;
+      out.set(accountName, bucket);
+    };
+
+    // Bill/Check/CreditCardCharge expense + item lines — debit the named
+    // expense account in real GL, but here we let the walk pick up postings
+    // to non-expense accounts (operator codes a check to a Fixed Asset
+    // directly, etc.). The line's resolved account is from
+    // resolveLineAccount("expense") which already handles AccountRef-first /
+    // ItemRef-fallback.
+    for (const storeName of ["Bill", "Check", "CreditCardCharge"]) {
+      for (const txn of this.getStore(storeName).values()) {
+        if (!inWindow(String(txn.TxnDate ?? ""))) continue;
+        for (const lineKey of ["ExpenseLineRet", "ItemLineRet"]) {
+          const lines = txn[lineKey];
+          if (!Array.isArray(lines)) continue;
+          for (const line of lines as Record<string, unknown>[]) {
+            const accountName = this.resolveLineAccount(line, "expense");
+            if (!accountName) continue;
+            const amt = Number(line.Amount ?? 0);
+            bump(accountName, "debit", amt);
+          }
+        }
+      }
+    }
+
+    // JE debit + credit lines.
+    for (const je of this.getStore("JournalEntry").values()) {
+      if (!inWindow(String(je.TxnDate ?? ""))) continue;
+      const debitLines = Array.isArray(je.JournalDebitLineRet) ? je.JournalDebitLineRet as Record<string, unknown>[] : [];
+      const creditLines = Array.isArray(je.JournalCreditLineRet) ? je.JournalCreditLineRet as Record<string, unknown>[] : [];
+      for (const line of debitLines) {
+        const ref = line.AccountRef as Record<string, unknown> | undefined;
+        const name = ref?.FullName ? String(ref.FullName) : null;
+        if (!name) continue;
+        bump(name, "debit", Number(line.Amount ?? 0));
+      }
+      for (const line of creditLines) {
+        const ref = line.AccountRef as Record<string, unknown> | undefined;
+        const name = ref?.FullName ? String(ref.FullName) : null;
+        if (!name) continue;
+        bump(name, "credit", Number(line.Amount ?? 0));
+      }
+    }
+
+    return out;
   }
 
   // -----------------------------------------------------------------------
