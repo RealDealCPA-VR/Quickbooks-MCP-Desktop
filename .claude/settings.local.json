@@ -69,7 +69,26 @@
       "PowerShell($env:QB_DEBUG_QBXML=\"1\"; $env:QB_DEBUG_LOG_PATH=\"$env:TEMP\\\\qbxml-smoke\"; $banner = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; $exit = $LASTEXITCODE; \"EXIT=$exit\"; $banner; Remove-Item env:QB_DEBUG_QBXML, env:QB_DEBUG_LOG_PATH -ErrorAction SilentlyContinue)",
       "PowerShell($cfg = \"$env:APPDATA\\\\Claude\\\\claude_desktop_config.json\"; if \\(Test-Path $cfg\\) { \\(Get-Content $cfg -Raw | ConvertFrom-Json\\).mcpServers.PSObject.Properties | ForEach-Object { \"$\\($_.Name\\) -> $\\($_.Value.command\\)\" } } else { \"CONFIG_MISSING: $cfg\" })",
       "Bash(awk '/private buildPnLReport/{print NR; exit}' src/session/simulation-store.ts)",
-      "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; $banner = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $banner)"
+      "PowerShell($env:QB_DEBUG_QBXML=$null; $env:QB_DEBUG_LOG_PATH=$null; $banner = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $banner)",
+      "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \"EXIT=$code\"; Write-Output \"---STDERR/STDOUT---\"; $out)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/jsgoupil/quickbooks-sync/master/src/QbXml/Schemas/qbxmlops130.xsd\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/jsgoupil/quickbooks-sync/master/src/QbXml/Schemas/qbxmltypes130.xsd\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/jsgoupil/quickbooks-sync/master/src/QbXml/Schemas/qbxmltypes130_generate.xsd\")",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/jsgoupil/quickbooks-sync/master/src/QbXml/Schemas/qbxmlops130.xsd\" -o /dev/null -w \"%{http_code}\\\\n\")",
+      "Bash(curl -s \"https://api.github.com/repos/jsgoupil/quickbooks-sync/contents/src/QbXml/Schemas\")",
+      "Bash(curl -sI \"https://raw.githubusercontent.com/jsgoupil/quickbooks-sync/master/src/QbXml/Schemas/qbxmltypes130.xsd\" -o /dev/null -w \"%{http_code}\\\\n%{size_download}\\\\n\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/jsgoupil/quickbooks-sync/master/src/QbXml/Schemas/qbxml130.xsd\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops100.xml\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops80.xml\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops60.xml\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops20.xml\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/qbwc/qbxml/master/schema/qbxmlops40.xml\")",
+      "Read(//c/Users/VR/.claude/**)",
+      "PowerShell(npm run build 2>&1)",
+      "PowerShell(npx vitest run tests/closing-date.test.ts 2>&1)",
+      "PowerShell(npx vitest run tests/mcp-prompts.test.ts 2>&1)",
+      "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \"EXIT=$code\"; Write-Output \"---\"; $out)",
+      "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \"EXIT: $code\"; Write-Output \"---OUTPUT---\"; Write-Output $out)"
     ]
   }
 }

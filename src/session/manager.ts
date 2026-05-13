@@ -466,6 +466,38 @@ export class QBSessionManager {
    */
   private sleepImpl: (ms: number) => Promise<void> = defaultSleep;
 
+  /**
+   * Epoch-millisecond timestamps of every transient-retry firing in
+   * `sendLiveRequestWithRetry` (Phase 14 #67). Each entry corresponds to one
+   * successful classify-as-transient → sleep → reconnect → retry leg — the
+   * push happens AFTER the classification check and BEFORE the sleep, so the
+   * count reflects retries actually fired (not transient errors that were
+   * the LAST attempt and therefore propagated without a retry firing).
+   *
+   * Pruned to the last hour on `getTransientRetryStats()` read so the array
+   * stays bounded under long-running agent sessions with intermittent
+   * transient failures. Bare push on each retry — no batching — because the
+   * frequency is naturally low (transient failures are rare; even a busy
+   * session sees < 1/minute).
+   *
+   * Survives auto-reconnect (the timestamp is added BEFORE the reconnect
+   * runs, and `reconnectAfterTransientError` does NOT clear this field — same
+   * discipline as `readOnly` / `idempotencyCache` / `hostInfoCache`). Cleared
+   * only on `switchCompanyFile` (a deliberate fresh start when the operator
+   * moves between books) and process restart.
+   */
+  private transientRetryTimestamps: number[] = [];
+
+  /**
+   * Monotonic counter of every transient-retry firing since process start
+   * (Phase 14 #67). Distinct from `transientRetryTimestamps.length` because
+   * the array is pruned to the last hour for the rolling-window stat;
+   * this counter is never reset (except via switchCompanyFile, same as the
+   * timestamp array — moving to a fresh book is a fresh observability
+   * window). Surfaced as `totalTransientRetries` by getTransientRetryStats.
+   */
+  private totalTransientRetries: number = 0;
+
   constructor(config: QBConnectionConfig) {
     this.config = config;
     this.simulationMode = resolveSimulationMode(process.env, process.platform);
@@ -686,7 +718,86 @@ export class QBSessionManager {
     // upgraded QB, and the cost of re-querying is one round trip. Cheaper to
     // be defensive here than to ship stale edition info.
     this.hostInfoCache = null;
+    // Transient-retry observability is a per-book signal — a fresh book is a
+    // fresh observability window. Clearing here keeps `qb_session_status`
+    // honest after a switch (otherwise "lastTransientRetryAt" from book A
+    // would leak into the status snapshot for book B and falsely imply
+    // recent instability on a freshly-opened file).
+    this.transientRetryTimestamps = [];
+    this.totalTransientRetries = 0;
     return this.openSession();
+  }
+
+  /**
+   * Snapshot the transient-retry observability state (Phase 14 #67).
+   * Prunes timestamps older than 1 hour on read so the array stays bounded
+   * under long-running agent sessions. Returns:
+   *   - `lastTransientRetryAt` — ISO timestamp of the most recent firing,
+   *     null if none have fired this session (or post switchCompanyFile).
+   *   - `transientRetryCountLastHour` — count of firings within the last
+   *     hour. Designed for orchestration probes: a non-zero value means QB
+   *     Desktop has been stalling recently; sustained non-zero means the
+   *     local environment may need intervention.
+   *   - `totalTransientRetries` — cumulative count since process start (or
+   *     last switchCompanyFile). Not pruned. Useful for long-haul telemetry.
+   *
+   * No wire I/O, cheap. Safe to call from any tool handler; in particular
+   * `qb_session_status` calls this on every invocation.
+   */
+  getTransientRetryStats(): {
+    lastTransientRetryAt: string | null;
+    transientRetryCountLastHour: number;
+    totalTransientRetries: number;
+  } {
+    const now = Date.now();
+    const oneHourAgo = now - 3600_000;
+    // Prune in-place — the array is bounded and the prune is cheap. Filter
+    // would allocate a new array on every call, which is wasteful for the
+    // common case of "no transient retries fired".
+    while (
+      this.transientRetryTimestamps.length > 0 &&
+      this.transientRetryTimestamps[0] < oneHourAgo
+    ) {
+      this.transientRetryTimestamps.shift();
+    }
+    const last = this.transientRetryTimestamps.length > 0
+      ? this.transientRetryTimestamps[this.transientRetryTimestamps.length - 1]
+      : null;
+    return {
+      lastTransientRetryAt: last !== null ? new Date(last).toISOString() : null,
+      transientRetryCountLastHour: this.transientRetryTimestamps.length,
+      totalTransientRetries: this.totalTransientRetries,
+    };
+  }
+
+  /**
+   * Application name registered with QBXMLRP2 — the string QB Desktop's
+   * Application Certificate dialog quotes back to the operator on first
+   * connect. Surfaced by `qb_session_status` so the operator can verify which
+   * app identity this process is using (useful when multiple MCP processes
+   * share a QB instance under different appNames).
+   */
+  getAppName(): string {
+    return this.config.appName;
+  }
+
+  /**
+   * Optional application ID. Most operators don't set this; surfaced for
+   * completeness in `qb_session_status` so the snapshot has the full identity
+   * tuple QBXMLRP2 was opened with.
+   */
+  getAppId(): string | undefined {
+    return this.config.appId;
+  }
+
+  /**
+   * qbXML schema version this session targets (defaults to "16.0"). Drives
+   * the `<?qbxml version="..."?>` PI on every outgoing envelope; mismatched
+   * versions against an older QB Desktop install surface as wire-side parse
+   * errors (statusCode -1).
+   */
+  getQbxmlVersion(): string | undefined {
+    return this.config.qbxmlVersion;
   }
 
   // -------------------------------------------------------------------------
@@ -792,6 +903,14 @@ export class QBSessionManager {
         }
 
         const backoffMs = RECONNECT_BACKOFF_MS[attempt];
+        // Record the firing BEFORE sleeping — observability should reflect
+        // "we entered the retry path" rather than "we finished sleeping",
+        // which matters when an `await sleepImpl` is intercepted by a test
+        // that never resolves and a stat read happens mid-flight. Always
+        // pushed (no allocation cost vs throwaway-on-no-debugger flag) — the
+        // pruning on read keeps the array bounded.
+        this.transientRetryTimestamps.push(Date.now());
+        this.totalTransientRetries += 1;
         console.error(
           `[QB Session] Transient QBXMLRP2 error on attempt ${attempt + 1}/${maxRetries + 1} ` +
           `(${(err as Error).message}). Reconnecting and retrying after ${backoffMs}ms.`

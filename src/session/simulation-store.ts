@@ -4794,6 +4794,96 @@ export class SimulationStore {
     };
     this.getStore("Company").set("COMPANY", companySeed);
 
+    // Preferences — singleton describing the company-file's preferences
+    // (Phase 18 #85). Real QB returns this via PreferencesQueryRq with no
+    // filter inputs; sim returns the seeded shape verbatim through the generic
+    // handleQuery path (PreferencesQueryRq → handleQuery → returns [prefSeed] →
+    // wrapped as {PreferencesRet: [...]}). Tool layer flattens to a single
+    // record per the QBXML SDK schema (PreferencesRet is a singleton, not a
+    // list).
+    //
+    // The shape mirrors the qbXML SDK AccountingPreferences / FinanceChargePreferences
+    // groups. Only AccountingPreferences.ClosingDate is meaningful in this
+    // server's first cut — the rest is illustrative but kept to mirror what a
+    // real qbXML PreferencesQueryRs returns so future tools (closing-date
+    // password status, audit-trail flag, etc.) can extend without reshaping.
+    //
+    // ClosingDate is null by default (no closing date set — most common case
+    // mid-year). Test fixtures override via `setPreference` (testing seam below).
+    // qbXML does NOT surface ClosingDatePasswordIsSet at any version — see
+    // DECISIONS.md 2026-05-12 #85 for source citations.
+    const preferencesSeed: StoredEntity = {
+      AccountingPreferences: {
+        IsUsingAccountNumbers: true,
+        IsRequiringAccounts: true,
+        IsUsingClassTracking: true,
+        IsUsingAuditTrail: true,
+        IsAssigningJournalEntryNumbers: true,
+        ClosingDate: null,
+      },
+      FinanceChargePreferences: {
+        AnnualInterestRate: 0,
+        MinFinanceCharge: 0,
+        GracePeriod: 0,
+        CalculateChargesFrom: "DueDate",
+        IsAssessingFinanceChargesOnOverdueFinanceCharges: false,
+        MarkFinanceChargeInvoicesToBePrinted: true,
+      },
+      JobsAndEstimatesPreferences: {
+        IsUsingEstimates: true,
+        IsUsingProgressInvoicing: false,
+        IsPrintingItemsWithZeroAmounts: false,
+      },
+      MultiCurrencyPreferences: {
+        IsMultiCurrencyOn: false,
+      },
+      MultiLocationInventoryPreferences: {
+        IsMultiLocationInventoryAvailable: false,
+        IsMultiLocationInventoryEnabled: false,
+      },
+      PurchasesAndVendorsPreferences: {
+        IsUsingInventory: true,
+        DaysBillsAreDue: 10,
+        IsAutomaticallyUsingDiscounts: false,
+      },
+      ReportsPreferences: {
+        AgingReportBasis: "AgeFromDueDate",
+        SummaryReportBasis: "Accrual",
+        ReportsShowItemsBy: "NameOnly",
+        ReportsShowAccountsBy: "NameOnly",
+      },
+      SalesAndCustomersPreferences: {
+        DefaultShipMethod: { FullName: "UPS Ground" },
+        IsTrackingReimbursedExpensesAsIncome: false,
+        IsAutoApplyingPayments: true,
+        PriceLevels: {
+          IsUsingPriceLevels: false,
+        },
+      },
+      SalesTaxPreferences: {
+        DefaultItemSalesTax: { FullName: "Local Sales Tax" },
+        PaySalesTax: "Monthly",
+        IsUsingVendorTaxCode: false,
+        IsUsingCustomerTaxCode: false,
+        IsUsingAmountsIncludeTax: false,
+      },
+      TimeTrackingPreferences: {
+        FirstDayOfWeek: "Monday",
+      },
+      CurrentAppAccessRights: {
+        IsAutomaticLoginAllowed: false,
+        AutomaticLoginUserName: "",
+        IsPersonalDataAccessAllowed: true,
+      },
+      ItemsAndInventoryPreferences: {
+        EnhancedInventoryReceivingEnabled: false,
+        IsTrackingSerialOrLotNumber: "None",
+        FIFOEnabled: false,
+        IsBarcodeEnabled: false,
+      },
+    };
+    this.getStore("Preferences").set("PREFERENCES", preferencesSeed);
+
     // Host — singleton describing the QB Desktop installation hosting this
     // company file (Phase 18 #82). Real QB returns this via HostQueryRq with no
     // filter inputs; sim returns the seeded shape verbatim through the generic

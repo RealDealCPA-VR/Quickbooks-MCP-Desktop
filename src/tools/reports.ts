@@ -11,6 +11,18 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 import { ISO_DATE_RE } from "../util/validators.js";
+import { normalizeClosingDate } from "./preferences.js";
+
+/**
+ * MCP server semver. Surfaced by `qb_session_status` so orchestration callers
+ * can pin against a known wire surface. Kept in lockstep with the
+ * `McpServer({ version })` literal in src/index.ts — if either moves, both
+ * must move. Centralizing as a const is a deliberate non-DRY: importing from
+ * index.ts would create a cycle (index → reports → index), and a
+ * package.json read at module load would add filesystem I/O at boot for one
+ * string.
+ */
+const SERVER_VERSION = "1.0.0";
 
 const ASSET_TYPES = ["Bank", "AccountsReceivable", "OtherCurrentAsset", "Inventory", "FixedAsset", "OtherAsset"] as const;
 const LIABILITY_TYPES = ["AccountsPayable", "CreditCard", "OtherCurrentLiability", "LongTermLiability"] as const;
@@ -2614,6 +2626,145 @@ export function registerReportTools(
         content: [{
           type: "text" as const,
           text: JSON.stringify({ success: true, message: "Session closed" }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_session_status — health/probe snapshot (Phase 14 #67)
+  // -----------------------------------------------------------------------
+  //
+  // Composite "tell me everything about the current session" tool. Designed
+  // for orchestration callers (e.g. an agent retrying a brittle workflow)
+  // that need a cheap, structured view of session state without performing
+  // a real entity query.
+  //
+  // Default behavior: ZERO wire I/O. Returns the connection state, config
+  // identity, read-only gate, cached HostInfo (null if uncached), and the
+  // rolling transient-retry observability counters. The whole call costs a
+  // few field reads and one Date.now() in the prune.
+  //
+  // Opt-in `probe: true`: runs a fresh HostQueryRq via getHostInfo({ refresh:
+  // true }). HostQueryRq is the lightest available real-wire call (no entity
+  // body, no filters, returns installation metadata). On success the snapshot
+  // carries `probe: { ok: true }`; on failure `probe: { ok: false,
+  // statusCode, statusMessage, humanReadable? }`. The snapshot itself does
+  // NOT fail when the probe fails — that's the whole point of having a
+  // probe: an orchestrator wants to know "is the wire usable" without
+  // failing the diagnostic call.
+  //
+  // Opt-in `includeClosingDate: true`: runs PreferencesQueryRq (one round
+  // trip — heavier than HostQueryRq but still trivial) and folds the closing
+  // date + adjacent accounting flags into the snapshot under `closingDate`.
+  // Useful for one-shot "tell me whether the prior period is locked" probes
+  // that would otherwise require a separate qb_closing_date_get call.
+  // Same fail-soft contract as `probe`: a Preferences-query failure surfaces
+  // as `closingDate: { error: {...} }` without making the overall response
+  // isError.
+  //
+  // Read-only safe; no read-only gate. The snapshot is always allowed.
+  server.tool(
+    "qb_session_status",
+    "Diagnostic snapshot of the current QuickBooks session — connection state, configured app identity, read-only gate, cached HostInfo (without triggering a fetch), and rolling transient-retry observability (lastTransientRetryAt / transientRetryCountLastHour / totalTransientRetries). No wire I/O by default. Pass `probe: true` to verify the live wire is responsive via a fresh HostQueryRq round trip; the probe result lands under `probe: { ok: true }` or `probe: { ok: false, statusCode, statusMessage }` — the snapshot itself does NOT fail when the probe fails, so orchestration callers can rely on this tool to ALWAYS return a structured shape. Pass `includeClosingDate: true` to fold in PreferencesQueryRq (closing date + audit-trail flags) under `closingDate` — heavier than the probe but still one round trip; same fail-soft contract.",
+    {
+      probe: z.boolean().optional().describe("When true, fire one HostQueryRq with refresh: true to actively verify the live wire is responsive. The probe result lands under `probe`; success returns `{ ok: true }`, failure returns `{ ok: false, statusCode, statusMessage, humanReadable? }`. The probe is fail-soft — a probe error never makes the overall tool response isError. In simulation mode the probe always succeeds (the sim handler returns the seeded Host singleton). Default false — most status calls don't need the wire probe."),
+      includeClosingDate: z.boolean().optional().describe("When true, also fetch the company file's closing date and adjacent accounting preferences via PreferencesQueryRq, folded into the response as `closingDate`. Equivalent to making a separate qb_closing_date_get call in the same conversation. Fail-soft like `probe` — a Preferences-query failure surfaces as `closingDate: { error: {...} }`. Default false — call qb_closing_date_get directly when you specifically want the closing date and nothing else."),
+    },
+    async ({ probe, includeClosingDate }) => {
+      const session = getSession();
+      const sessionData = session.getSession();
+
+      let probeResult:
+        | { ok: true }
+        | { ok: false; statusCode: number; statusMessage: string; humanReadable?: string }
+        | undefined;
+      if (probe === true) {
+        try {
+          // refresh: true forces a real wire call even when the cache is
+          // populated — which is the whole point of an explicit probe. Sim
+          // mode returns instantly from the seeded Host singleton.
+          await session.getHostInfo({ refresh: true });
+          probeResult = { ok: true };
+        } catch (err) {
+          const e = err as { message?: string; statusCode?: number };
+          const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+          probeResult = {
+            ok: false,
+            statusCode: e.statusCode ?? -1,
+            statusMessage: e.message ?? "HostQueryRq probe failed",
+            ...(humanReadable ? { humanReadable } : {}),
+          };
+        }
+      }
+
+      let closingDateBlock:
+        | {
+            closingDate: string | null;
+            isUsingAuditTrail: boolean;
+            isUsingClassTracking: boolean;
+            isUsingAccountNumbers: boolean;
+            isRequiringAccounts: boolean;
+          }
+        | { error: { statusCode: number; statusMessage: string; humanReadable?: string } }
+        | undefined;
+      if (includeClosingDate === true) {
+        try {
+          const records = await session.queryEntity("Preferences", {});
+          const prefs = (records[0] ?? {}) as Record<string, unknown>;
+          const acctRaw = (prefs.AccountingPreferences ?? {}) as Record<string, unknown>;
+          const flag = (v: unknown): boolean =>
+            v === true || String(v ?? "").toLowerCase() === "true";
+          closingDateBlock = {
+            closingDate: normalizeClosingDate(acctRaw.ClosingDate),
+            isUsingAuditTrail: flag(acctRaw.IsUsingAuditTrail),
+            isUsingClassTracking: flag(acctRaw.IsUsingClassTracking),
+            isUsingAccountNumbers: flag(acctRaw.IsUsingAccountNumbers),
+            isRequiringAccounts: flag(acctRaw.IsRequiringAccounts),
+          };
+        } catch (err) {
+          const e = err as { message?: string; statusCode?: number };
+          const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+          closingDateBlock = {
+            error: {
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "PreferencesQueryRq failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            },
+          };
+        }
+      }
+
+      // Peek the host-info cache AFTER the opt-in calls so the snapshot
+      // reflects any populating side effect a `probe: true` had. Without
+      // probe this is the same value peekHostInfoCache would have returned
+      // at function entry. peekHostInfoCache never triggers a fetch, so the
+      // "no wire I/O on the default path" contract still holds.
+      const hostInfo = session.peekHostInfoCache();
+      // Retry stats are read last so they include any retry that fired
+      // during the opt-in calls. (Sim mode never retries; live mode may, in
+      // which case the snapshot reflects the most-current state.)
+      const retryStats = session.getTransientRetryStats();
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            connected: session.isConnected(),
+            mode: session.isSimulation() ? "simulation" : "live",
+            companyFile: sessionData?.companyFile ?? session.getCompanyFile() ?? null,
+            appName: session.getAppName(),
+            appId: session.getAppId() ?? null,
+            qbxmlVersion: session.getQbxmlVersion() ?? null,
+            readOnly: session.isReadOnly(),
+            ticket: sessionData?.ticket ?? null,
+            openedAt: sessionData?.openedAt?.toISOString() ?? null,
+            serverVersion: SERVER_VERSION,
+            hostInfo,
+            retryStats,
+            ...(probeResult !== undefined ? { probe: probeResult } : {}),
+            ...(closingDateBlock !== undefined ? { closingDate: closingDateBlock } : {}),
+          }, null, 2),
         }],
       };
     }

@@ -66,6 +66,8 @@ import { registerTransactionTools } from "./tools/transactions.js";
 import { registerForm1099Tools } from "./tools/form-1099.js";
 import { registerReconciliationTools } from "./tools/reconciliation.js";
 import { registerAttachmentTools } from "./tools/attachments.js";
+import { registerPreferenceTools } from "./tools/preferences.js";
+import { registerWorkflowPrompts } from "./prompts/workflows.js";
 import { getQbxmlLogger } from "./util/qbxml-logger.js";
 import { join } from "node:path";
 
@@ -97,6 +99,7 @@ const server = new McpServer(
   {
     capabilities: {
       tools: {},
+      prompts: {},
       logging: {},
     },
     instructions: [
@@ -125,12 +128,20 @@ const server = new McpServer(
       "  • qb_attachment_*  — File attachments (AttachableAdd / AttachableQuery / AttachableDel). qb_attachment_add attaches a local file (vendor receipt, deposit slip, signed invoice, customer W-9) to an existing transaction (txnId) or list entity (listId — Customer / Vendor / Item / etc.). Absolute path required; file must exist on the QB Desktop host. Optional note + showAsImage flag. Returns the new Attachable's ListID + derived FileName / FileSize / FileExtension. qb_attachment_list filters by txnId (every attachment on the txn), targetListId (every attachment on the list entity), or attachableListId (single attachment by own ListID) — pass at most one. qb_attachment_delete removes the metadata record (real QB also removes the underlying file from its Attached Documents folder); inputs the attachableListId from add/list. Read-only sessions gate add/delete (9001). Subject to QB edition support for Attached Documents — wire failures surface with humanReadable.",
       "  • qb_company_info  — Connection & company info",
       "  • qb_host_query    — QB Desktop installation metadata (HostQueryRq) — productName / majorVersion / supportedQbxmlVersions / isAutomaticLogin / qbFileMode plus derived `edition` (Pro | Premier | PremierAccountant | Enterprise | EnterpriseAccountant | Unknown) + `isEnterprise` / `isAccountant` flags. Use `edition` to gate edition-specific features; payroll subscription is NOT derivable here. Cached at the session manager — pass refresh:true to force a re-query.",
+      "  • qb_closing_date_get / qb_closing_date_set — Year-end-lock / closing-date state. qb_closing_date_get wraps PreferencesQueryRq — returns the company file's closing date (ISO YYYY-MM-DD, or null when unset) plus adjacent AccountingPreferences flags (isUsingAuditTrail, isUsingClassTracking, isUsingAccountNumbers, isRequiringAccounts). The qbXML SDK does NOT surface the closing-date password status at any version — this tool can only tell you whether a closing date exists, not whether it's password-protected. qb_closing_date_set is an INFORMATIONAL stub — the qbXML SDK has no write path for company preferences (PreferencesModRq / AccountingPreferencesModRq do not exist in the schema at any version through 16.0). It always fails with statusCode 9005 and returns explicit QB Desktop UI navigation steps (Edit → Preferences → Accounting → Company Preferences → Set Date/Password) so an agent thinking 'set the closing date' routes the user correctly instead of hallucinating a non-existent mutation.",
       "  • qb_company_open  — Switch the active QuickBooks company file mid-session. Closes the current session, swaps the configured `.qbw` path, and opens a new session against the new file. Live mode requires QB Desktop to have the target file open (QBXMLRP2 cannot open a file QB hasn't loaded). Simulation mode resets the in-memory store to fresh seed — real QB persists per-file, sim doesn't, so without the reseed the operator would see entities from the prior company on the 'new' one (deliberate sim-fidelity tradeoff per DECISIONS.md 2026-05-09). Use qb_company_list first to discover available `.qbw` paths.",
       "  • qb_company_list  — List `.qbw` company files under $QB_COMPANY_ROOT (fallback: dirname($QB_COMPANY_FILE), or pass `root` arg). Pure filesystem op — identical in live and simulation. Returns [{companyFile, displayName, sizeBytes, modifiedAt}] sorted by modifiedAt desc. Pair with qb_company_open: the returned `companyFile` paths are valid input.",
       "  • qb_raw_query     — Direct QBXML queries for advanced use",
-      "  • qb_session_*     — Session connect/disconnect. qb_session_connect accepts an optional readOnly:true flag that gates every mutation (*_add / *_update / *_delete / *_apply / *_pay / *_make_inactive / *_convert_to_invoice / batch_create) — those tools fail-fast with statusCode 9001 BEFORE any QBXML envelope is built. Reads (queries, reports, qb_raw_query) and qb_company_open / qb_company_list are unaffected. The flag toggles immediately on call (safe to flip mid-conversation without disconnecting); a fresh qb_session_connect() with no readOnly arg defaults to writable. qb_company_info surfaces the current readOnly state.",
+      "  • qb_session_*     — Session connect/disconnect/status. qb_session_connect accepts an optional readOnly:true flag that gates every mutation (*_add / *_update / *_delete / *_apply / *_pay / *_make_inactive / *_convert_to_invoice / batch_create) — those tools fail-fast with statusCode 9001 BEFORE any QBXML envelope is built. Reads (queries, reports, qb_raw_query) and qb_company_open / qb_company_list are unaffected. The flag toggles immediately on call (safe to flip mid-conversation without disconnecting); a fresh qb_session_connect() with no readOnly arg defaults to writable. qb_company_info surfaces the current readOnly state. qb_session_status returns a diagnostic snapshot — connection state, configured app identity (appName, appId, qbxmlVersion), readOnly gate, cached HostInfo (null when not yet fetched — never triggers a fetch), rolling transient-retry observability (lastTransientRetryAt / transientRetryCountLastHour / totalTransientRetries from #84's auto-reconnect path), and server version. Zero wire I/O by default. Pass probe:true to actively verify the live wire via a fresh HostQueryRq round trip (lightest available real call); probe result lands under `probe: {ok}` — fail-soft so the snapshot itself never returns isError. Pass includeClosingDate:true to fold PreferencesQueryRq into the snapshot under `closingDate`. Use this from orchestration callers retrying brittle workflows: a non-zero transientRetryCountLastHour means QB Desktop has been stalling recently and a longer backoff may be warranted.",
       "",
       "Idempotency keys: every *_create / *_add tool (qb_customer_add, qb_vendor_add, qb_account_add, qb_employee_add, qb_item_add, qb_invoice_create, qb_invoice_batch_create, qb_invoice_duplicate, qb_invoice_write_off, qb_bill_create, qb_bill_duplicate, qb_bill_pay, qb_payment_receive, qb_estimate_create, qb_estimate_convert_to_invoice, qb_sales_receipt_create, qb_sales_receipt_batch_create, qb_sales_receipt_duplicate, qb_credit_memo_create, qb_purchase_order_create, qb_journal_entry_create, qb_journal_entry_duplicate, qb_journal_entry_batch_create, qb_attachment_add) accepts an optional idempotencyKey:string arg. Retrying with the same key + same payload returns the original result instead of duplicating the QB record (the response carries idempotentReplay:true). Same key + different payload returns statusCode 9002 — use a fresh key for new requests. The cache is in-memory, scoped per company file, and resets on qb_company_open. Failed creates are NOT cached (next retry can fix the underlying problem). For batch tools (qb_invoice_batch_create / qb_sales_receipt_batch_create / qb_journal_entry_batch_create) the key fingerprints the entire entries list and only fully-successful batches are cached.",
+      "",
+      "Workflow prompts (MCP prompts API, surfaced as slash-commands in the host app):",
+      "  • /month_end_close           — full month-end-close checklist (bank/CC rec → P&L review → AR/AP aging → BS reconcile → SCF). Defaults to prior calendar month.",
+      "  • /credit_card_qb_batch      — bulk-categorize a CC statement into atomic qb_journal_entry_batch_create. Bridges the operator's `credit-card-qb-batch` skill.",
+      "  • /trial_balance_workup      — pulls TB + cross-checks (BS reconcile, AR/AP totals, P&L netIncome plug). Bridges the `trial-balance-workup` skill.",
+      "  • /cc_statement_validator    — three-way CC reconciliation (balance match, line-by-line match, discrepancy scan, clear-on-match). Bridges the `cc-statement-validator` skill.",
+      "  • /w2_prep                   — January W-2 prep via qb_w2_summary + qb_employee_list + reconciliation. Requires QB Payroll subscription.",
       "",
       "Workflow tips:",
       "  1. Start with qb_company_info to verify connection status.",
@@ -178,6 +189,13 @@ registerTransactionTools(server, getSessionManager);
 registerForm1099Tools(server, getSessionManager);
 registerReconciliationTools(server, getSessionManager);
 registerAttachmentTools(server, getSessionManager);
+registerPreferenceTools(server, getSessionManager);
+
+// Phase 18 #86 — workflow-bundle prompts surfaced via the MCP prompts/list +
+// prompts/get API. Bridges the operator's existing skill workflows
+// (credit-card-qb-batch / trial-balance-workup / cc-statement-validator)
+// to the post-Phase-11/12 tool surface, plus month-end-close + w2-prep.
+registerWorkflowPrompts(server);
 
 // ---------------------------------------------------------------------------
 // Start the server

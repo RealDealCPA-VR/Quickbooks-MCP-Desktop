@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (103 total)
+## Tools (106 total)
 
 ### Customers
 | Tool | Description |
@@ -240,6 +240,15 @@ QuickBooks Desktop's "Attached Documents" feature lets you attach files (vendor 
 | `qb_attachment_list` | List attachments stored in QuickBooks. Three mutually-exclusive filter modes: `txnId` (every attachment whose ObjectRef points at the named transaction), `targetListId` (every attachment whose ObjectRef points at the named list entity), or `attachableListId` (single attachment by its OWN ListID, the ID returned from `qb_attachment_add`). Pass at most one — multiple filters reject with 3120. Optional `maxReturned` caps the result. Returns `{ count, attachments: [...AttachableRet] }`. Each row carries `FileName` / `FileSize` / `FileExtension` / `Note` / `ShowAsImage` / `ObjectRef` / `TimeCreated` / `TimeModified`. **Note:** this lists attachment METADATA only — actual file bytes live in QB's Attached Documents folder and are not surfaced through the SDK. Read-side. |
 | `qb_attachment_delete` | Delete an attachment by its own ListID. Wraps `ListDelRq` with `ListDelType='Attachable'`. The file in QB's Attached Documents folder is also removed by real QB (sim just removes the metadata record). Use `qb_attachment_list` to find the `attachableListId` before deleting. Read-only sessions reject with 9001. Unknown `attachableListId` returns statusCode 500. |
 
+### Closing Date / Year-End Lock
+
+The qbXML SDK exposes company preferences as a **read-only** surface — `PreferencesQueryRq` reads the closing date, but no `PreferencesModRq` / `AccountingPreferencesModRq` / `CompanyActivityModRq` exists at any qbXML version through 16.0 (verified against the qbwc/qbxml master schema mirrors — see [DECISIONS.md](DECISIONS.md) `2026-05-12 — Closing date is read-only via QBXML SDK`). The closing date itself must be set in QuickBooks Desktop's UI (Edit → Preferences → Accounting → Company Preferences → Set Date/Password). `ClosingDatePasswordIsSet` is **not exposed** by qbXML at any version — this server can only tell you whether a closing date exists, not whether it's password-protected.
+
+| Tool | Description |
+|------|-------------|
+| `qb_closing_date_get` | Read the company file's closing date and adjacent accounting-preferences flags via `PreferencesQueryRq`. Returns `closingDate: string \| null` (ISO YYYY-MM-DD, or `null` if no closing date is set) plus `isUsingAuditTrail` / `isUsingClassTracking` / `isUsingAccountNumbers` / `isRequiringAccounts` (from `AccountingPreferences`) and a human-readable `note` summarizing protection state. Cannot surface password-set status — qbXML doesn't expose it. Read-only safe; no read-only-session gate. |
+| `qb_closing_date_set` | **Informational stub** — the qbXML SDK has NO write path for company preferences. Always fails with **statusCode 9005** and returns explicit QB Desktop UI navigation steps (Edit → Preferences → Accounting → Company Preferences → Set Date/Password), quoting the operator-supplied `closingDate` and (if provided) `password` in the instructions. Performs no wire I/O — the failure is synchronous. Surfaced as a tool (rather than omitted) so an agent thinking "I should set the closing date" routes the user correctly instead of hallucinating a non-existent mutation. The only programmatic workaround is UI Automation against the running QB Desktop instance — outside the scope of this MCP. |
+
 ### Bank Reconciliation
 
 The QBXML SDK's actual reconciliation surface is much narrower than the QB Desktop UI suggests: there is **no `ReconcileQueryRq`**, **no `ReconcileDetail` GeneralDetailReportType**, and **no `LastReconciledDate` field on AccountRet** (verified against qbxmlops130/140 schemas — see [DECISIONS.md](DECISIONS.md) `2026-05-10 — bank reconciliation SDK surface`). What IS exposed:
@@ -264,8 +273,23 @@ End-to-end month-end-close workflow through the MCP:
 |------|-------------|
 | `qb_session_connect` | Open a QuickBooks session. Optional `readOnly: true` gates every mutation (`*_add` / `*_update` / `*_delete` / `*_apply` / `*_pay` / `*_make_inactive` / `*_convert_to_invoice` / `batch_create`) — those tools fail-fast with `statusCode 9001` BEFORE any QBXML envelope is built. Reads (queries, reports, `qb_raw_query`) and `qb_company_open` / `qb_company_list` are unaffected. The flag toggles immediately on call (safe to flip mid-conversation without disconnecting); a fresh `qb_session_connect()` with no `readOnly` arg defaults to writable. `qb_company_info` surfaces the current `readOnly` state. |
 | `qb_session_disconnect` | Close the session |
+| `qb_session_status` | Diagnostic snapshot of the current session — `connected`, `mode` (`simulation` \| `live`), `companyFile`, `appName`, `appId`, `qbxmlVersion`, `readOnly`, `ticket`, `openedAt`, `serverVersion`, cached `hostInfo` (`null` when not yet fetched — peek-only, never triggers a fetch), and `retryStats` (`lastTransientRetryAt` / `transientRetryCountLastHour` / `totalTransientRetries` — the rolling-window observability for `#84`'s auto-reconnect on transient QBXMLRP2 failures). **Zero wire I/O by default.** Pass `probe: true` to actively verify the live wire is responsive via a fresh `HostQueryRq` round trip (the lightest available real-wire call); the probe lands under `probe: { ok: true }` on success or `probe: { ok: false, statusCode, statusMessage, humanReadable? }` on failure — **fail-soft** so the snapshot itself never returns `isError`. Pass `includeClosingDate: true` to fold `PreferencesQueryRq` into the response under `closingDate` (same shape as `qb_closing_date_get`, same fail-soft contract). The retry stats are pruned to the last hour on read so the array stays bounded; `switchCompanyFile` resets the observability window (a fresh book starts clean). Use this from orchestration callers retrying brittle workflows: a non-zero `transientRetryCountLastHour` means QB Desktop has been stalling recently and a longer backoff may be warranted. |
 | `qb_company_open` | Switch the active QuickBooks Desktop company file mid-session. Closes the current session, swaps the configured `.qbw` path, opens a new session against the new file. Live mode requires QB Desktop to already have the target file open (QBXMLRP2 cannot open a file QB hasn't loaded). Simulation mode resets the in-memory store to fresh seed — real QB persists per-file, sim doesn't (deliberate sim-fidelity tradeoff per [DECISIONS.md](DECISIONS.md#2026-05-09--company-switching-reseeds-the-simulation-store)); the response carries `simulationStoreReset: true` in sim. |
 | `qb_company_list` | Enumerate `.qbw` company files under a search root. Search root resolves in priority: `root` arg → `$QB_COMPANY_ROOT` → `dirname($QB_COMPANY_FILE)`. Returns `[{ companyFile, displayName, sizeBytes, modifiedAt }]` sorted by `modifiedAt` desc. Pure filesystem op — identical in live and simulation. Pair with `qb_company_open`: returned `companyFile` paths are valid input. |
+
+## Workflow Prompts
+
+Beyond tools, the server registers **MCP prompts** (workflow bundles) via the `prompts/list` + `prompts/get` API. MCP hosts (Claude Desktop and others) typically surface these as slash-commands in the chat input. Each prompt seeds the conversation with a structured workflow that references the right `qb_*` tools in order — the agent then drives the workflow to completion.
+
+All prompt arguments are optional with sensible defaults (prior calendar month for month-end, last completed year for W-2 prep, today for trial balance / CC validator). The single user-role message body contains exact `qb_*` tool names so the agent's tool-use loop maps directly to calls.
+
+| Prompt | Description |
+|--------|-------------|
+| `/month_end_close` | Full month-end-close checklist (bank rec → CC rec → P&L review → AR/AP aging → BS reconcile → SCF). Defaults to the prior calendar month when `fromDate` / `toDate` are unset. Optional `bankAccountName` scopes the bank-rec step. Composes 12+ tools (qb_company_info, qb_host_query, qb_closing_date_get, qb_uncleared_transactions, qb_reconciliation_discrepancy, qb_cleared_status_update, qb_pnl_report, qb_general_ledger, qb_ar_aging, qb_ap_aging, qb_balance_sheet_report, qb_statement_of_cash_flows). Explicitly warns not to call `qb_closing_date_set` (no SDK write path). |
+| `/credit_card_qb_batch` | Bulk-categorize a credit-card statement into atomic `qb_journal_entry_batch_create`. Bridges the operator's `credit-card-qb-batch` skill from Excel-intermediate to direct MCP entry. Optional args: `creditCardAccountName` / `statementMonth` (YYYY-MM) / `source` (parsing-source description). Calls out `idempotencyKey` usage + 9002 conflict semantics + refund/credit reversal mechanics. |
+| `/trial_balance_workup` | Pulls trial balance + cross-checks (BS Assets = Liab+Equity reconcile, AR/AP totals match aging reports, P&L netIncome plug). Bridges the `trial-balance-workup` skill from manual CSV export to direct MCP query. Optional args: `asOfDate` (default today) / `basis` (default Accrual). Specifies the workpaper output table shape. |
+| `/cc_statement_validator` | Three-way reconciliation of a credit-card statement against QB's CC account state — balance match, line-by-line match, discrepancy scan, clear-on-match. Bridges the `cc-statement-validator` skill. Optional args: `creditCardAccountName` / `statementEndingBalance` / `statementEndingDate`. |
+| `/w2_prep` | January W-2 prep via `qb_w2_summary` + `qb_employee_list` + reconciliation against P&L wage totals + balance-sheet withholding liability. Optional args: `taxYear` (default last completed year) / `employeeFullName` (single-employee scope). Surfaces a per-employee filing checklist; calls out 9003 / 9004 status codes for edition / subscription rejections. Subject to QB Payroll subscription availability. |
 
 ## Architecture
 
@@ -276,7 +300,7 @@ End-to-end month-end-close workflow through the MCP:
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (103 tools)     │──│──────────────┐
+                                    │  │ (106 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

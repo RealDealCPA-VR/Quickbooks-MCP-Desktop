@@ -48,6 +48,14 @@ const TABLE: Record<number, string> = {
   // matching employees" — the first means the operator can't get W-2 data
   // until they subscribe; the second is a legitimate empty result.
   9004: "QB Payroll subscription required or not active. PayrollSummaryReportQueryRq returned no data — verify the subscription status in QB Desktop (Employees → My Payroll Service → Account/Billing Info) before retrying.",
+  // 9005 — synthetic, client-side. Issued by qb_closing_date_set (Phase 18 #85)
+  // because the qbXML SDK does NOT expose a write path for the closing date
+  // (no PreferencesModRq / AccountingPreferencesModRq exists at any qbXML
+  // version through 16.0 — verified against the qbwc/qbxml master mirrors of
+  // Intuit's official SDK XSDs). The tool fails fast with this code and
+  // returns explicit UI navigation steps in its response. Reads of the
+  // closing date work normally via qb_closing_date_get.
+  9005: "Closing date cannot be set via the QuickBooks Desktop SDK. The qbXML schema has no write path for company preferences (PreferencesModRq does not exist at any version). Set the closing date manually in QB Desktop under Edit → Preferences → Accounting → Company Preferences → Set Date/Password. Read access via qb_closing_date_get is supported.",
 };
 
 export function qbStatusCodeMessage(statusCode: number): string | undefined {
