@@ -249,11 +249,16 @@ export class SimulationStore {
       );
     }
 
-    // Transaction filters: EntityFilter matches Customer/Vendor reference on
-    // the transaction. Real QB scopes EntityFilter to CustomerRef on
-    // Invoice/ReceivePayment/Estimate/SalesReceipt/CreditMemo/SalesOrder, and
-    // to VendorRef on Bill/PurchaseOrder/BillPaymentCheck/BillPaymentCreditCard.
-    // For the sim, we accept either ref shape — entities only carry one.
+    // Transaction filters: EntityFilter matches Customer/Vendor/Payee reference
+    // on the transaction. Real QB scopes EntityFilter to CustomerRef on
+    // Invoice/ReceivePayment/Estimate/SalesReceipt/CreditMemo/SalesOrder, to
+    // VendorRef on Bill/PurchaseOrder, to PayeeEntityRef on Check/
+    // BillPaymentCheck/BillPaymentCreditCard/CreditCardCharge/CreditCardCredit.
+    // For the sim, we accept any of the three ref shapes — entities only carry
+    // one. PayeeEntityRef added by Phase 17 #75 (banking primitives) so
+    // qb_check_list({payeeName}) scopes correctly; strict improvement on
+    // BillPaymentCheck/BillPaymentCreditCard list tools that already passed
+    // EntityFilter against their PayeeEntityRef.
     if (reqData.EntityFilter && typeof reqData.EntityFilter === "object") {
       const ef = reqData.EntityFilter as Record<string, unknown>;
       const targetListIds = ef.ListID
@@ -268,7 +273,7 @@ export class SimulationStore {
         : null;
       if (targetListIds || targetNames) {
         results = results.filter((e) => {
-          const ref = (e.CustomerRef ?? e.VendorRef) as
+          const ref = (e.CustomerRef ?? e.VendorRef ?? e.PayeeEntityRef) as
             | Record<string, unknown>
             | undefined;
           if (!ref) return false;
@@ -3290,6 +3295,28 @@ export class SimulationStore {
       result.TotalCredit = this.sumLineAmounts(result.JournalCreditLineRet);
     }
 
+    // Phase 17 #75 — Check.Amount = sum(ExpenseLineRet.Amount) +
+    // sum(ItemLineRet.Amount). Real QB returns Amount as the total drawn
+    // against the bank account; downstream walks (qb_uncleared_transactions,
+    // qb_reconciliation_discrepancy, qb_transaction_list_by_account) all read
+    // txn.Amount on Check. Sets only when undefined so an explicit override on
+    // create (existing tests + seedCheck helper pass Amount: 250 explicitly)
+    // wins; handleMod's post-lineMod block deletes Amount first so re-derive
+    // fires there.
+    if (entityType === "Check" && result.Amount === undefined) {
+      result.Amount = lineSum;
+    }
+
+    // Phase 17 #75 — Deposit.DepositTotal = sum(DepositLineRet.Amount). Real
+    // QB's DepositRet carries DepositTotal as the sum of split lines. Same
+    // pattern as Check.Amount: derives only when undefined so explicit
+    // override wins; handleMod re-derives after line mods. Note this DOES NOT
+    // also set Amount — bank-balance walks already prefer DepositLineRet sum
+    // (txnPostingsToBankAccount) and fall back to DepositTotal / Amount.
+    if (entityType === "Deposit" && result.DepositTotal === undefined) {
+      result.DepositTotal = lineSum;
+    }
+
     return result;
   }
 
@@ -3553,10 +3580,22 @@ export class SimulationStore {
         entityType === "SalesReceipt" ||
         entityType === "CreditMemo" ||
         entityType === "PurchaseOrder" ||
-        entityType === "JournalEntry")
+        entityType === "JournalEntry" ||
+        // Phase 17 #75 — Check / Deposit re-derive header totals on line mod.
+        // Mirror Bill: computeTotals only sets the header field when undefined
+        // (preserves explicit overrides on create), so the field must be
+        // cleared before recompute fires.
+        entityType === "Check" ||
+        entityType === "Deposit")
     ) {
       if (entityType === "Bill") {
         delete updated.AmountDue;
+      }
+      if (entityType === "Check") {
+        delete updated.Amount;
+      }
+      if (entityType === "Deposit") {
+        delete updated.DepositTotal;
       }
       updated = this.computeTotals(updated, entityType);
     }

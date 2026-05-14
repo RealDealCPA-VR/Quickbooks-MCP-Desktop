@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (108 total)
+## Tools (120 total)
 
 ### Customers
 | Tool | Description |
@@ -251,6 +251,27 @@ The qbXML SDK exposes company preferences as a **read-only** surface — `Prefer
 | `qb_closing_date_get` | Read the company file's closing date and adjacent accounting-preferences flags via `PreferencesQueryRq`. Returns `closingDate: string \| null` (ISO YYYY-MM-DD, or `null` if no closing date is set) plus `isUsingAuditTrail` / `isUsingClassTracking` / `isUsingAccountNumbers` / `isRequiringAccounts` (from `AccountingPreferences`) and a human-readable `note` summarizing protection state. Cannot surface password-set status — qbXML doesn't expose it. Read-only safe; no read-only-session gate. |
 | `qb_closing_date_set` | **Informational stub** — the qbXML SDK has NO write path for company preferences. Always fails with **statusCode 9005** and returns explicit QB Desktop UI navigation steps (Edit → Preferences → Accounting → Company Preferences → Set Date/Password), quoting the operator-supplied `closingDate` and (if provided) `password` in the instructions. Performs no wire I/O — the failure is synchronous. Surfaced as a tool (rather than omitted) so an agent thinking "I should set the closing date" routes the user correctly instead of hallucinating a non-existent mutation. The only programmatic workaround is UI Automation against the running QB Desktop instance — outside the scope of this MCP. |
 
+### Banking (Deposit / Check / Transfer)
+
+The direct-banking transactions QB Desktop tracks on its own — distinct from the AR/AP workflow (`qb_payment_receive` / `qb_bill_pay`) and from the reconciliation primitives below. **`Deposit`** records funds arriving in a bank account; **`Check`** records funds leaving via a written check or direct disbursement; **`Transfer`** moves funds between two balance-sheet accounts. All three are bank-affecting transactions — `ClearedStatus` defaults to `NotCleared` on creation and flips via `qb_cleared_status_update` during reconciliation.
+
+These tools pair with `qb_uncleared_transactions` / `qb_reconciliation_discrepancy` / `qb_cleared_status_update` (Bank Reconciliation section below) for the full month-end-close workflow — the read-side surfaces what needs clearing; the write side here lets the operator post the missing entries (deposit the daily cash drawer, write the rent check, move funds to savings) without leaving the agent.
+
+| Tool | Description |
+|------|-------------|
+| `qb_deposit_list` | List or search Deposits. Each Deposit names a `DepositToAccountRef` (the bank account where funds land) and N split lines (`DepositLineRet`). Filter by `txnId` / date range; `paginate: true` for iterator-based pagination (auto-defaults `maxReturned` to 500). Lines stripped by default — pass `includeLineItems: true` to surface them. |
+| `qb_deposit_create` | Create a new Deposit. Requires `depositToAccountName` (or `depositToAccountListId`) — a Bank account — plus at least one `lines[]` entry. Each line names an income / equity / refund-liability account + amount + optional entity / payment-method / cheque-number. The simulation derives `DepositTotal` from the line sum. Use for batch cash arrivals (recording a day's customer payments after they've been received via `qb_payment_receive` into Undeposited Funds, ad-hoc cash like a tax refund, owner contributions). Accepts `idempotencyKey` for retry safety. |
+| `qb_deposit_update` | Modify an existing Deposit by `txnId` + `editSequence`. Passing `lines` REPLACES the line set wholesale (lines with matching `txnLineID` are merged; lines you don't list are dropped). `DepositTotal` recomputes from the post-mod line sum. Stale `editSequence` rejects with 3170. |
+| `qb_deposit_delete` | Delete a Deposit. Irreversible. |
+| `qb_check_list` | List or search Checks (direct bank disbursements, distinct from `BillPaymentCheck` which pays existing bills). Filter by `txnId` / date range / `refNumber` / `payeeName` (matches `PayeeEntityRef`). `paginate: true` for iterator pagination. Lines stripped by default — pass `includeLineItems: true` to surface `ExpenseLineRet` + `ItemLineRet`. |
+| `qb_check_create` | Create a new Check drawn against `accountName` (a Bank account). Optional `payeeName` (Vendor / Customer / Employee / OtherName). Requires at least one expense or item line — a check must post somewhere on the GL side. **Use `qb_bill_pay` instead** for paying an existing bill (`BillPaymentCheckRq` is a different transaction type that closes AP and moves vendor balance). The simulation derives `Check.Amount` from the line sum on create. Accepts `idempotencyKey`. |
+| `qb_check_update` | Modify an existing Check by `txnId` + `editSequence`. Line arrays REPLACE wholesale (same merge-by-`txnLineID` semantics as `qb_bill_update`). `Check.Amount` recomputes from the post-mod line sum. Stale `editSequence` rejects with 3170. |
+| `qb_check_delete` | Delete a Check. Irreversible. To void instead (preserves the check number in the register), use `qb_check_update` with amount 0 and a "VOID" memo. |
+| `qb_transfer_list` | List or search Transfers. Each Transfer moves funds from `TransferFromAccountRef` to `TransferToAccountRef` — no line set, just `Amount`. Filter by `txnId` / date range; `paginate: true` for iterator pagination. |
+| `qb_transfer_create` | Create a new Transfer. Requires both `fromAccountName` (or `fromAccountListId`) and `toAccountName` (or `toAccountListId`) — both balance-sheet accounts, must be different (self-transfer rejects with `statusCode 3120`). `amount` must be positive (direction is encoded by the From/To refs, not by amount sign). Use for Bank-to-Bank, Bank-to-CreditCard (paying down a card directly without the bill-payment flow), Equity-to-Bank owner-draw / contribution, etc. Inventory site transfers (Enterprise-only `TransferInventoryAddRq`) are intentionally NOT exposed — they belong under Phase 17 #80 inventory adjustments. Accepts `idempotencyKey`. |
+| `qb_transfer_update` | Modify an existing Transfer by `txnId` + `editSequence`. Header-only (no line set). Stale `editSequence` rejects with 3170. |
+| `qb_transfer_delete` | Delete a Transfer. Irreversible — both sides of the posting reverse atomically. |
+
 ### Bank Reconciliation
 
 The QBXML SDK's actual reconciliation surface is much narrower than the QB Desktop UI suggests: there is **no `ReconcileQueryRq`**, **no `ReconcileDetail` GeneralDetailReportType**, and **no `LastReconciledDate` field on AccountRet** (verified against qbxmlops130/140 schemas — see [DECISIONS.md](DECISIONS.md) `2026-05-10 — bank reconciliation SDK surface`). What IS exposed:
@@ -302,7 +323,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (108 tools)     │──│──────────────┐
+                                    │  │ (120 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │
