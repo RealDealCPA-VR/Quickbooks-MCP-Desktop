@@ -490,6 +490,117 @@ export function buildTrialBalance(
 }
 
 // ---------------------------------------------------------------------------
+// Tax line mapping helper (qb_tax_line_mapping) — Phase 15 #69
+// ---------------------------------------------------------------------------
+
+export type TaxLineMappingAccountInput = {
+  ListID?: string;
+  FullName?: string;
+  Name?: string;
+  AccountNumber?: string;
+  AccountType?: string;
+  IsActive?: boolean;
+  TaxLineInfoRet?: { TaxLineID?: number | string; TaxLineName?: string };
+};
+
+export type TaxLineMappingRow = {
+  accountListId: string | null;
+  accountName: string;
+  accountNumber: string | null;
+  accountType: string;
+  isActive: boolean;
+  taxLineId: number | string | null;
+  taxLineName: string | null;
+  isUnmapped: boolean;
+};
+
+export type TaxLineMappingResult = {
+  count: number;
+  mappedCount: number;
+  unmappedCount: number;
+  accounts: TaxLineMappingRow[];
+};
+
+/**
+ * Project a chart-of-accounts query response onto the tax-line-mapping shape.
+ * Pure function so the projection + sort + mapped/unmapped split are unit-
+ * testable without spinning up an MCP transport.
+ *
+ * An account is "mapped" when `TaxLineInfoRet.TaxLineName` is a non-empty
+ * string. TaxLineID alone (without a name) does not qualify — the name is
+ * the workpaper-readable label every downstream consumer (qb_trial_balance_
+ * export's taxLine column, the tax preparer reading the workpaper) keys on.
+ *
+ * Sort: canonical workpaper order — AccountType (using TB_ACCOUNT_TYPES
+ * order; types outside that set sort last alphabetically), then AccountNumber
+ * (lex compare since AccountNumber is a string in QB — `1000-1` / `1000.A`
+ * patterns), then alphabetical FullName.
+ */
+export function buildTaxLineMapping(
+  accounts: ReadonlyArray<TaxLineMappingAccountInput | Record<string, unknown>>,
+  options: { includeUnmapped?: boolean } = {},
+): TaxLineMappingResult {
+  const rows: TaxLineMappingRow[] = [];
+
+  for (const a of accounts) {
+    const rec = a as TaxLineMappingAccountInput;
+    const name = String(rec.FullName ?? rec.Name ?? "");
+    if (!name) continue;
+    const taxInfo = rec.TaxLineInfoRet;
+    const taxLineName = taxInfo?.TaxLineName ? String(taxInfo.TaxLineName) : null;
+    const taxLineId = taxInfo?.TaxLineID !== undefined && taxInfo.TaxLineID !== null
+      ? taxInfo.TaxLineID
+      : null;
+    const isUnmapped = !taxLineName;
+    if (isUnmapped && options.includeUnmapped !== true) continue;
+
+    rows.push({
+      accountListId: rec.ListID ? String(rec.ListID) : null,
+      accountName: name,
+      accountNumber: rec.AccountNumber ? String(rec.AccountNumber) : null,
+      accountType: String(rec.AccountType ?? ""),
+      isActive: rec.IsActive !== false,
+      taxLineId,
+      taxLineName,
+      isUnmapped,
+    });
+  }
+
+  const typeOrder = new Map(TB_ACCOUNT_TYPES.map((t, i) => [t, i]));
+  rows.sort((a, b) => {
+    const oa = typeOrder.get(a.accountType) ?? 999;
+    const ob = typeOrder.get(b.accountType) ?? 999;
+    if (oa !== ob) return oa - ob;
+    if (oa === 999 && a.accountType !== b.accountType) {
+      return a.accountType.localeCompare(b.accountType);
+    }
+    if (a.accountNumber && b.accountNumber) {
+      const cmp = a.accountNumber.localeCompare(b.accountNumber);
+      if (cmp !== 0) return cmp;
+    } else if (a.accountNumber && !b.accountNumber) {
+      return -1;
+    } else if (!a.accountNumber && b.accountNumber) {
+      return 1;
+    }
+    return a.accountName.localeCompare(b.accountName);
+  });
+
+  let mappedCount = 0;
+  let unmappedCount = 0;
+  for (const r of rows) {
+    if (r.isUnmapped) unmappedCount += 1;
+    else mappedCount += 1;
+  }
+
+  return {
+    count: rows.length,
+    mappedCount,
+    unmappedCount,
+    accounts: rows,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // General Ledger helper (qb_general_ledger) — Phase 11 #53
 // ---------------------------------------------------------------------------
 
@@ -1040,7 +1151,7 @@ export function registerReportTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_trial_balance_export",
-    "Trial Balance export shaped for tax-season workpapers. Returns one row per posting account with non-zero balance (debits and credits split by natural-balance side — Asset/Expense balances → debit column, Liability/Equity/Income → credit column; contra-balances flip to the OTHER column rather than appearing as a negative number), sorted by canonical AccountType then AccountNumber. Each row carries accountListId / accountName / accountNumber / accountType / taxLine (from Account.TaxLineInfoRet.TaxLineName — populated by live QB; sim is empty until Phase 15 #69 seeds it) / debitBalance / creditBalance / isActive / lastActivityDate. Plus four cross-checks: balanceSheet (Assets ≡ Liabilities + Equity), netIncome (P&L NetIncome ≡ BS NetIncome), arReconciliation (AR account balance ≡ AR aging total), apReconciliation (AP account balance ≡ AP aging total) — each with delta and a `matches`/`reconciles` boolean (cent-tolerance). Any mismatch is an audit signal. NonPosting accounts (estimates, POs, sales orders) are excluded from the TB (matches the workpaper convention; for NonPosting balances use qb_balance_summary). Defaults: includeInactive=false (inactive accounts dropped), includeZeroBalances=false (zero-balance rows dropped — TB convention), includeLastActivityDate=false (the opt-in costs N additional TransactionQueryRq round trips, one per account — useful for tax-season workpapers, skip for quick reconciliation). Composite of 5 wire calls (AccountQueryRq + BalanceSheetStandard + ProfitAndLossStandard + InvoiceQueryRq + BillQueryRq) in the default path. Sim caveat: BalanceSheetStandard reads Account.Balance for AS/LI/EQ (snapshot — asOfDate advisory for those buckets); P&L walk IS date-bounded in both modes; cross-check arithmetic is correct in both.",
+    "Trial Balance export shaped for tax-season workpapers. Returns one row per posting account with non-zero balance (debits and credits split by natural-balance side — Asset/Expense balances → debit column, Liability/Equity/Income → credit column; contra-balances flip to the OTHER column rather than appearing as a negative number), sorted by canonical AccountType then AccountNumber. Each row carries accountListId / accountName / accountNumber / accountType / taxLine (from Account.TaxLineInfoRet.TaxLineName — populated by live QB and by sim seed for the mapped accounts; null for unmapped accounts) / debitBalance / creditBalance / isActive / lastActivityDate. Plus four cross-checks: balanceSheet (Assets ≡ Liabilities + Equity), netIncome (P&L NetIncome ≡ BS NetIncome), arReconciliation (AR account balance ≡ AR aging total), apReconciliation (AP account balance ≡ AP aging total) — each with delta and a `matches`/`reconciles` boolean (cent-tolerance). Any mismatch is an audit signal. NonPosting accounts (estimates, POs, sales orders) are excluded from the TB (matches the workpaper convention; for NonPosting balances use qb_balance_summary). Defaults: includeInactive=false (inactive accounts dropped), includeZeroBalances=false (zero-balance rows dropped — TB convention), includeLastActivityDate=false (the opt-in costs N additional TransactionQueryRq round trips, one per account — useful for tax-season workpapers, skip for quick reconciliation). Composite of 5 wire calls (AccountQueryRq + BalanceSheetStandard + ProfitAndLossStandard + InvoiceQueryRq + BillQueryRq) in the default path. Sim caveat: BalanceSheetStandard reads Account.Balance for AS/LI/EQ (snapshot — asOfDate advisory for those buckets); P&L walk IS date-bounded in both modes; cross-check arithmetic is correct in both.",
     {
       asOfDate: z.string().regex(ISO_DATE_RE).optional()
         .describe("As-of date (YYYY-MM-DD). Defaults to today. Used as toDate for both the BalanceSheetStandard run and the lifetime-through-asOfDate P&L walk."),
@@ -1161,6 +1272,77 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "qb_trial_balance_export failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // Tax line mapping (Phase 15 #69)
+  // -----------------------------------------------------------------------
+  // Direct bridge from QB's chart of accounts to a tax-prep workpaper. Every
+  // QB account can carry a tax-line assignment (Sch C / Sch L / 1120-S /
+  // 1065 / Sch E / etc.) — `AccountQueryRq` already returns that mapping
+  // under `TaxLineInfoRet.{TaxLineID, TaxLineName}` but no dedicated tool
+  // exposes it. Without this, every workpaper rebuilds the same mapping by
+  // hand: chart of accounts → which 1120-S line each account rolls up to.
+  //
+  // Pure read-side composite over `session.queryEntity("Account", filters)`.
+  // No new wire types, no schema-order risk, no manager method needed.
+  // Filters mirror `qb_account_list` so the same scope args work in both
+  // tools (accountListId / accountName / accountType). The two tools differ
+  // only in PROJECTION — qb_account_list returns full Account records;
+  // qb_tax_line_mapping returns just the tax-line bridge fields plus the
+  // mapped/unmapped split count.
+  server.tool(
+    "qb_tax_line_mapping",
+    "Tax-line mapping for the chart of accounts — bridge from books to tax software. Returns each posting account with its assigned tax-line (Sch C / Sch L / 1120-S / 1065 / etc.) from Account.TaxLineInfoRet, so the tax preparer can group accounts by tax-line code without rebuilding the mapping by hand. Pure projection over AccountQueryRq — same shape qb_trial_balance_export's `taxLine` column reads from. Defaults: returns all active mapped accounts (accounts whose TaxLineInfoRet is populated). Pass includeUnmapped:true to include accounts that have no tax-line assignment (one of the workpaper-prep checks — every income/expense account should be mapped before filing). Scope optionally to a single account (accountListId or accountName) or a single AccountType (accountType). NonPosting accounts are NOT excluded by default — pass an explicit accountType filter to scope. Output: { count, mappedCount, unmappedCount, accounts: [{accountListId, accountName, accountNumber, accountType, isActive, taxLineId, taxLineName, isUnmapped}] } sorted by accountType then accountNumber then name (workpaper convention).",
+    {
+      accountListId: z.string().optional()
+        .describe("Scope to a single account by ListID. Mutually exclusive with accountName in practice (both work; ListID wins on the wire)."),
+      accountName: z.string().optional()
+        .describe("Scope to a single account by FullName (exact match)."),
+      accountType: z.string().optional()
+        .describe("Filter to one AccountType (e.g. 'Income', 'Expense', 'Bank'). See the AccountType enum on qb_account_add for the full set."),
+      includeInactive: z.boolean().optional()
+        .describe("When true, include inactive accounts (IsActive === false). Default false — workpapers normally exclude them."),
+      includeUnmapped: z.boolean().optional()
+        .describe("When true, include accounts with no TaxLineInfoRet. Default false — only mapped accounts surface. Set true to audit the chart for missing tax-line assignments before filing."),
+    },
+    async (args) => {
+      const session = getSession();
+      try {
+        const filters: Record<string, unknown> = {};
+        if (args.accountListId) filters.ListID = args.accountListId;
+        if (args.accountName) filters.FullName = args.accountName;
+        if (args.accountType) filters.AccountType = args.accountType;
+        if (args.includeInactive !== true) filters.ActiveStatus = "ActiveOnly";
+
+        const raw = await session.queryEntity("Account", filters);
+        const mapping = buildTaxLineMapping(raw, {
+          includeUnmapped: args.includeUnmapped === true,
+        });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(mapping, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "qb_tax_line_mapping failed",
               ...(humanReadable ? { humanReadable } : {}),
             }),
           }],

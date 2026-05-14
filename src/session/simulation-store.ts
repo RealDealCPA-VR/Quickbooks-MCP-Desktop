@@ -386,6 +386,16 @@ export class SimulationStore {
     } else if (reqData.ActiveStatus === "InactiveOnly") {
       results = results.filter((e) => e.IsActive === false);
     }
+    // Phase 15 #69 — AccountType filter for AccountQueryRq. Real QB accepts a
+    // single AccountType value (Bank / Income / Expense / etc.) and scopes the
+    // result. Pre-#69 the sim ignored it (qb_account_list silently returned
+    // every account regardless of accountType arg) — qb_tax_line_mapping needs
+    // it to work, and applying it here is a strict improvement on every other
+    // caller that already passed AccountType through.
+    if (reqData.AccountType) {
+      const targetType = String(reqData.AccountType);
+      results = results.filter((e) => String(e.AccountType ?? "") === targetType);
+    }
     if (reqData.MaxReturned) {
       results = results.slice(0, Number(reqData.MaxReturned));
     }
@@ -4633,18 +4643,33 @@ export class SimulationStore {
       vendors.set(v.ListID as string, v);
     }
 
-    // Sample accounts (Chart of Accounts)
+    // Sample accounts (Chart of Accounts). Phase 15 #69 — most accounts carry
+    // a representative TaxLineInfoRet so qb_tax_line_mapping (and the taxLine
+    // column on qb_trial_balance_export rows) surface non-null values in sim.
+    // Savings + Consulting Revenue are intentionally left UNMAPPED so the
+    // includeUnmapped filter has something to exercise against fresh seed.
+    // The tax-line names follow the QB Desktop convention (1120-S corp filing
+    // since the operator's primary live test file is an S-corp); these are
+    // representative, not literal copies of QB's TaxLineID enum.
     const sampleAccounts: StoredEntity[] = [
-      { ListID: "A0000001", Name: "Checking", FullName: "Checking", AccountType: "Bank", AccountNumber: "1000", Balance: 45000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "A0000001", Name: "Checking", FullName: "Checking", AccountType: "Bank", AccountNumber: "1000", Balance: 45000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 28, TaxLineName: "B/S-Assets: Cash" } },
       { ListID: "A0000002", Name: "Savings", FullName: "Savings", AccountType: "Bank", AccountNumber: "1010", Balance: 120000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
-      { ListID: "A0000003", Name: "Accounts Receivable", FullName: "Accounts Receivable", AccountType: "AccountsReceivable", AccountNumber: "1100", Balance: 26700.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
-      { ListID: "A0000004", Name: "Accounts Payable", FullName: "Accounts Payable", AccountType: "AccountsPayable", AccountNumber: "2000", Balance: 3700.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
-      { ListID: "A0000005", Name: "Sales Revenue", FullName: "Sales Revenue", AccountType: "Income", AccountNumber: "4000", Balance: 185000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "A0000003", Name: "Accounts Receivable", FullName: "Accounts Receivable", AccountType: "AccountsReceivable", AccountNumber: "1100", Balance: 26700.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 29, TaxLineName: "B/S-Assets: Accounts receivable" } },
+      { ListID: "A0000004", Name: "Accounts Payable", FullName: "Accounts Payable", AccountType: "AccountsPayable", AccountNumber: "2000", Balance: 3700.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 38, TaxLineName: "B/S-Liabs/Eq.: Accounts payable" } },
+      { ListID: "A0000005", Name: "Sales Revenue", FullName: "Sales Revenue", AccountType: "Income", AccountNumber: "4000", Balance: 185000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 100, TaxLineName: "Income: Gross receipts or sales" } },
       { ListID: "A0000006", Name: "Consulting Revenue", FullName: "Consulting Revenue", AccountType: "Income", AccountNumber: "4100", Balance: 72000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
-      { ListID: "A0000007", Name: "Cost of Goods Sold", FullName: "Cost of Goods Sold", AccountType: "CostOfGoodsSold", AccountNumber: "5000", Balance: 95000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
-      { ListID: "A0000008", Name: "Rent Expense", FullName: "Rent Expense", AccountType: "Expense", AccountNumber: "6000", Balance: 24000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
-      { ListID: "A0000009", Name: "Utilities", FullName: "Utilities", AccountType: "Expense", AccountNumber: "6100", Balance: 4800.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
-      { ListID: "A0000010", Name: "Payroll Expense", FullName: "Payroll Expense", AccountType: "Expense", AccountNumber: "6200", Balance: 156000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "A0000007", Name: "Cost of Goods Sold", FullName: "Cost of Goods Sold", AccountType: "CostOfGoodsSold", AccountNumber: "5000", Balance: 95000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 101, TaxLineName: "COGS: Other costs" } },
+      { ListID: "A0000008", Name: "Rent Expense", FullName: "Rent Expense", AccountType: "Expense", AccountNumber: "6000", Balance: 24000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 50, TaxLineName: "Deductions: Rents" } },
+      { ListID: "A0000009", Name: "Utilities", FullName: "Utilities", AccountType: "Expense", AccountNumber: "6100", Balance: 4800.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 51, TaxLineName: "Deductions: Utilities" } },
+      { ListID: "A0000010", Name: "Payroll Expense", FullName: "Payroll Expense", AccountType: "Expense", AccountNumber: "6200", Balance: 156000.00, IsActive: true, EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now,
+        TaxLineInfoRet: { TaxLineID: 52, TaxLineName: "Deductions: Salaries and wages" } },
     ];
 
     for (const a of sampleAccounts) {
