@@ -93,7 +93,8 @@
       "Bash(where /R \"C:\\\\Users\\\\VR\" trial-balance*)",
       "Bash(echo \"---EXIT $?---\")",
       "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; $out -join \"`n\"; \"---EXIT:$code---\")",
-      "Bash(echo \"EXIT:$?\")"
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(grep -n \"GeneralLedgerAccountInput\\\\|GeneralLedgerSection\\\\|TrialBalanceAccount\\\\|TrialBalanceReportInput\\\\|interface.*\\\\{$\\\\|^type \\\\|^export type \" src/tools/reports.ts)"
     ]
   }
 }
