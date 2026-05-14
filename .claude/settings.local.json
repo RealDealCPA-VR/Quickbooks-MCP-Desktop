@@ -88,7 +88,9 @@
       "PowerShell(npx vitest run tests/closing-date.test.ts 2>&1)",
       "PowerShell(npx vitest run tests/mcp-prompts.test.ts 2>&1)",
       "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \"EXIT=$code\"; Write-Output \"---\"; $out)",
-      "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \"EXIT: $code\"; Write-Output \"---OUTPUT---\"; Write-Output $out)"
+      "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \"EXIT: $code\"; Write-Output \"---OUTPUT---\"; Write-Output $out)",
+      "Read(//c/Users/VR/**)",
+      "Bash(where /R \"C:\\\\Users\\\\VR\" trial-balance*)"
     ]
   }
 }

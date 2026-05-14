@@ -271,13 +271,16 @@ describe("trialBalanceWorkupPrompt", () => {
     expect(text).toContain("Cash");
   });
 
-  it("references the four cross-check tools", () => {
+  it("calls the one-shot qb_trial_balance_export tool and names the drill-down tools", () => {
+    // Post-#68 the prompt bundles TB + four cross-checks into qb_trial_balance_export
+    // (one call instead of the prior 8-tool recipe). The drill-down tools stay
+    // referenced so an agent can dig deeper when a cross-check fires.
     const { text } = callPrompt(trialBalanceWorkupPrompt, {});
-    expect(text).toContain("qb_balance_summary");
-    expect(text).toContain("qb_balance_sheet_report");
-    expect(text).toContain("qb_pnl_report");
-    expect(text).toContain("qb_ar_aging");
-    expect(text).toContain("qb_ap_aging");
+    expect(text).toContain("qb_trial_balance_export");
+    expect(text).toContain("qb_transaction_list_by_account");
+    expect(text).toContain("qb_general_ledger");
+    expect(text).toContain("qb_customer_balance_detail");
+    expect(text).toContain("qb_vendor_balance_detail");
   });
 
   it("specifies the workpaper output table shape", () => {

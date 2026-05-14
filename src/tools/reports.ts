@@ -195,6 +195,301 @@ export function buildBalanceSummary(
 }
 
 // ---------------------------------------------------------------------------
+// Trial Balance helper (qb_trial_balance_export) — Phase 15 #68
+//
+// Composes the chart of accounts + BalanceSheetStandard + ProfitAndLossStandard
+// + AR/AP aging totals into a single workpaper-shaped TB: one row per
+// non-zero-balance posting account, debits and credits split by natural-balance
+// side, sorted by canonical AccountType then AccountNumber. Plus a crossChecks
+// block that pins the four reconciliations every TB reviewer runs:
+//   - Assets ≡ Liabilities + Equity
+//   - P&L NetIncome ≡ BS NetIncome
+//   - AR account balance ≡ AR aging total
+//   - AP account balance ≡ AP aging total
+//
+// All math is in one pure function (`buildTrialBalance`) so the natural-balance
+// logic and the cross-check arithmetic can be unit-tested without an MCP
+// transport. The tool wrapper handles I/O orchestration (5 wire calls — Account,
+// BS, P&L, Invoice for AR aging, Bill for AP aging) and the optional opt-in
+// LastActivityDate fanout (N+1 calls when enabled).
+// ---------------------------------------------------------------------------
+
+export type TrialBalanceAccount = {
+  ListID?: string;
+  FullName?: string;
+  Name?: string;
+  AccountNumber?: string;
+  AccountType?: string;
+  Balance?: number;
+  IsActive?: boolean;
+  TaxLineInfoRet?: { TaxLineName?: string; TaxLineID?: number | string };
+};
+
+export type TrialBalanceReportInput = BalanceSummaryReportInput;
+
+export type TrialBalanceRow = {
+  accountListId: string | null;
+  accountName: string;
+  accountNumber: string | null;
+  accountType: string;
+  taxLine: string | null;
+  debitBalance: number;
+  creditBalance: number;
+  isActive: boolean;
+  lastActivityDate: string | null;
+};
+
+export type TrialBalanceCrossChecks = {
+  balanceSheet: {
+    totalAssets: number;
+    totalLiabilities: number;
+    totalEquity: number;
+    sumLiabilitiesAndEquity: number;
+    reconciles: boolean;
+    delta: number;
+  };
+  netIncome: {
+    fromPnL: number;
+    fromBalanceSheet: number;
+    matches: boolean;
+    delta: number;
+  };
+  arReconciliation: {
+    fromTrialBalance: number;
+    fromARAging: number;
+    matches: boolean;
+    delta: number;
+  };
+  apReconciliation: {
+    fromTrialBalance: number;
+    fromAPAging: number;
+    matches: boolean;
+    delta: number;
+  };
+};
+
+export type TrialBalanceResult = {
+  rows: TrialBalanceRow[];
+  rowCount: number;
+  totals: {
+    totalDebits: number;
+    totalCredits: number;
+    isBalanced: boolean;
+    delta: number;
+  };
+  crossChecks: TrialBalanceCrossChecks;
+};
+
+// Natural-balance side per AccountType. Determines which column a non-zero
+// balance lands in: a positive Asset balance is a Debit; a positive Liability
+// balance is a Credit. Contra-balance accounts (a negative Accounts Receivable
+// = customer credit on file) flip to the OTHER column rather than appearing as
+// a negative number — matches the workpaper convention bookkeepers expect.
+const NATURAL_DEBIT_TYPES = new Set<string>([
+  "Bank", "AccountsReceivable", "OtherCurrentAsset", "Inventory",
+  "FixedAsset", "OtherAsset",
+  "CostOfGoodsSold", "Expense", "OtherExpense",
+]);
+const NATURAL_CREDIT_TYPES = new Set<string>([
+  "AccountsPayable", "CreditCard", "OtherCurrentLiability", "LongTermLiability",
+  "Equity",
+  "Income", "OtherIncome",
+]);
+
+// NonPosting is intentionally excluded from the TB — estimates, POs, sales
+// orders don't post to GL and have no business on a trial balance. Operators
+// who want NonPosting balances can use qb_balance_summary.
+const TB_ACCOUNT_TYPES: readonly string[] = [
+  ...ASSET_TYPES,
+  ...LIABILITY_TYPES,
+  ...EQUITY_TYPES,
+  ...INCOME_TYPES,
+  ...EXPENSE_TYPES,
+];
+
+// Cent-tolerance for cross-check matches. Reconciliations off by less than one
+// cent (floating-point rounding across separate report walks) match; anything
+// above is a real signal.
+const RECON_TOLERANCE = 0.01;
+
+/**
+ * Bucket BalanceSheetStandard + ProfitAndLossStandard report output into a
+ * workpaper-shaped TB plus four reconciliation cross-checks. Pure function so
+ * the sign convention, sort, debit/credit split, and cross-check math can be
+ * unit-tested without spinning up an MCP transport.
+ *
+ * Sources:
+ *   AS/LI/EQ row balances ← bsRet.Sections[*].Accounts[*].Total (BalanceSheetStandard)
+ *   INC/EXP row balances  ← pnlRet.Sections[*].Accounts[*].Total (ProfitAndLossStandard)
+ *   AccountType / AccountNumber / TaxLine / IsActive ← chart of accounts
+ *   AR cross-check ← caller passes arAgingTotal (Σ Invoice.BalanceRemaining where !IsPaid)
+ *   AP cross-check ← caller passes apAgingTotal (Σ Bill.AmountDue where !IsPaid)
+ *
+ * Synthetic BS rows (`Net Income`, `Balancing Adjustment (simulation seed gap)`)
+ * are filtered — they're already captured in bsRet.Totals.NetIncome and would
+ * pollute the per-account rows otherwise.
+ *
+ * Sort: canonical TB_ACCOUNT_TYPES order, then AccountNumber asc (numbered
+ * accounts first within type), then alphabetical by FullName. Matches the
+ * standard workpaper ordering CPAs expect.
+ */
+export function buildTrialBalance(
+  accounts: ReadonlyArray<TrialBalanceAccount | Record<string, unknown>>,
+  bsRet: TrialBalanceReportInput,
+  pnlRet: TrialBalanceReportInput,
+  arAgingTotal: number,
+  apAgingTotal: number,
+  options: {
+    includeInactive?: boolean;
+    includeZeroBalances?: boolean;
+    lastActivityByAccount?: Map<string, string>;
+  } = {},
+): TrialBalanceResult {
+  const accountByName = new Map<string, TrialBalanceAccount>();
+  for (const a of accounts) {
+    const rec = a as TrialBalanceAccount;
+    const name = String(rec.FullName ?? rec.Name ?? "");
+    if (name) accountByName.set(name, rec);
+  }
+
+  // Per-account balances come from the BS sections (AS/LI/EQ) and P&L sections
+  // (INC/EXP). The two reports cover disjoint AccountTypes so there's no
+  // overlap; if a name shows up twice (shouldn't, but defensive) the later
+  // entry wins — the P&L value would take precedence for INC/EXP accounts.
+  const balanceByName = new Map<string, number>();
+  for (const section of [...(bsRet.Sections ?? []), ...(pnlRet.Sections ?? [])]) {
+    if (!section?.Accounts) continue;
+    for (const acct of section.Accounts) {
+      const name = String(acct?.Name ?? "");
+      if (!name || BALANCE_SUMMARY_SYNTHETIC_ROWS.has(name)) continue;
+      const total = Number(acct?.Total ?? 0);
+      if (Number.isFinite(total)) balanceByName.set(name, total);
+    }
+  }
+
+  const allowedTypes = new Set<string>(TB_ACCOUNT_TYPES);
+  const rows: TrialBalanceRow[] = [];
+  let arTbSum = 0;
+  let apTbSum = 0;
+
+  for (const [name, account] of accountByName) {
+    const type = String(account.AccountType ?? "");
+    if (!allowedTypes.has(type)) continue; // skip NonPosting / unknown
+    if (options.includeInactive !== true && account.IsActive === false) continue;
+
+    const rawBalance = balanceByName.get(name) ?? 0;
+    if (options.includeZeroBalances !== true && Math.abs(rawBalance) < 0.005) continue;
+
+    let debitBalance = 0;
+    let creditBalance = 0;
+    if (NATURAL_DEBIT_TYPES.has(type)) {
+      if (rawBalance >= 0) debitBalance = round2(rawBalance);
+      else creditBalance = round2(-rawBalance);
+    } else if (NATURAL_CREDIT_TYPES.has(type)) {
+      if (rawBalance >= 0) creditBalance = round2(rawBalance);
+      else debitBalance = round2(-rawBalance);
+    }
+
+    if (type === "AccountsReceivable") arTbSum += rawBalance;
+    if (type === "AccountsPayable") apTbSum += rawBalance;
+
+    const taxLine = account.TaxLineInfoRet?.TaxLineName;
+    rows.push({
+      accountListId: account.ListID ? String(account.ListID) : null,
+      accountName: name,
+      accountNumber: account.AccountNumber ? String(account.AccountNumber) : null,
+      accountType: type,
+      taxLine: taxLine ? String(taxLine) : null,
+      debitBalance,
+      creditBalance,
+      isActive: account.IsActive !== false,
+      lastActivityDate: options.lastActivityByAccount?.get(name) ?? null,
+    });
+  }
+
+  const typeOrder = new Map(TB_ACCOUNT_TYPES.map((t, i) => [t, i]));
+  rows.sort((a, b) => {
+    const oa = typeOrder.get(a.accountType) ?? 999;
+    const ob = typeOrder.get(b.accountType) ?? 999;
+    if (oa !== ob) return oa - ob;
+    // Numbered accounts sort before unnumbered within type; numbers compared
+    // lexicographically because AccountNumber is a string in QB (allows
+    // 1000-1, 1000.A, etc. — strict numeric compare would mis-sort).
+    if (a.accountNumber && b.accountNumber) {
+      const cmp = a.accountNumber.localeCompare(b.accountNumber);
+      if (cmp !== 0) return cmp;
+    } else if (a.accountNumber) {
+      return -1;
+    } else if (b.accountNumber) {
+      return 1;
+    }
+    return a.accountName.localeCompare(b.accountName);
+  });
+
+  const totalDebits = round2(rows.reduce((s, r) => s + r.debitBalance, 0));
+  const totalCredits = round2(rows.reduce((s, r) => s + r.creditBalance, 0));
+  const debitCreditDelta = round2(totalDebits - totalCredits);
+
+  const bsTotals = bsRet.Totals ?? {};
+  const pnlTotals = pnlRet.Totals ?? {};
+  const totalAssets = round2(Number(bsTotals.TotalAssets ?? 0));
+  const totalLiabilities = round2(Number(bsTotals.TotalLiabilities ?? 0));
+  const totalEquity = round2(Number(bsTotals.TotalEquity ?? 0));
+  const sumLiabAndEquity = round2(totalLiabilities + totalEquity);
+  const bsDelta = round2(totalAssets - sumLiabAndEquity);
+
+  const pnlNetIncome = round2(Number(pnlTotals.NetIncome ?? 0));
+  const bsNetIncome = round2(Number(bsTotals.NetIncome ?? 0));
+  const niDelta = round2(pnlNetIncome - bsNetIncome);
+
+  const arTb = round2(arTbSum);
+  const apTb = round2(apTbSum);
+  const arAging = round2(arAgingTotal);
+  const apAging = round2(apAgingTotal);
+  const arDelta = round2(arTb - arAging);
+  const apDelta = round2(apTb - apAging);
+
+  return {
+    rows,
+    rowCount: rows.length,
+    totals: {
+      totalDebits,
+      totalCredits,
+      isBalanced: Math.abs(debitCreditDelta) <= RECON_TOLERANCE,
+      delta: debitCreditDelta,
+    },
+    crossChecks: {
+      balanceSheet: {
+        totalAssets,
+        totalLiabilities,
+        totalEquity,
+        sumLiabilitiesAndEquity: sumLiabAndEquity,
+        reconciles: Math.abs(bsDelta) <= RECON_TOLERANCE,
+        delta: bsDelta,
+      },
+      netIncome: {
+        fromPnL: pnlNetIncome,
+        fromBalanceSheet: bsNetIncome,
+        matches: Math.abs(niDelta) <= RECON_TOLERANCE,
+        delta: niDelta,
+      },
+      arReconciliation: {
+        fromTrialBalance: arTb,
+        fromARAging: arAging,
+        matches: Math.abs(arDelta) <= RECON_TOLERANCE,
+        delta: arDelta,
+      },
+      apReconciliation: {
+        fromTrialBalance: apTb,
+        fromAPAging: apAging,
+        matches: Math.abs(apDelta) <= RECON_TOLERANCE,
+        delta: apDelta,
+      },
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // General Ledger helper (qb_general_ledger) — Phase 11 #53
 // ---------------------------------------------------------------------------
 
@@ -715,6 +1010,157 @@ export function registerReportTools(
               success: false,
               statusCode: e.statusCode ?? -1,
               statusMessage: e.message ?? "qb_balance_summary failed",
+              ...(humanReadable ? { humanReadable } : {}),
+            }),
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // Trial balance export (qb_trial_balance_export) — Phase 15 #68
+  //
+  // Composite over AccountQueryRq + BalanceSheetStandard + ProfitAndLossStandard
+  // + InvoiceQueryRq (for AR aging total) + BillQueryRq (for AP aging total).
+  // Five wire calls in the default path; the chart-of-accounts query feeds
+  // both the per-row metadata (AccountType / AccountNumber / IsActive / TaxLine)
+  // and the cross-check name→type lookups.
+  //
+  // includeLastActivityDate: true triggers an additional per-account
+  // TransactionQueryRq fanout. That's N+5 round trips for an N-account chart —
+  // ~10s for a 200-account chart at typical QBXMLRP2 latency. Default is off
+  // so the bare tool call stays cheap (workpaper use opts in deliberately).
+  //
+  // Sim caveat: the same caveat as qb_balance_summary applies — sim's
+  // BalanceSheetStandard draws AS/LI/EQ from Account.Balance snapshot (asOfDate
+  // is advisory for those buckets), but the P&L walk IS date-bounded. The
+  // cross-check arithmetic is correct in both modes.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_trial_balance_export",
+    "Trial Balance export shaped for tax-season workpapers. Returns one row per posting account with non-zero balance (debits and credits split by natural-balance side — Asset/Expense balances → debit column, Liability/Equity/Income → credit column; contra-balances flip to the OTHER column rather than appearing as a negative number), sorted by canonical AccountType then AccountNumber. Each row carries accountListId / accountName / accountNumber / accountType / taxLine (from Account.TaxLineInfoRet.TaxLineName — populated by live QB; sim is empty until Phase 15 #69 seeds it) / debitBalance / creditBalance / isActive / lastActivityDate. Plus four cross-checks: balanceSheet (Assets ≡ Liabilities + Equity), netIncome (P&L NetIncome ≡ BS NetIncome), arReconciliation (AR account balance ≡ AR aging total), apReconciliation (AP account balance ≡ AP aging total) — each with delta and a `matches`/`reconciles` boolean (cent-tolerance). Any mismatch is an audit signal. NonPosting accounts (estimates, POs, sales orders) are excluded from the TB (matches the workpaper convention; for NonPosting balances use qb_balance_summary). Defaults: includeInactive=false (inactive accounts dropped), includeZeroBalances=false (zero-balance rows dropped — TB convention), includeLastActivityDate=false (the opt-in costs N additional TransactionQueryRq round trips, one per account — useful for tax-season workpapers, skip for quick reconciliation). Composite of 5 wire calls (AccountQueryRq + BalanceSheetStandard + ProfitAndLossStandard + InvoiceQueryRq + BillQueryRq) in the default path. Sim caveat: BalanceSheetStandard reads Account.Balance for AS/LI/EQ (snapshot — asOfDate advisory for those buckets); P&L walk IS date-bounded in both modes; cross-check arithmetic is correct in both.",
+    {
+      asOfDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("As-of date (YYYY-MM-DD). Defaults to today. Used as toDate for both the BalanceSheetStandard run and the lifetime-through-asOfDate P&L walk."),
+      basis: z.enum(["Accrual", "Cash"]).optional()
+        .describe("Accounting basis. Defaults to Accrual."),
+      includeInactive: z.boolean().optional()
+        .describe("When true, include inactive accounts (IsActive === false). Default false — workpapers normally exclude them."),
+      includeZeroBalances: z.boolean().optional()
+        .describe("When true, include accounts whose computed balance rounds to $0.00. Default false — TB convention drops zero rows. Set true to verify chart coverage."),
+      includeLastActivityDate: z.boolean().optional()
+        .describe("When true, fans out one TransactionQueryRq per row to surface the most-recent posting date per account. Costs N additional round trips (~10s for a 200-account chart in live mode); per-account errors land in `warnings` and the row's `lastActivityDate` stays null. Default false — opt in for tax-season workpapers."),
+    },
+    async (args) => {
+      const session = getSession();
+      try {
+        const effectiveAsOf = args.asOfDate ?? new Date().toISOString().split("T")[0];
+        const effectiveBasis = args.basis ?? "Accrual";
+
+        const accounts = await session.queryEntity("Account", {});
+
+        // BS first, then P&L (sequential — QBXMLRP2 serializes COM calls
+        // anyway, and avoiding parallel-session races in live mode).
+        const bsRet = await session.runReport("BalanceSheetStandard", {
+          toDate: effectiveAsOf,
+          basis: effectiveBasis,
+        });
+        const pnlRet = await session.runReport("ProfitAndLossStandard", {
+          toDate: effectiveAsOf,
+          basis: effectiveBasis,
+        });
+
+        // AR / AP aging totals — same walk qb_ar_aging / qb_ap_aging perform
+        // for the bucketed view, summed without the per-bucket math. Walking
+        // typed entities (rather than reading the reports' AR/AP rows) gives
+        // the canonical aging-total signal the cross-check is meant to match.
+        const invoices = await session.queryEntity("Invoice", {});
+        let arAgingTotal = 0;
+        for (const inv of invoices) {
+          if (inv.IsPaid === true) continue;
+          const bal = Number(inv.BalanceRemaining ?? 0);
+          if (bal > 0) arAgingTotal += bal;
+        }
+
+        const bills = await session.queryEntity("Bill", {});
+        let apAgingTotal = 0;
+        for (const bill of bills) {
+          if (bill.IsPaid === true) continue;
+          const amt = Number(bill.AmountDue ?? 0);
+          if (amt > 0) apAgingTotal += amt;
+        }
+
+        // Optional per-account LastActivityDate. Walks each posting account
+        // via TransactionQueryRq, picks max(TxnDate) from the returned rows.
+        // Per-account failures are isolated — they surface in warnings but
+        // don't fail the whole tool (the rest of the TB is still useful).
+        let lastActivityByAccount: Map<string, string> | undefined;
+        const warnings: string[] = [];
+        if (args.includeLastActivityDate === true) {
+          lastActivityByAccount = new Map();
+          const allowedTypes = new Set<string>(TB_ACCOUNT_TYPES);
+          for (const acct of accounts as TrialBalanceAccount[]) {
+            const type = String(acct.AccountType ?? "");
+            const name = String(acct.FullName ?? acct.Name ?? "");
+            if (!name || !allowedTypes.has(type)) continue;
+            if (!acct.ListID) continue;
+            try {
+              const rows = await session.queryTransactions({
+                AccountFilter: { ListID: String(acct.ListID) },
+                MaxReturned: 1000,
+              });
+              let maxDate = "";
+              for (const r of rows) {
+                const d = String((r as Record<string, unknown>).TxnDate ?? "");
+                if (d && d > maxDate) maxDate = d;
+              }
+              if (maxDate) lastActivityByAccount.set(name, maxDate);
+            } catch (err) {
+              const e = err as { message?: string };
+              warnings.push(`lastActivityDate lookup failed for ${name}: ${e.message ?? "unknown"}`);
+            }
+          }
+        }
+
+        const result = buildTrialBalance(
+          accounts as TrialBalanceAccount[],
+          bsRet as TrialBalanceReportInput,
+          pnlRet as TrialBalanceReportInput,
+          arAgingTotal,
+          apAgingTotal,
+          {
+            includeInactive: args.includeInactive === true,
+            includeZeroBalances: args.includeZeroBalances === true,
+            lastActivityByAccount,
+          },
+        );
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              asOfDate: effectiveAsOf,
+              basis: effectiveBasis,
+              rowCount: result.rowCount,
+              rows: result.rows,
+              totals: result.totals,
+              crossChecks: result.crossChecks,
+              ...(warnings.length > 0 ? { warnings } : {}),
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const e = err as { message?: string; statusCode?: number };
+        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: e.statusCode ?? -1,
+              statusMessage: e.message ?? "qb_trial_balance_export failed",
               ...(humanReadable ? { humanReadable } : {}),
             }),
           }],
