@@ -522,13 +522,14 @@ export class SimulationStore {
       reportType !== "SalesByCustomerSummary" &&
       reportType !== "SalesByItemSummary" &&
       reportType !== "ExpensesByVendorSummary" &&
-      reportType !== "StatementOfCashFlows"
+      reportType !== "StatementOfCashFlows" &&
+      reportType !== "SalesTaxLiability"
     ) {
       return {
         type: rsType,
         statusCode: 3120,
         statusSeverity: "Error",
-        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard, BalanceSheetStandard, SalesByCustomerSummary, SalesByItemSummary, ExpensesByVendorSummary, and StatementOfCashFlows are implemented)`,
+        statusMessage: `Unsupported GeneralSummaryReportType: ${reportType || "(missing)"} (only ProfitAndLossStandard, BalanceSheetStandard, SalesByCustomerSummary, SalesByItemSummary, ExpensesByVendorSummary, StatementOfCashFlows, and SalesTaxLiability are implemented)`,
         data: {},
       };
     }
@@ -610,6 +611,23 @@ export class SimulationStore {
 
     if (reportType === "StatementOfCashFlows") {
       const reportRet = this.buildStatementOfCashFlows(fromDate, toDate, basis);
+      return {
+        type: rsType,
+        statusCode: 0,
+        statusSeverity: "Info",
+        statusMessage: "Status OK",
+        data: { ReportRet: reportRet },
+      };
+    }
+
+    if (reportType === "SalesTaxLiability") {
+      // Phase 17 #77 — per-tax-item liability, grouped by agency. Walks
+      // Invoice + SalesReceipt SalesTaxTotal scoped to ItemSalesTaxRef in the
+      // window for TaxCollected; subtracts SalesTaxPaymentCheckLineRet sums
+      // per-item for TaxPaid; emits TaxPayable = TaxCollected − TaxPaid plus
+      // a per-agency rollup. Custom shape (not the Sections/Totals envelope)
+      // because liability rows have multiple measures per row.
+      const reportRet = this.buildSalesTaxLiabilityReport(fromDate, toDate, basis);
       return {
         type: rsType,
         statusCode: 0,
@@ -808,6 +826,185 @@ export class SimulationStore {
         { Name: "Expenses", Accounts: vendors, Subtotal: totalExpenses },
       ],
       Totals: { TotalExpenses: totalExpenses },
+    };
+  }
+
+  // Phase 17 #77 — per-tax-item liability rollup, grouped by agency.
+  //
+  // TaxCollected: walks Invoice + SalesReceipt in the date window. Each txn
+  // that carries a header ItemSalesTaxRef contributes its full SalesTaxTotal
+  // to that tax-item's row. CreditMemo SUBTRACTS (returning taxable goods
+  // reverses the collection). Sim simplification: only per-txn header
+  // ItemSalesTaxRef is walked, not per-line tax flags — real QB also tracks
+  // per-line taxable status, but this server's sales-tax engine doesn't
+  // simulate that yet (sales-tax codes per line don't drive any computation
+  // in sim). Documented on the tool surface.
+  //
+  // TaxPaid: walks SalesTaxPaymentCheck txns in the window. Each line
+  // (SalesTaxPaymentCheckLineRet) reduces the named ItemSalesTaxRef's
+  // liability by line.Amount.
+  //
+  // Per-row TaxPayable = TaxCollected − TaxPaid (positive = still owed,
+  // negative = overpaid / credit at agency). Agency rollup sums the
+  // component items. All rows present even when zero (operator wants to see
+  // "$0 owed to CA agency this period" not silently dropped — distinguishes
+  // "no liability" from "no agency configured").
+  private buildSalesTaxLiabilityReport(
+    from: string | null,
+    to: string | null,
+    basis: "Accrual" | "Cash",
+  ): Record<string, unknown> {
+    const round2 = (n: number): number => Math.round(n * 100) / 100;
+    const inWindow = (d: string): boolean => {
+      if (from && d < from) return false;
+      if (to && d > to) return false;
+      return true;
+    };
+
+    // Index every SalesTaxItem by both ListID and FullName so wire refs
+    // (which may carry only one) resolve uniformly.
+    type Row = {
+      AgencyName: string;
+      AgencyListID: string | null;
+      TaxItemName: string;
+      TaxItemListID: string;
+      TaxRate: number;
+      TaxCollected: number;
+      TaxPaid: number;
+      TaxPayable: number;
+    };
+    const rows = new Map<string, Row>();
+    const itemByListId = new Map<string, Row>();
+    const itemByName = new Map<string, Row>();
+    for (const item of this.getStore("ItemSalesTax").values()) {
+      const listId = String(item.ListID ?? "");
+      const name = String(item.FullName ?? item.Name ?? "");
+      if (!listId || !name) continue;
+      const agencyRef = item.TaxVendorRef as Record<string, unknown> | undefined;
+      const row: Row = {
+        AgencyName: String(agencyRef?.FullName ?? "(no agency)"),
+        AgencyListID: agencyRef?.ListID ? String(agencyRef.ListID) : null,
+        TaxItemName: name,
+        TaxItemListID: listId,
+        TaxRate: Number(item.TaxRate ?? 0),
+        TaxCollected: 0,
+        TaxPaid: 0,
+        TaxPayable: 0,
+      };
+      rows.set(listId, row);
+      itemByListId.set(listId, row);
+      itemByName.set(name, row);
+    }
+
+    const resolveItem = (ref: Record<string, unknown> | undefined): Row | null => {
+      if (!ref) return null;
+      if (ref.ListID) {
+        const r = itemByListId.get(String(ref.ListID));
+        if (r) return r;
+      }
+      if (ref.FullName) {
+        const r = itemByName.get(String(ref.FullName));
+        if (r) return r;
+      }
+      return null;
+    };
+
+    // TaxCollected: Invoice + SalesReceipt header SalesTaxTotal where the
+    // header's ItemSalesTaxRef resolves to a known SalesTaxItem; CreditMemo
+    // subtracts (returns reverse the collection).
+    const collectFrom = (storeName: string, sign: 1 | -1): void => {
+      for (const txn of this.getStore(storeName).values()) {
+        const txnDate = String(txn.TxnDate ?? "");
+        if (!inWindow(txnDate)) continue;
+        const taxRef = txn.ItemSalesTaxRef as Record<string, unknown> | undefined;
+        const row = resolveItem(taxRef);
+        if (!row) continue;
+        const amt = Number(txn.SalesTaxTotal ?? 0);
+        if (Number.isFinite(amt)) row.TaxCollected += sign * amt;
+      }
+    };
+    collectFrom("Invoice", 1);
+    collectFrom("SalesReceipt", 1);
+    collectFrom("CreditMemo", -1);
+
+    // TaxPaid: SalesTaxPaymentCheck lines reduce the named tax item's
+    // liability by line.Amount. Each line carries its own ItemSalesTaxRef.
+    for (const txn of this.getStore("SalesTaxPaymentCheck").values()) {
+      const txnDate = String(txn.TxnDate ?? "");
+      if (!inWindow(txnDate)) continue;
+      const lines = txn.SalesTaxPaymentCheckLineRet;
+      if (!Array.isArray(lines)) continue;
+      for (const line of lines as Record<string, unknown>[]) {
+        const taxRef = line.ItemSalesTaxRef as Record<string, unknown> | undefined;
+        const row = resolveItem(taxRef);
+        if (!row) continue;
+        const amt = Number(line.Amount ?? 0);
+        if (Number.isFinite(amt)) row.TaxPaid += amt;
+      }
+    }
+
+    // Round + derive payable + sort by agency → tax item.
+    const finalRows = [...rows.values()]
+      .map((r) => ({
+        ...r,
+        TaxCollected: round2(r.TaxCollected),
+        TaxPaid: round2(r.TaxPaid),
+        TaxPayable: round2(r.TaxCollected - r.TaxPaid),
+      }))
+      .sort((a, b) => {
+        if (a.AgencyName !== b.AgencyName) return a.AgencyName.localeCompare(b.AgencyName);
+        return a.TaxItemName.localeCompare(b.TaxItemName);
+      });
+
+    // Per-agency rollup.
+    const byAgency = new Map<string, {
+      AgencyName: string;
+      AgencyListID: string | null;
+      TaxCollected: number;
+      TaxPaid: number;
+      TaxPayable: number;
+    }>();
+    for (const r of finalRows) {
+      const key = r.AgencyListID ?? r.AgencyName;
+      const existing = byAgency.get(key);
+      if (existing) {
+        existing.TaxCollected = round2(existing.TaxCollected + r.TaxCollected);
+        existing.TaxPaid = round2(existing.TaxPaid + r.TaxPaid);
+        existing.TaxPayable = round2(existing.TaxPayable + r.TaxPayable);
+      } else {
+        byAgency.set(key, {
+          AgencyName: r.AgencyName,
+          AgencyListID: r.AgencyListID,
+          TaxCollected: r.TaxCollected,
+          TaxPaid: r.TaxPaid,
+          TaxPayable: r.TaxPayable,
+        });
+      }
+    }
+
+    const totals = finalRows.reduce(
+      (acc, r) => ({
+        TaxCollected: acc.TaxCollected + r.TaxCollected,
+        TaxPaid: acc.TaxPaid + r.TaxPaid,
+        TaxPayable: acc.TaxPayable + r.TaxPayable,
+      }),
+      { TaxCollected: 0, TaxPaid: 0, TaxPayable: 0 },
+    );
+
+    return {
+      ReportTitle: "Sales Tax Liability",
+      ReportBasis: basis,
+      ...(from ? { FromReportDate: from } : {}),
+      ...(to ? { ToReportDate: to } : {}),
+      Rows: finalRows,
+      ByAgency: [...byAgency.values()].sort((a, b) =>
+        a.AgencyName.localeCompare(b.AgencyName),
+      ),
+      Totals: {
+        TaxCollected: round2(totals.TaxCollected),
+        TaxPaid: round2(totals.TaxPaid),
+        TaxPayable: round2(totals.TaxPayable),
+      },
     };
   }
 
@@ -3337,6 +3534,16 @@ export class SimulationStore {
       result.DepositTotal = lineSum;
     }
 
+    // Phase 17 #77 — SalesTaxPaymentCheck.TotalAmount =
+    // sum(SalesTaxPaymentCheckLineRet.Amount). Mirrors Check.Amount pattern:
+    // derives only when undefined so explicit override wins. The total is
+    // what gets drawn against the bank account; per-line allocations partition
+    // it across the agency's tax items (one line per ItemSalesTaxRef). Real
+    // QB's SalesTaxPaymentCheckRet header carries TotalAmount as the sum.
+    if (entityType === "SalesTaxPaymentCheck" && result.TotalAmount === undefined) {
+      result.TotalAmount = lineSum;
+    }
+
     return result;
   }
 
@@ -4307,6 +4514,10 @@ export class SimulationStore {
     "Transfer",
     "CreditCardCharge",
     "CreditCardCredit",
+    // Phase 17 #77 — SalesTaxPaymentCheck draws from a Bank account just like
+    // Check / BillPaymentCheck, so it carries ClearedStatus and shows up in
+    // qb_uncleared_transactions for the bank account it was drawn against.
+    "SalesTaxPaymentCheck",
   ];
 
   private handleClearedStatusMod(
@@ -4517,6 +4728,11 @@ export class SimulationStore {
       // structurally a transaction. Kept in sync with builder.ts and
       // manager.ts.
       "TimeTracking",
+      // Phase 17 #77 — SalesTaxPaymentCheck. Posted by qb_sales_tax_payment_create
+      // to pay down sales-tax-item liability owed to an agency. Carries TxnID
+      // + EditSequence + lines (one per ItemSalesTaxRef being paid). Bank-affecting
+      // (added to BANK_AFFECTING_TXN_TYPES below). Three lists in sync.
+      "SalesTaxPaymentCheck",
     ].includes(entityType);
   }
 
@@ -5280,6 +5496,180 @@ export class SimulationStore {
       IsActive: true,
     };
     salesOrders.set(salesOrderSeed.TxnID as string, salesOrderSeed);
+
+    // Phase 17 #77 — Sales tax surface seed.
+    //
+    // Two tax agencies modeled as vendors (real QB doesn't have a separate
+    // SalesTaxAgency entity — agencies are just Vendors that appear as
+    // TaxVendorRef on SalesTaxItem records; qb_sales_tax_agency_list derives
+    // the agency set from that ref). Three sales-tax items (one IL state
+    // single-rate, two CA: state + county) plus one SalesTaxGroup combining
+    // the two CA items — exercises the per-item, per-group, and per-agency
+    // walk paths in qb_sales_tax_liability_report. Three sales-tax codes
+    // (TAX, NON, plus a custom "OUT" out-of-state) covering the typical CPA
+    // workpaper "is this customer taxable?" gate.
+    //
+    // One sales-taxed invoice (Acme, $1,000 + $75 IL state tax) so the
+    // liability report has a non-zero TaxCollected for IL Department of
+    // Revenue against fresh sim — bare qb_sales_tax_liability_report calls
+    // shouldn't return all-zeros.
+    const salesTaxAgencies: StoredEntity[] = [
+      {
+        ListID: "90000010-1234567890",
+        Name: "IL Department of Revenue",
+        FullName: "IL Department of Revenue",
+        IsActive: true,
+        CompanyName: "Illinois Department of Revenue",
+        Phone: "217-782-3336",
+        VendorAddress: {
+          Addr1: "PO Box 19447",
+          City: "Springfield",
+          State: "IL",
+          PostalCode: "62794",
+          Country: "US",
+        },
+        IsVendorEligibleFor1099: false,
+        IsSalesTaxAgency: true,
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "90000011-1234567890",
+        Name: "CA State Board of Equalization",
+        FullName: "CA State Board of Equalization",
+        IsActive: true,
+        CompanyName: "California Department of Tax and Fee Administration",
+        Phone: "800-400-7115",
+        VendorAddress: {
+          Addr1: "PO Box 942879",
+          City: "Sacramento",
+          State: "CA",
+          PostalCode: "94279",
+          Country: "US",
+        },
+        IsVendorEligibleFor1099: false,
+        IsSalesTaxAgency: true,
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+    ];
+    for (const a of salesTaxAgencies) {
+      vendors.set(a.ListID as string, a);
+    }
+
+    // Sales-tax codes — short codes (TAX/NON/OUT) flagged on customers and
+    // line items to indicate taxable status. Sales tax engine in real QB
+    // uses these codes to decide whether to apply tax to a line.
+    const salesTaxCodes: StoredEntity[] = [
+      { ListID: "STC0000001", Name: "TAX", FullName: "TAX", IsActive: true, IsTaxable: true, Desc: "Taxable sales", EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "STC0000002", Name: "NON", FullName: "NON", IsActive: true, IsTaxable: false, Desc: "Non-taxable sales", EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+      { ListID: "STC0000003", Name: "OUT", FullName: "OUT", IsActive: true, IsTaxable: false, Desc: "Out-of-state sales (exempt)", EditSequence: now, TimeCreated: "2024-01-01T00:00:00", TimeModified: now },
+    ];
+    for (const c of salesTaxCodes) this.getStore("SalesTaxCode").set(c.ListID as string, c);
+
+    // Sales-tax items — each carries a TaxRate (decimal percent) and a
+    // TaxVendorRef pointing at the agency that collects it. Real QB stores
+    // these in the same Item table as Service/Inventory/etc. but with
+    // ItemType=SalesTax; this server keeps them in a dedicated ItemSalesTax
+    // store (Item store routing in handleAdd/handleQuery uses entityType
+    // verbatim from the request).
+    const salesTaxItems: StoredEntity[] = [
+      {
+        ListID: "I0000010",
+        Name: "IL State Tax",
+        FullName: "IL State Tax",
+        IsActive: true,
+        ItemDesc: "Illinois state sales tax",
+        TaxRate: 7.5,
+        TaxVendorRef: { ListID: "90000010-1234567890", FullName: "IL Department of Revenue" },
+        SalesTaxReturnLineRef: { FullName: "IL ST-1 Line 4a" },
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "I0000011",
+        Name: "CA State Tax",
+        FullName: "CA State Tax",
+        IsActive: true,
+        ItemDesc: "California state sales tax",
+        TaxRate: 7.25,
+        TaxVendorRef: { ListID: "90000011-1234567890", FullName: "CA State Board of Equalization" },
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "I0000012",
+        Name: "CA County Tax",
+        FullName: "CA County Tax",
+        IsActive: true,
+        ItemDesc: "California Los Angeles County district tax",
+        TaxRate: 2.25,
+        TaxVendorRef: { ListID: "90000011-1234567890", FullName: "CA State Board of Equalization" },
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+    ];
+    for (const i of salesTaxItems) this.getStore("ItemSalesTax").set(i.ListID as string, i);
+
+    // Sales-tax group — bundles multiple SalesTaxItems so a single line on
+    // an invoice (e.g. "CA-LA Combined") collects state + county at once.
+    // Real QB resolves group → component items at posting time; the sim
+    // keeps the group in its own store and the liability report walks
+    // ItemSalesTax (not ItemSalesTaxGroup) so groups are list-only here.
+    const salesTaxGroups: StoredEntity[] = [
+      {
+        ListID: "I0000013",
+        Name: "CA-LA Combined",
+        FullName: "CA-LA Combined",
+        IsActive: true,
+        ItemDesc: "Combined CA state + LA county sales tax",
+        ItemSalesTaxRef: [
+          { ListID: "I0000011", FullName: "CA State Tax" },
+          { ListID: "I0000012", FullName: "CA County Tax" },
+        ],
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+    ];
+    for (const g of salesTaxGroups) this.getStore("ItemSalesTaxGroup").set(g.ListID as string, g);
+
+    // One sales-taxed SalesReceipt against TechStart so the liability report
+    // has a non-trivial row against fresh sim. SalesReceipt rather than
+    // Invoice deliberately — a cash-sale receipt does NOT post to AR, so
+    // adding it does not disturb existing customer-balance / AR-aging /
+    // trial-balance test fixtures (those pin specific values derived from
+    // the open-invoice set). The liability-report walk handles SalesReceipt
+    // identically to Invoice (both contribute SalesTaxTotal when carrying an
+    // ItemSalesTaxRef).
+    // 2025-01-15 deliberately — keeps the receipt outside the 2024-windowed
+    // tests in engagement-profitability (which pin TechStart having zero
+    // revenue Jan-Dec 2024) and the 2025-12 customer-balance-detail window
+    // (which pins TechStart having no activity Dec 2025). The bare
+    // qb_sales_tax_liability_report call defaults to no date filter, so the
+    // receipt still surfaces against fresh sim.
+    const taxedReceipt: StoredEntity = {
+      TxnID: "T0000001-SR",
+      CustomerRef: { ListID: "80000003-1234567890", FullName: "TechStart Solutions" },
+      TxnDate: "2025-01-15",
+      RefNumber: "SR-2001",
+      ItemSalesTaxRef: { ListID: "I0000010", FullName: "IL State Tax" },
+      Subtotal: 1000.00,
+      SalesTaxTotal: 75.00,
+      TotalAmount: 1075.00,
+      DepositToAccountRef: { ListID: "A0000001", FullName: "Checking" },
+      PaymentMethodRef: { FullName: "Check" },
+      Memo: "Taxable widget sale (Phase 17 #77 sales-tax seed)",
+      EditSequence: now,
+      TimeCreated: "2025-01-15T09:00:00",
+      TimeModified: now,
+    };
+    this.getStore("SalesReceipt").set(taxedReceipt.TxnID as string, taxedReceipt);
 
     // Set ID counter beyond seed data
     this.idCounter = 10000;

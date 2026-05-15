@@ -1445,6 +1445,8 @@ export class QBSessionManager {
       "SalesOrder", "CreditCardCharge", "CreditCardCredit",
       // Phase 17 #78 — TimeTracking is a transaction (TxnID + TxnDelRq).
       "TimeTracking",
+      // Phase 17 #77 — SalesTaxPaymentCheck (TxnID + TxnDelRq).
+      "SalesTaxPaymentCheck",
     ].includes(entityType);
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);

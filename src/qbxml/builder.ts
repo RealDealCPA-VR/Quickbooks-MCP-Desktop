@@ -535,6 +535,11 @@ export function buildDeleteRequest(
     // GL effect, no AR/AP movement). The three transaction-type lists across
     // builder.ts / manager.ts / simulation-store.ts must stay in sync.
     "TimeTracking",
+    // Phase 17 #77 — SalesTaxPaymentCheck. Posted via SalesTaxPaymentCheckAddRq;
+    // structurally a check (carries BankAccountRef + PayeeEntityRef + lines)
+    // but its lines reduce sales-tax-item liability rather than expense GL.
+    // Carries TxnID + EditSequence, deletes via TxnDelRq. Three lists in sync.
+    "SalesTaxPaymentCheck",
   ].includes(entityType);
 
   if (isTransaction) {

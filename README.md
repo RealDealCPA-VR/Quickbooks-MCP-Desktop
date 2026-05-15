@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (129 total)
+## Tools (134 total)
 
 ### Customers
 | Tool | Description |
@@ -173,6 +173,28 @@ A `SalesOrder` is the customer-side analog of a `PurchaseOrder` — a committed-
 | `qb_sales_order_update` | Modify an existing sales order. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. `TotalAmount` recomputes after line mods. `isManuallyClosed` flips the order's closed state. |
 | `qb_sales_order_delete` | Delete a sales order. Non-posting, so no customer balance to reverse — pure record removal. Invoices already spawned against the SO are NOT touched. |
 | `qb_sales_order_convert_to_invoice` | Convert a sales order to an invoice. Carries `CustomerRef` + lines (and optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PONumber`). Operator-supplied `invoiceTxnDate` / `invoiceDueDate` / `invoiceRefNumber` / `invoiceMemo` override the carried values. Default flips the order `IsManuallyClosed: true` after the invoice is created — pass `markClosed: false` for partial conversions. |
+
+### Sales Tax
+
+Monthly sales-tax cycle for any client with taxable sales. Five tools cover discovery (codes, items, agencies), the liability report at month-end, and writing the actual payment check to the agency. Real QB models sales tax through three coordinated entities:
+
+- **`SalesTaxCode`** is a 1-3 character flag (TAX / NON / OUT) stamped on customers and line items to indicate **whether** that party or line is taxable. Codes carry NO rate — they're classifiers; the actual `TaxRate` lives on the `SalesTaxItem` paired with the code on a posted transaction.
+- **`ItemSalesTax`** (a.k.a. "sales tax item") carries the actual `TaxRate` (decimal percent) and the `TaxVendorRef` pointing at the agency that collects it. When a transaction posts with an `ItemSalesTaxRef`, real QB applies `TaxRate × taxable-line-subtotal` and posts the result as `SalesTaxTotal` on the txn header.
+- **`ItemSalesTaxGroup`** bundles multiple `SalesTaxItem`s so a single line (e.g. "CA-LA Combined") collects state + county at once. Real QB resolves group → component items at posting time; the liability report walks `ItemSalesTax` (not Group), so groups are list-only here.
+
+Sales-tax agencies are **not a separate entity** in real QB — they're regular `Vendor` records that happen to appear as `TaxVendorRef` on `SalesTaxItem` records. `qb_sales_tax_agency_list` derives the agency set from distinct `TaxVendorRef` values across active `SalesTaxItem`s, optionally enriches each row with the full `Vendor` record, and rolls up the list of tax items collected per agency.
+
+`qb_sales_tax_liability_report` wraps `GeneralSummaryReportQueryRq` with `GeneralSummaryReportType=SalesTaxLiability`. Each row carries `TaxCollected` (sum of header `SalesTaxTotal` on `Invoice` + `SalesReceipt` where the txn carried this tax item, minus `CreditMemo` returns), `TaxPaid` (sum of `SalesTaxPaymentCheckLineRet.Amount` in the window), and `TaxPayable = TaxCollected − TaxPaid`. Per-agency rollups + grand totals included. Simulation mode tracks collection at the **header level only** (`txn.ItemSalesTaxRef` + `txn.SalesTaxTotal`); per-line tax flagging is not modeled — real QB tracks both. For the typical month-end question "what do I owe each agency this month?" the header-level model is sufficient.
+
+`qb_sales_tax_payment_create` wraps `SalesTaxPaymentCheckAddRq` — **distinct from `qb_check_create`** because its lines reduce sales-tax-item liability instead of posting to expense GL. Each line names ONE `SalesTaxItem` + an `Amount`; the sum is drawn from the named bank account. A regular `qb_check_create` posted to a sales-tax-liability account would double-count (real QB's payable account is debited automatically by the payment check; a manual debit on top would over-reduce it). The payment is bank-affecting (default `ClearedStatus: NotCleared`; participates in `qb_uncleared_transactions`) and supports idempotency keys.
+
+| Tool | Description |
+|------|-------------|
+| `qb_sales_tax_code_list` | List sales-tax codes (TAX / NON / OUT etc.). Filters: `nameFilter`, `activeOnly`, `maxReturned`, `listId`. Each row carries `IsTaxable: boolean`. |
+| `qb_sales_tax_item_list` | List sales-tax items + groups. Default fans across `ItemSalesTaxQueryRq` + `ItemSalesTaxGroupQueryRq`; pass `taxItemType: 'Item' \| 'Group'` to scope. Each row carries an `ItemType` discriminator ('SalesTaxItem' or 'SalesTaxGroup'). Items expose `TaxRate` + `TaxVendorRef`. |
+| `qb_sales_tax_agency_list` | List sales-tax agencies (Vendors referenced as `TaxVendorRef` on any active `SalesTaxItem`). Each row carries `agencyName` / `agencyListId` / `taxItems: [{name, listId, taxRate}]` + (default) full `vendorDetails`. Pass `includeVendorDetails: false` to skip the per-agency Vendor lookup. |
+| `qb_sales_tax_liability_report` | Run the Sales Tax Liability report. Returns `rows` (per tax item) + `byAgency` (per agency rollup) + `totals` (grand). Each row: `agencyName / taxItemName / taxRate / taxCollected / taxPaid / taxPayable`. Filters: `fromDate`, `toDate`, `basis`. |
+| `qb_sales_tax_payment_create` | Write a sales-tax payment check (`SalesTaxPaymentCheckAddRq`). Required: `bankAccountName` (or `bankAccountListId`), `payeeName` (or `payeeListId`), `lines: [{salesTaxItemName, amount}]` (at least one). `TotalAmount` derives from the line sum. Idempotency key supported. |
 
 ### Journal Entries
 
@@ -365,7 +387,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (129 tools)     │──│──────────────┐
+                                    │  │ (134 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

@@ -90,6 +90,17 @@ const arrayElements = new Set([
   // TimeTrackingRet rows; a single hit must surface as an array so the
   // tool layer's filter / sort / map paths work uniformly.
   "TimeTrackingRet",
+  // Phase 17 #77 — sales tax surface. SalesTaxCodeQueryRq returns the codes
+  // (TAX / NON / etc.) flagged on customers and transactions; ItemSalesTaxRet
+  // and ItemSalesTaxGroupRet are item subtypes (TaxRate + TaxVendorRef);
+  // SalesTaxPaymentCheckRet is the transaction posted by qb_sales_tax_payment_create
+  // with one SalesTaxPaymentCheckLineRet per agency item being paid down.
+  // Each must surface as an array so single-hit responses work uniformly.
+  "SalesTaxCodeRet",
+  "ItemSalesTaxRet",
+  "ItemSalesTaxGroupRet",
+  "SalesTaxPaymentCheckRet",
+  "SalesTaxPaymentCheckLineRet",
 ]);
 
 // ---------------------------------------------------------------------------

@@ -99,7 +99,8 @@
       "Bash(grep -n \"Name: \\\\\"Acme\\\\\\\\|Name: \\\\\"Globex\\\\\\\\|Name: \\\\\"Initech\\\\\\\\|Maria Sanchez\\\\\\\\|Carla Nguyen\\\\\\\\|Hiroshi\" src/session/simulation-store.ts)",
       "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 20; \"EXIT: $LASTEXITCODE\")",
       "PowerShell(\"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1 | Select-Object -First 10; \"ExitCode: $LASTEXITCODE\")",
-      "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \\(\"---EXIT---: \" + $code\\); $out)"
+      "PowerShell($out = \"\" | & node dist/index.js 2>&1; $code = $LASTEXITCODE; Write-Output \\(\"---EXIT---: \" + $code\\); $out)",
+      "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"exit=$LASTEXITCODE\"; $out | Select-String -Pattern \"Mode:|simulation\" | ForEach-Object { $_.Line })"
     ]
   }
 }
