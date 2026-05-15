@@ -530,6 +530,11 @@ export function buildDeleteRequest(
     // Phase 11 #52 — kept in sync with isTransactionType in simulation-store
     "CreditCardCharge",
     "CreditCardCredit",
+    // Phase 17 #78 — TimeTracking is a transaction in QB (carries TxnID +
+    // EditSequence, deletes via TxnDelRq) even though it's non-posting (no
+    // GL effect, no AR/AP movement). The three transaction-type lists across
+    // builder.ts / manager.ts / simulation-store.ts must stay in sync.
+    "TimeTracking",
   ].includes(entityType);
 
   if (isTransaction) {

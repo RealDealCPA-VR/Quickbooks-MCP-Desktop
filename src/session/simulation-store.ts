@@ -249,16 +249,24 @@ export class SimulationStore {
       );
     }
 
-    // Transaction filters: EntityFilter matches Customer/Vendor/Payee reference
-    // on the transaction. Real QB scopes EntityFilter to CustomerRef on
-    // Invoice/ReceivePayment/Estimate/SalesReceipt/CreditMemo/SalesOrder, to
-    // VendorRef on Bill/PurchaseOrder, to PayeeEntityRef on Check/
-    // BillPaymentCheck/BillPaymentCreditCard/CreditCardCharge/CreditCardCredit.
-    // For the sim, we accept any of the three ref shapes — entities only carry
-    // one. PayeeEntityRef added by Phase 17 #75 (banking primitives) so
-    // qb_check_list({payeeName}) scopes correctly; strict improvement on
-    // BillPaymentCheck/BillPaymentCreditCard list tools that already passed
-    // EntityFilter against their PayeeEntityRef.
+    // Transaction filters: EntityFilter matches the type-appropriate entity
+    // reference on the transaction. Real QB scopes EntityFilter to:
+    //   - EntityRef         on TimeTracking (the WORKER — Employee/Vendor/OtherName)
+    //   - CustomerRef       on Invoice/ReceivePayment/Estimate/SalesReceipt/
+    //                       CreditMemo/SalesOrder
+    //   - VendorRef         on Bill/PurchaseOrder
+    //   - PayeeEntityRef    on Check/BillPaymentCheck/BillPaymentCreditCard/
+    //                       CreditCardCharge/CreditCardCredit
+    // Each transaction type carries exactly ONE party-ref EXCEPT TimeTracking,
+    // which has both EntityRef (the worker who did the work) AND CustomerRef
+    // (the customer billed against). For TimeTracking the EntityFilter target
+    // is the WORKER, so EntityRef must take priority over CustomerRef. For all
+    // other transaction types EntityRef is absent and the chain falls through
+    // to the original priority order. PayeeEntityRef added by Phase 17 #75
+    // (banking primitives); EntityRef-first added by Phase 17 #78 (time
+    // tracking). Customer scoping on TimeTracking is post-filtered at the
+    // tool layer (qb_time_track_list documents this) because real QB's
+    // TimeTrackingQueryRq has no CustomerFilter.
     if (reqData.EntityFilter && typeof reqData.EntityFilter === "object") {
       const ef = reqData.EntityFilter as Record<string, unknown>;
       const targetListIds = ef.ListID
@@ -273,7 +281,7 @@ export class SimulationStore {
         : null;
       if (targetListIds || targetNames) {
         results = results.filter((e) => {
-          const ref = (e.CustomerRef ?? e.VendorRef ?? e.PayeeEntityRef) as
+          const ref = (e.EntityRef ?? e.CustomerRef ?? e.VendorRef ?? e.PayeeEntityRef) as
             | Record<string, unknown>
             | undefined;
           if (!ref) return false;
@@ -4488,6 +4496,11 @@ export class SimulationStore {
       // in QB Desktop (they carry TxnID and route through TxnDelRq for
       // deletion); the prior list was simply incomplete.
       "CreditCardCharge", "CreditCardCredit",
+      // Phase 17 #78 — TimeTracking. Non-posting (no GL / AR / AP effect)
+      // but carries TxnID + EditSequence and deletes via TxnDelRq, so
+      // structurally a transaction. Kept in sync with builder.ts and
+      // manager.ts.
+      "TimeTracking",
     ].includes(entityType);
   }
 
@@ -5128,6 +5141,87 @@ export class SimulationStore {
     ];
     for (const e of employeeSeeds) {
       this.getStore("Employee").set(e.ListID as string, e);
+    }
+
+    // Phase 17 #78 — TimeTracking seed. Five entries: three billable hours
+    // logged by Alice (employee 80000020) against Acme + Globex via the
+    // Consulting Services item, one non-billable internal hour by Bob, and
+    // one hours-only entry with no customer/item (just a payroll-tracking
+    // timesheet line). Mix of dates within the same week so list filters
+    // (date range, entityName, billable) have something to exercise.
+    const timeTrackingSeeds: StoredEntity[] = [
+      {
+        TxnID: "T0000001-TT",
+        TxnNumber: 1,
+        TxnDate: "2024-11-04",
+        EntityRef: { ListID: "80000020-1234567890", FullName: "Alice Johnson" },
+        CustomerRef: { ListID: "80000001-1234567890", FullName: "Acme Corporation" },
+        ItemServiceRef: { ListID: "I0000001", FullName: "Consulting Services" },
+        Duration: "PT8H0M0S",
+        Notes: "Q4 audit fieldwork — opening meeting + initial document review",
+        IsBillable: true,
+        BillableStatus: "Billable",
+        EditSequence: now,
+        TimeCreated: "2024-11-04T17:30:00",
+        TimeModified: now,
+      },
+      {
+        TxnID: "T0000002-TT",
+        TxnNumber: 2,
+        TxnDate: "2024-11-05",
+        EntityRef: { ListID: "80000020-1234567890", FullName: "Alice Johnson" },
+        CustomerRef: { ListID: "80000001-1234567890", FullName: "Acme Corporation" },
+        ItemServiceRef: { ListID: "I0000001", FullName: "Consulting Services" },
+        Duration: "PT6H30M0S",
+        Notes: "Q4 audit fieldwork — AR confirmations + revenue testing",
+        IsBillable: true,
+        BillableStatus: "Billable",
+        EditSequence: now,
+        TimeCreated: "2024-11-05T17:30:00",
+        TimeModified: now,
+      },
+      {
+        TxnID: "T0000003-TT",
+        TxnNumber: 3,
+        TxnDate: "2024-11-06",
+        EntityRef: { ListID: "80000020-1234567890", FullName: "Alice Johnson" },
+        CustomerRef: { ListID: "80000002-1234567890", FullName: "Global Industries" },
+        ItemServiceRef: { ListID: "I0000001", FullName: "Consulting Services" },
+        Duration: "PT4H15M0S",
+        Notes: "Tax planning consultation — entity restructuring options",
+        IsBillable: true,
+        BillableStatus: "Billable",
+        EditSequence: now,
+        TimeCreated: "2024-11-06T15:00:00",
+        TimeModified: now,
+      },
+      {
+        TxnID: "T0000004-TT",
+        TxnNumber: 4,
+        TxnDate: "2024-11-06",
+        EntityRef: { ListID: "80000021-1234567890", FullName: "Bob Martinez" },
+        Duration: "PT2H0M0S",
+        Notes: "Internal admin — staff meeting + CPE webinar",
+        IsBillable: false,
+        BillableStatus: "NotBillable",
+        EditSequence: now,
+        TimeCreated: "2024-11-06T17:00:00",
+        TimeModified: now,
+      },
+      {
+        TxnID: "T0000005-TT",
+        TxnNumber: 5,
+        TxnDate: "2024-11-07",
+        EntityRef: { ListID: "80000022-1234567890", FullName: "Carla Nguyen" },
+        Duration: "PT8H0M0S",
+        Notes: "Standard timesheet entry — no client allocation",
+        EditSequence: now,
+        TimeCreated: "2024-11-07T17:30:00",
+        TimeModified: now,
+      },
+    ];
+    for (const tt of timeTrackingSeeds) {
+      this.getStore("TimeTracking").set(tt.TxnID as string, tt);
     }
 
     // Set ID counter beyond seed data

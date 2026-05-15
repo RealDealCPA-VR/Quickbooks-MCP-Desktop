@@ -86,6 +86,10 @@ const arrayElements = new Set([
   // a single hit must still surface as an array for the tool layer's filter
   // path to work uniformly.
   "AttachableRet",
+  // Phase 17 #78 — time tracking. TimeTrackingQueryRq returns N
+  // TimeTrackingRet rows; a single hit must surface as an array so the
+  // tool layer's filter / sort / map paths work uniformly.
+  "TimeTrackingRet",
 ]);
 
 // ---------------------------------------------------------------------------

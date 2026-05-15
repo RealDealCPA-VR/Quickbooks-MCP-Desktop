@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (120 total)
+## Tools (124 total)
 
 ### Customers
 | Tool | Description |
@@ -185,6 +185,17 @@ Each line accepts an optional `entityName` to attach a Customer / Vendor / Emplo
 | `qb_employee_make_inactive` | Deactivate an employee by ListID + EditSequence (sets IsActive: false). Reversible via `qb_employee_update { isActive: true }`. |
 | `qb_employee_delete` | Hard-delete an employee by ListID. Fails for employees with paycheck/timesheet history — use `qb_employee_make_inactive` instead. |
 
+### Time Tracking
+
+`TimeTracking` records ONE work session — a date, a worker (`EntityRef` — Employee / Vendor / OtherName), an optional customer/job (line-level — TimeTracking is the one transaction type that carries BOTH `EntityRef` and `CustomerRef`), an optional service item, and a `Duration` (ISO 8601 PT-H-M-S). The entry is **non-posting** — no GL effect, no AR/AP movement. Downstream consumers are payroll (when `PayrollItemWageRef` is set) and the Time/Costs dialog on the invoice form (when `IsBillable: true`).
+
+QB's `TimeTrackingQueryRq` is the only transaction-type wire request with no `CustomerFilter` at any qbXML version — customer scope on the list tool is applied as a POST-FILTER in the tool layer (documented on the tool description; matters when combined with `paginate: true`, which may miss matches beyond the page). The list tool emits a derived `hours` field (decimal hours parsed from `Duration` via `parseDurationToHours`) on every row for convenience — `qb_engagement_profitability` is the first cross-tool consumer of that helper.
+
+| Tool | Description |
+|------|-------------|
+| `qb_time_track_list` | List/search TimeTracking entries with filters for `txnId`, worker (`entityName` / `entityListId` — server-side `EntityFilter`), customer (`customerName` / `customerListId` — POST-FILTERED), date range, and `billableOnly` (POST-FILTERED). Each row carries the parent fields plus a derived `hours` decimal. Set `paginate: true` for iterator pagination (auto-defaults `maxReturned` to 500). |
+| `qb_time_track_add` | Record a new TimeTracking entry. Requires a worker (`entityName` / `entityListId`) and either `hours` (decimal — converted to ISO `PT-H-M-S`) or `duration` (pre-formatted ISO). Optional `customerName` / `customerListId` attaches the work to a job; optional `itemServiceName` / `itemServiceListId` names what to bill as; `billable: true` flips `IsBillable` / `BillableStatus` for downstream invoice flow via the Time/Costs dialog. Optional `payrollItemWageName` links to payroll (live QB requires a payroll subscription). Read-only sessions reject with `9001`. Optional `idempotencyKey`. |
+
 ### Reference Lists
 
 Read-only lookups for the supporting types that transactions reference by `FullName` or `Name`. Operators need these to discover valid values to pass into invoice/bill/payment creation (the Class on a line, the Terms on an invoice header, the PaymentMethod on a receive-payment, etc.). New entries are defined in QuickBooks itself, not via this server.
@@ -227,6 +238,19 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 | `qb_1099_detail` | Per-transaction breakdown for 1099 prep — same Bill + Check walk as `qb_1099_summary` but returns each transaction with `txnId` / `txnDate` / `refNumber` / `total` / `memo` / `lines` (per-line `accountName` + `amount` + `memo`). Use to verify the summary, drill into a specific vendor (`vendorListId` or `vendorFullName`), or export to a 1099 prep spreadsheet. No threshold filter (every transaction is surfaced regardless of vendor total). Empty result when the scope filter matches nothing is a structured success (not an error). Defaults to last completed tax year. Card payments excluded per IRS rule. |
 | `qb_w2_summary` | Per-employee W-2 summary via `PayrollSummaryReportQueryRq` (`ReportType=EmployeeWagesTaxesAdjustments`). Maps YTD totals onto W-2 box numbers: `box1_wagesTipsOtherComp` / `box2_federalIncomeTaxWithheld` / `box3_socialSecurityWages` / `box4_socialSecurityTaxWithheld` / `box5_medicareWages` / `box6_medicareTaxWithheld` / `box16_stateWages` / `box17_stateIncomeTax` (state boxes optional — surface only when state data is present). Defaults `taxYear` to last completed year (current year − 1). Pre-flight edition probe rejects Pro builds (without Plus) with **statusCode 9003**; empty-result rejects with **9004** (payroll subscription required or not active — distinguishes "subscription off" from "no matching employees"). SSNs masked to last 4 ("XXX-XX-1234") matching real QB's printed payroll-summary behavior. Scope to a single employee via `employeeFullName` / `employeeListId`. Wire-side period is always Jan 1 → Dec 31 of the resolved year — the W-2 box model is inherently annual. **Boxes 7-15 / 18-20 (SS tips, allocated tips, dep care, codes A-W, box 14 other, local taxes) are NOT surfaced** in this first cut — those require per-payroll-item box mapping that the SDK doesn't expose. For strict box-by-box reporting use QB Desktop's W-2 wizard. **Live-mode note:** PayrollSummaryReport's row-tree adapter has not been pinned against a real QB Desktop yet — verified-by-construction structurally; if QBXMLRP2 surfaces `statusCode -1` the fix is a child-order tweak in `buildPayrollSummaryReportRequest` (same class as the 2026-05-09 #37 P&L bug). |
 | `qb_raw_query` | Execute raw QBXML queries |
+
+### Workpaper Composites
+
+High-level composites that bundle multiple report + entity primitives into a single tool call — the workflows a CPA fires at the start of a tax return or a monthly job-cost review. Pure composites over existing session primitives (`queryEntity` / `queryTransactions` / `runReport` / `runCustomDetailReport` / `runPayrollSummaryReport` / `getHostInfo`); no new wire types, no parser changes.
+
+All composites use the same **fail-soft section contract**: each section is either `sectionStatus.<name>: 'ok'` (with its payload under `sections.<name>`) or `'error'` (with `sections.<name>.error: {...}`) or `'skipped'` (when a section toggle is off, or — for `qb_client_packet` payroll — when the QB edition / subscription can't surface the data). A single section's failure does NOT poison the rest of the response. The only non-fail-soft path per tool is the lookup that the whole composite depends on (`AccountQueryRq` for `qb_client_packet`; `CustomerQueryRq` for `qb_engagement_profitability`).
+
+Synthetic statusCodes surfaced by the payroll section: `9003` (edition lacks payroll surface — Pro), `9004` (subscription inactive or no employees with YTD activity).
+
+| Tool | Description |
+|------|-------------|
+| `qb_client_packet` | Tax-prep workpaper bundle for one `.qbw` file over `taxYear` (Jan 1 → Dec 31). Sections: Trial Balance (via `buildTrialBalance` + 5 supporting queries; cross-checks reconcile BS = Liab+Eq, P&L NetIncome ≡ BS NetIncome, AR / AP ≡ aging totals), General Ledger (per-account postings + RunningBalance via `buildGeneralLedgerSection`; defaults to `glScope: 'PnLOnly'` — ~5–15 accounts — pass `'AllAccounts'` for the full chart), Bank Reconciliation Discrepancy (fans out across every Bank + CreditCard account; per-account errors land in that account's entry), Payroll Summary (W-2 box mapping per employee; edition-gated via `9003` / subscription-gated via `9004`), Fixed Asset Detail (per-FixedAsset-account postings + running balance — Form 4562 input; empty `accounts` array against a service-business chart is NOT an error). Optional `customerListId` / `customerName` surfaces a label at the top of the packet but does NOT filter the underlying reports (the `.qbw` file IS the client). Five section toggles all default true; `bankReconDiscrepancySinceDate` defaults to start of `taxYear`. Read-side. |
+| `qb_engagement_profitability` | Per-engagement (customer/job) profitability rollup over a date window. Sections: Revenue (Invoice + SalesReceipt − CreditMemo header totals, scoped server-side via `EntityFilter`), Time (TimeTracking entries POST-FILTERED by `CustomerRef`; rolled up `byWorker` + `byServiceItem`, billable vs non-billable split, hours derived from `Duration` via `parseDurationToHours`), Reimbursable Expenses (Bill / Check / CreditCardCharge `ExpenseLineRet` + `ItemLineRet` filtered by LINE-LEVEL `CustomerRef` — headers don't carry job-costing scope; bills can split across multiple jobs and only the matched lines count). Plus a derived `summary` block (`revenue` / `reimbursableExpenseCost` / `grossProfit` / `marginPct` / `billableHours` / `totalHours` / `revenuePerHour` / `billableRate`) emitted ONLY when every queried section is `'ok'` — partial summary would silently misrepresent profitability. `customerListId` or `customerName` REQUIRED (the engagement IS the customer); `fromDate` + `toDate` REQUIRED (engagements have explicit windows; no defaults; date inversion rejects with `3120`). Three section toggles all default true. Read-side. |
 
 ### Attachments
 
@@ -323,7 +347,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (120 tools)     │──│──────────────┐
+                                    │  │ (124 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

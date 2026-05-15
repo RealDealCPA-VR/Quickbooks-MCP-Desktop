@@ -1443,6 +1443,8 @@ export class QBSessionManager {
       "PurchaseOrder", "JournalEntry", "Deposit", "Transfer", "Check",
       "BillPaymentCheck", "BillPaymentCreditCard", "ReceivePayment",
       "SalesOrder", "CreditCardCharge", "CreditCardCredit",
+      // Phase 17 #78 — TimeTracking is a transaction (TxnID + TxnDelRq).
+      "TimeTracking",
     ].includes(entityType);
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);
