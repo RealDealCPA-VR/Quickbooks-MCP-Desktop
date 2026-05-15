@@ -1,25 +1,47 @@
 # Handoff State
 
-_Last updated: 2026-05-15. **README sync landed.** Tool count surfaces in [README.md](README.md) bumped 120 → 124 in two places (`## Tools (X total)` header + architecture-diagram inset). Two new sections added: `### Time Tracking` (between Employees and Reference Lists, documents `qb_time_track_list` / `qb_time_track_add` + the non-posting nature + `TimeTrackingQueryRq`'s missing-`CustomerFilter` post-filter caveat + the derived `hours` decimal) and `### Workpaper Composites` (between Reports & Queries and Attachments, documents `qb_client_packet` + `qb_engagement_profitability` + the shared fail-soft `sectionStatus` contract + the synthetic `9003`/`9004` payroll codes). Architecture diagram structure unchanged (no new layers). True source-of-truth tool count is **124** (enumerated by counting `server.tool('qb_...')` calls in `src/tools/` — prior handoffs claimed 123, off by one). No source changes; build + tests + simulation banner unchanged from #70 closure._
+_Last updated: 2026-05-15. **Phase 17 #76 sales orders shipped.** 5 new tools in fresh [src/tools/sales-orders.ts](src/tools/sales-orders.ts) — `qb_sales_order_list` / `_create` / `_update` / `_delete` / `_convert_to_invoice`. Pure composite over existing generic add/mod/del/query primitives; no new wire types, no manager methods, no parser changes. The four sync points (builder `isTransaction` / manager `isTransaction` / sim-store `isTransactionType` / parser `arrayElements` for `SalesOrderRet` + `SalesOrderLineRet`) were already in place from prior work, so this was a tools-layer task only. Sim store gained two strict improvements: `computeTotals` SalesOrder branch (`TotalAmount = lineSum`, mirrors PurchaseOrder) + post-line-mod recompute allow-list extension. One seeded SalesOrder (`S0000001-SO` against Acme, $3,500 two-line) for fresh-sim list/convert exercise. 35 new tests across 6 layers — all green. Tool count 124 → 129; 1116 → 1151 tests green. README sync done: new `### Sales Orders` section between Purchase Orders and Journal Entries, architecture diagram inset bumped in both spots. Build + test + simulation banner clean._
 
 ## Last Session Summary
 
-- **README sync — DONE.** Four edits total: tool count `120 → 124` at [README.md:12](README.md#L12) (`## Tools (124 total)`) + [README.md:350](README.md#L350) (architecture diagram `(124 tools)`); new `### Time Tracking` section at [README.md:188-198](README.md#L188-L198) covering `qb_time_track_list` + `qb_time_track_add` with the intro paragraph pinning the non-posting nature + the post-filter caveat on customer scope (QB's `TimeTrackingQueryRq` has no `CustomerFilter` at any qbXML version — same caveat the tool description carries); new `### Workpaper Composites` section at [README.md:242-253](README.md#L242-L253) covering `qb_client_packet` + `qb_engagement_profitability` with the intro paragraph pinning the shared fail-soft `sectionStatus: 'ok' | 'error' | 'skipped'` contract + synthetic `9003`/`9004` payroll status codes.
+- **#76 sales orders — DONE.** 5 tools shipped. Pattern mirrors `estimates.ts` (closest convert-to-invoice analog) + `purchase-orders.ts` (closest IsManuallyClosed analog) + `deposits.ts` (latest CRUD with paginate + idempotency).
+  - `qb_sales_order_list` — customer / txnId / refNumber / date filters; paginate auto-defaults maxReturned to 500; includeLineItems opt-in (Phase 10 #41 strips by default).
+  - `qb_sales_order_create` — customer + lines (Rate-based, mirrors invoice/estimate) + optional dueDate / poNumber / isManuallyClosed / memo + idempotency.
+  - `qb_sales_order_update` — txnId + editSequence + header fields + replacement lines (wholesale) + IsManuallyClosed flip.
+  - `qb_sales_order_delete` — TxnDelRq; pure record removal (non-posting, no customer-balance reversal).
+  - `qb_sales_order_convert_to_invoice` — read source with `IncludeLineItems:true` → InvoiceAdd with CustomerRef + carried lines + optional ClassRef/TermsRef/SalesRepRef/PONumber header refs → mark source `IsManuallyClosed: true` (default; pass `markClosed:false` for partial conversions). Idempotent replay skips the mark-closed flip (original call already ran it; re-running would fail with 3170).
 
-- **Tool count discrepancy resolved.** Source-of-truth enumeration via `[regex]::Matches($c, "server\.tool\(\s*['""]([a-z0-9_]+)['""]")` against [src/tools/*.ts](src/tools) yields **124 distinct registered tools** (every `server.tool` call across 26 tool files; 124 occurrences, 124 unique names — no duplicates). Prior handoffs claimed 122 → 123 with #70; the actual jump was 123 → 124. The off-by-one likely entered during one of #71/#75/#78's tool-count math.
+- **Sim improvements (strict, paired with #76):**
+  - [src/session/simulation-store.ts](src/session/simulation-store.ts) `computeTotals` now derives `SalesOrder.TotalAmount = sum(SalesOrderLineRet.Amount)` — mirrors PurchaseOrder (non-posting, no Subtotal/SalesTaxTotal split in sim's first cut).
+  - `handleMod`'s post-line-mod recompute allow-list now includes SalesOrder so partial line edits re-derive TotalAmount correctly.
+  - One SalesOrder seed (`S0000001-SO` / Acme / two lines / $3,500 / `IsManuallyClosed: false`) added to `seedData()` for parity with deposits/checks/transfers/time-tracking seeds.
 
-- **No source changes this session.** No new files, no Edits to `src/`, no test additions. Build state inherited from #70 closure — `npm run build` clean, `npm test` green at 47 files / 1116 tests, `node dist/index.js` boots with `Mode: simulation` banner.
+- **35 new tests in [tests/sales-orders.test.ts](tests/sales-orders.test.ts) across 6 layers.** Coverage: sim TotalAmount derivation + non-posting invariant on Acme `Balance`; list filter matrix; create happy paths + customer-ref validation + idempotency (replay + 9002 conflict) + read-only 9001; update header-only + line replacement + IsManuallyClosed flip + stale editSequence 3170 + unknown TxnID 500 + 9001; delete happy + 500 + 9001; convert-to-invoice happy (lines map + source marks closed + customer AR moves by BalanceRemaining) + override-wins + `markClosed:false` leaves SO open + unknown source + source-without-CustomerRef defensive guard + idempotency replay skips mark-closed flip + 9002 cross-source conflict + 9001.
+
+- **README sync done.** Tool count `124 → 129` in both spots (`## Tools (129 total)` header + architecture diagram `(129 tools)` inset). New `### Sales Orders` section between Purchase Orders and Journal Entries — explains the customer-side analog framing, the Estimate-vs-SalesOrder distinction (quotes vs committed-but-not-fulfilled), the convert-to-invoice contract, plus a 5-row tool table.
+
+- **src/index.ts** got the import + register call + a new bullet under the Transactions section of the instructions block (mirrors the existing purchase-order line) + extension of the idempotency-keyed-tools enumeration with `qb_sales_order_create, qb_sales_order_convert_to_invoice` + a new line in the top-of-file Capabilities comment.
+
+- **Tool count enumeration:** re-counted via `Grep -p "server\.tool\(" src/tools` → 129 distinct `server.tool` calls across 27 files. Matches the README header.
 
 ## Verify Before Continuing
 
 Re-run if the tree has been touched (skip if next session starts within hours):
 
 - [ ] `npm run build` → exit 0 (tsc clean).
-- [ ] `npm test` → `Test Files 47 passed | Tests 1116 passed`.
+- [ ] `npm test` → `Test Files 48 passed | Tests 1151 passed`.
 - [ ] `"" | & node dist/index.js` → exit 0, `Mode: simulation` printed.
-- [ ] **(Windows + QB) First live exercise of #70.** Connect to `VR Tax & Consulting Inc..qbw`. Run `qb_engagement_profitability({ customerName: "<one active tax-prep client>", fromDate: "2024-01-01", toDate: "2024-12-31" })` and confirm: (1) `success: true`; (2) `customer` carries `fullName` + `balance`; (3) `sections.revenue.netRevenue` matches the operator's mental model for that client; (4) `sections.time.totalHours` reflects any TimeTracking entries logged against that customer (likely zero unless the operator has been logging time — most CPAs don't, so this is mostly empty); (5) `sections.reimbursableExpenses.lines` surfaces any job-costed Bill/Check expense lines (also commonly empty for most clients); (6) `summary` block emits when all three sections succeed. The composite layers EIGHT different `*QueryRq` wire types — any schema-order class of bug from any of them will surface here (the same risk #71 carries, now wider).
-- [ ] **(Windows + QB) Carried — #78 time tracking first live exercise.** Run `qb_time_track_add` against a real employee + service item; capture envelope via `QB_DEBUG_QBXML=1` if `TimeTrackingAddRq` rejects with statusCode -1 (schema-order class of bug). Canonical child order: `TxnDate → EntityRef → CustomerRef → ItemServiceRef → Duration → ClassRef → PayrollItemWageRef → Notes → IsBillable → BillableStatus`.
-- [ ] **(Windows + QB) Carried — #71 qb_client_packet first live exercise.** Six different *QueryRq wire types.
+- [ ] **(Windows + QB) #76 first live exercise.** Connect to `VR Tax & Consulting Inc..qbw`. Run through the full SO lifecycle against an active customer:
+  1. `qb_sales_order_create({ customerName: "<active client>", refNumber: "TEST-SO-001", lines: [{ itemName: "<seeded service item>", quantity: 5, rate: 100 }, { itemName: "<another service>", quantity: 1, rate: 250 }] })` — confirm `success: true`, `salesOrder.TotalAmount === 750`, two `SalesOrderLineRet` rows present with TxnLineIDs.
+  2. `qb_sales_order_list({ customerName: "<active client>", includeLineItems: true })` — confirm the new SO surfaces with the lines intact.
+  3. `qb_sales_order_update({ txnId, editSequence, memo: "live-test updated", isManuallyClosed: false })` — confirm IsManuallyClosed stays false; capture new editSequence.
+  4. `qb_sales_order_convert_to_invoice({ salesOrderTxnId: <txnId>, markClosed: false })` — confirm `success: true`, `salesOrderMarkedClosed: false`, new invoice carries the same two lines + the SO's RefNumber. Verify the SO remains open via a follow-up list call (partial-conversion path).
+  5. `qb_sales_order_convert_to_invoice({ salesOrderTxnId: <txnId> })` — confirm the second invoice posts AND `salesOrderMarkedClosed: true`. (Real QB allows multiple invoices against one SO; whether the operator wants this in their workflow is separate.)
+  6. `qb_sales_order_delete({ txnId })` — confirm `success: true`. Invoices spawned against the SO should NOT be touched (per the tool description).
+  - **If a schema-order class of bug surfaces (statusCode -1 from QBXMLRP2)**, capture envelope via `QB_DEBUG_QBXML=1` and pin canonical child order in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts) the way #37 did for `GeneralSummaryReportQueryRq`. The JS key insertion order in the tool layer is CustomerRef → TxnDate → RefNumber → DueDate → PONumber → IsManuallyClosed → Memo → SalesOrderLineAdd (matches estimate / PO emit patterns which are already live-validated).
+- [ ] **(Windows + QB) Carried — #70 `qb_engagement_profitability` first live exercise** against `VR Tax & Consulting Inc..qbw`. Six different `*QueryRq` wire types layered.
+- [ ] **(Windows + QB) Carried — #78 time tracking first live exercise.** TimeTrackingAddRq canonical child order: `TxnDate → EntityRef → CustomerRef → ItemServiceRef → Duration → ClassRef → PayrollItemWageRef → Notes → IsBillable → BillableStatus`.
+- [ ] **(Windows + QB) Carried — #71 `qb_client_packet` first live exercise.** Six different `*QueryRq` wire types.
 - [ ] **(Windows + QB) Carried — #75 banking primitives first live exercise.** `qb_deposit_create` / `qb_check_create` / `qb_transfer_create` + list / delete companions.
 - [ ] **(Windows + QB) Carried — #69 `qb_tax_line_mapping` + #68 `qb_trial_balance_export` first live exercises** against `VR Tax & Consulting Inc..qbw`.
 - [ ] **(Windows + QB) Carried — Phase 18 #85 / #86 first live exercises** of `qb_closing_date_get` / `qb_closing_date_set` (9005 + UI navigation) / all five MCP prompts in Claude Desktop's `/` picker.
@@ -28,40 +50,48 @@ Re-run if the tree has been touched (skip if next session starts within hours):
 
 ## Next Task
 
-**Operator picks next.** With #70 closed + README sync done, the highest-leverage remaining items in roughly descending operator-value order:
+**Operator picks next.** With #76 closed the highest-leverage remaining items in roughly descending operator-value order:
 
-- **#76 sales orders** (Phase 17) — `qb_sales_order_create` / `_list` / `_update` / `_delete` / `_convert_to_invoice`. Same shape as #75 banking primitives — pure composite over existing primitives. Sales orders are tracked in `isTransactionType` already.
-
-- **#77 sales tax / #80 inventory adjustments / #81 statement charges** (Phase 17) — remaining domain coverage gaps.
-
+- **#77 sales tax** (Phase 17) — `qb_sales_tax_liability_report` / `qb_sales_tax_payment_create` / `qb_sales_tax_code_list` / `qb_sales_tax_item_list` / `qb_sales_tax_agency_list`. Monthly necessity for any client with taxable sales.
+- **#80 inventory adjustments** (Phase 17) — `qb_inventory_adjustment_add` / `_list`. `InventoryAdjustmentAddRq` / `InventoryAdjustmentQueryRq`.
+- **#81 statement charges** (Phase 17) — `qb_statement_charge_add` / `_list` / `_update` / `_delete`. Service-business time-and-materials billing without a formal invoice.
+- **#79 vehicle mileage** (Phase 17) — `qb_vehicle_mileage_add` / `_list` / `qb_vehicle_list`. Tax-practice staple (Schedule C / Form 4562).
 - **Phase 13–14 coverage gaps** — DataExt (#61), sub-customer (#62), memo search (#63), dry-run (#64), better errors (#65), audit log (#66 — Enterprise-only).
 
 ## Context Notes
 
-- **Authoritative tool count is 124** (not 123 as prior handoffs claimed). Confirmed by enumerating `server.tool('qb_...')` calls in [src/tools/*.ts](src/tools) — 124 distinct names. README + architecture diagram now both reflect 124. If a future session adds tools, recount the same way (`Get-ChildItem src\tools -Filter *.ts | Select-String "server\.tool\(\s*[`"']qb_"` in PowerShell, or grep equivalent) — don't blindly increment from a HANDOFF figure.
+- **Authoritative tool count is 129** (re-enumerated via `Grep -p "server\.tool\(" src/tools` → 129 distinct calls across 27 files). README + architecture diagram both reflect 129. Don't blindly increment from a HANDOFF figure — re-grep before bumping.
 
-- **README structure landed:** Time Tracking section sits between Employees and Reference Lists; Workpaper Composites section sits between Reports & Queries and Attachments. Architecture diagram (the ASCII box) is unchanged — only the `(124 tools)` inset string was edited. If you add a new tool category section, mirror the existing pattern: optional intro paragraph(s) explaining the underlying QB primitive's quirks, then a `| Tool | Description |` table.
+- **#76 was infrastructure-already-wired.** The SalesOrder type was in `isTransactionType` ([src/session/simulation-store.ts](src/session/simulation-store.ts):4489), the parallel `isTransaction` array in [src/qbxml/builder.ts](src/qbxml/builder.ts):529 and [src/session/manager.ts](src/session/manager.ts):1445, plus `SalesOrderRet` / `SalesOrderLineRet` registered in parser `arrayElements` ([src/qbxml/parser.ts](src/qbxml/parser.ts):71-72) — all from prior work. Only the tools layer + a `computeTotals` branch + a `handleMod` recompute allow-list entry + one seed were missing. **The three transaction-type lists must stay in sync** across builder.ts / manager.ts / simulation-store.ts; CLAUDE.md calls this out as the canonical invariant.
 
-- **README intro paragraphs for both new sections deliberately mirror the tool descriptions** — repeating the non-obvious gotchas (TimeTrackingQueryRq's missing CustomerFilter, fail-soft sectionStatus contract, line-level CustomerRef on bills/checks for job-costing) so a reader skimming the README catches the same warnings without drilling into the tool description string in source. Pattern to follow for future composite tools.
+- **README structure landed:** Sales Orders section sits between Purchase Orders and Journal Entries. Architecture diagram (the ASCII box) inset bumped 124 → 129 in two places. Future-tool category sections should mirror this pattern: framing paragraphs (often calling out distinctions from sibling types — Estimate vs SalesOrder, Bill vs Check, etc.), then a `| Tool | Description |` table.
 
-- **Carried gotchas (unchanged from #70's handoff — all still apply):**
-  - **#70 `IncludeLineItems: true` is LOAD-BEARING** for any tool that walks line-level data on Bill/Check/CreditCardCharge. Both sim ([src/session/simulation-store.ts](src/session/simulation-store.ts) `handleQuery` ~line 425) and real QB strip `*LineRet` from query responses without it. Initial #70 cut omitted the flag and every reimbursable-expense test failed with `lineCount: 0`. Pinned in 4 tests.
-  - **#70 customer scope on time is POST-FILTERED.** QB's `TimeTrackingQueryRq` has NO `CustomerFilter` at any qbxml version. Pull the wire response with `TxnDateRangeFilter` only, then filter in-process by `CustomerRef`. `qb_engagement_profitability` does NOT paginate (capped at MAX_ROWS_PER_CALL=500 per fetch).
-  - **#70 customer scope on Bill/Check/CCC is LINE-LEVEL.** Bills carry `VendorRef` on the header (whom you paid), not `CustomerRef` (which job it was for). Job-costing tags ride on each line — `ExpenseLineRet[i].CustomerRef` and `ItemLineRet[i].CustomerRef`. The matched-line total is what counts toward THIS customer's engagement, NOT the parent bill total.
-  - **#70 summary OMITTED when any section is error or any toggle off.** Partial profitability silently misreports gross profit. Caller MUST branch on `sectionStatus` to know whether `summary` is trustworthy.
-  - **#70 customer lookup is the one non-fail-soft path.** Unknown customer / `CustomerQueryRq` failure fails the whole tool with `'pre-flight failed:'` prefix.
-  - **#70 first cross-tool consumer of `parseDurationToHours`** from [src/tools/time-tracking.ts](src/tools/time-tracking.ts). Imports directly. Future tools that compute hours-from-Duration should follow suit — don't re-implement the parser.
-  - **#70 `customerRefMatches` accepts EITHER ListID OR FullName match.** ListID match is the canonical form (immutable identifier); FullName is a fallback for stores that happen to have only the name on the ref.
-  - **#78 EntityFilter priority reorder** — `handleQuery` does `EntityRef ?? CustomerRef ?? VendorRef ?? PayeeEntityRef`. TimeTracking is the ONLY transaction type with both EntityRef and CustomerRef populated; EntityFilter on TimeTracking targets the WORKER per QB SDK.
-  - **#78 Duration is ISO 8601 PT-H-M-S only.** No day component. Empty `PT` rejected.
-  - **#78 IsBillable + BillableStatus co-emission.** Both fields set on add when `billable` arg is supplied; both absent when unset.
-  - **#71 fail-soft contract** — `sections.<name>` is either the success payload OR an `{ error: {...} }` block; `sectionStatus.<name>` is `'ok' | 'skipped' | 'error'`. #70 follows the same pattern.
+- **The convert-to-invoice idempotency pattern is now a 2x example.** Both `qb_estimate_convert_to_invoice` and `qb_sales_order_convert_to_invoice` skip the source-mark flip on idempotent replay — the original call already ran it (or was told not to), and re-running would fail with statusCode 3170 because the source's EditSequence is now stale. Future convert-style composites (e.g. a possible PO → Bill / Receive Inventory flow) should follow the same skip-on-replay contract. Pinned in [tests/sales-orders.test.ts](tests/sales-orders.test.ts) "idempotency replay returns the original invoice WITHOUT re-attempting the markClosed flip".
+
+- **Sales-side `Rate` vs purchase-side `Cost`** — keep these straight. Sales (Invoice / Estimate / SalesReceipt / CreditMemo / SalesOrder) use `Rate` per unit on lines. Purchase (PO) uses `Cost`. The element name matters at the wire layer; QB will reject `<Rate>` on a `PurchaseOrderLineAdd` and `<Cost>` on a `SalesOrderLineAdd`. Both compute Amount = qty × per-unit-price internally.
+
+- **`IsManuallyClosed` is the SalesOrder analog of Estimate's `IsAccepted`.** Both are write fields on the header that signal "this committed thing is now done from the originating-document's POV" — flip true after a successful convert-to-invoice; expose on Add + Mod; PO has the same flag with the same semantics on the AP side. Real QB also tracks derived `IsFullyInvoiced` flags (header + per-line) that derive from line-level invoicing state; this server's first cut doesn't model that derivation — invoices and sales orders aren't linked at the line-ID level. If a future task needs accurate `IsFullyInvoiced` tracking, that would be the place to start.
+
+- **Carried gotchas (unchanged from prior handoffs — all still apply):**
+  - **#76 SalesOrder is non-posting** — `Customer.Balance` does NOT move on SO add or delete. The customer balance only moves when an invoice is created against the order (via convert or a manual `qb_invoice_create`).
+  - **#76 convert idempotency skip-on-replay** — same pattern as estimate convert. The first call posts the invoice + flips IsManuallyClosed. Replay returns the cached invoice without re-attempting the flip (source's EditSequence is stale, would 3170).
+  - **#70 `IncludeLineItems: true` is LOAD-BEARING** for any tool that walks line-level data on Bill/Check/CreditCardCharge/SalesOrder. Both sim ([src/session/simulation-store.ts](src/session/simulation-store.ts) `handleQuery` ~line 425) and real QB strip `*LineRet` from query responses without it. #76's convert tool reads SalesOrderLineRet via `IncludeLineItems: true` per the comment at the call site.
+  - **#70 customer scope on time is POST-FILTERED.** QB's `TimeTrackingQueryRq` has NO `CustomerFilter` at any qbxml version.
+  - **#70 customer scope on Bill/Check/CCC is LINE-LEVEL.** Bills carry `VendorRef` on the header (whom you paid), not `CustomerRef` (which job it was for).
+  - **#70 summary OMITTED when any section is error or any toggle off.** Partial profitability silently misreports gross profit. Caller MUST branch on `sectionStatus`.
+  - **#70 customer lookup is the one non-fail-soft path.**
+  - **#70 first cross-tool consumer of `parseDurationToHours`** from [src/tools/time-tracking.ts](src/tools/time-tracking.ts).
+  - **#70 `customerRefMatches` accepts EITHER ListID OR FullName match.**
+  - **#78 EntityFilter priority reorder** — `handleQuery` does `EntityRef ?? CustomerRef ?? VendorRef ?? PayeeEntityRef`.
+  - **#78 Duration is ISO 8601 PT-H-M-S only.**
+  - **#78 IsBillable + BillableStatus co-emission.**
+  - **#71 fail-soft contract** — `sections.<name>` is either the success payload OR an `{ error: {...} }` block; `sectionStatus.<name>` is `'ok' | 'skipped' | 'error'`.
   - **#71 payroll has THREE skip states** — Pro → 9003, wire-zero → 9004, probe-fail → error.
   - **#71 GL defaults to PnLOnly scope** for cost reasons.
-  - **#71 customerListId / customerName is OPTIONAL CONTEXT, NOT A FILTER.** Underlying sections are WHOLE-FILE. #70 INVERTS this — customer IS the engagement, customer is REQUIRED.
+  - **#71 customerListId / customerName is OPTIONAL CONTEXT, NOT A FILTER.** #70 INVERTS this — customer IS the engagement.
   - **#71 AccountQueryRq failure is the only non-fail-soft path** for #71; #70's parallel is CustomerQueryRq failure.
   - **#75 EntityFilter strict improvement** — `handleQuery` matches `PayeeEntityRef` for Check / BillPaymentCheck / BillPaymentCreditCard / CreditCardCharge / CreditCardCredit.
-  - **#75 `computeTotals` Check.Amount / Deposit.DepositTotal** — "set when undefined, preserve explicit overrides".
+  - **#75 `computeTotals` Check.Amount / Deposit.DepositTotal** — "set when undefined, preserve explicit overrides". #76 follows the SAME pattern for SalesOrder.TotalAmount (always derives, since SO has no caller-side explicit-total path that matters).
   - **#75 Sim does NOT move `Bank.Account.Balance`** on Deposit/Transfer/Check.
   - **#67 default path is zero wire I/O.** Probe is opt-in.
   - **#68 RECON_TOLERANCE = 0.01.** AR/AP drift in sim seed is deliberate.
@@ -69,7 +99,7 @@ Re-run if the tree has been touched (skip if next session starts within hours):
   - **#85 SDK gap is permanent** — `qb_closing_date_set` always 9005 + UI navigation.
   - **Synthetic statusCodes**: 9001 read-only, 9002 idempotency conflict, 9003 edition unsupported, 9004 payroll subscription required, 9005 SDK has no write path.
   - **#86 prompts registration** uses `reg<Args>(entry)` helper + `as const` tuple.
-  - **Three transaction-type lists must stay in sync** across builder / manager / simulation-store. #78 added TimeTracking to all three.
+  - **Three transaction-type lists must stay in sync** across builder / manager / simulation-store. #78 added TimeTracking to all three; #76 did NOT need to (SalesOrder was already in all three from prior work).
   - **AR-side `Customer.Balance` discount math is correct; AP-side is NOT** — future `qb_bill_write_off` needs the parallel fix.
   - **Dispatch order in `processRequest`**: non-entity-typed `*QueryRq` / `*ModRq` / `AttachableAddRq` MUST precede the `endsWith` catch-alls.
   - **Iterator wire names diverge**: `iterator`/`iteratorID` on request, `iteratorRemainingCount`/`iteratorID` on response.

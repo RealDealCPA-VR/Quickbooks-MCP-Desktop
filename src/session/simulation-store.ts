@@ -3292,6 +3292,18 @@ export class SimulationStore {
       result.TotalAmount = lineSum;
     }
 
+    // Phase 17 #76 — SalesOrder is the customer-side analog of PurchaseOrder:
+    // a committed-but-not-yet-invoiced order, non-posting (no AR balance until
+    // an invoice is created against it). Real QB exposes Subtotal +
+    // SalesTaxTotal + TotalAmount; this simulation mirrors PO and rolls the
+    // line set directly into TotalAmount (a partial sales-tax model would
+    // require splitting taxable vs non-taxable line aggregation — out of #76
+    // scope). IsManuallyClosed lives on the entity itself; this method doesn't
+    // touch it.
+    if (entityType === "SalesOrder") {
+      result.TotalAmount = lineSum;
+    }
+
     // JournalEntry has no single TotalAmount — debit and credit lines are two
     // independent sums that must equal each other (validated separately by
     // validateJournalEntryBalance before persist). Store both for inspection;
@@ -3588,6 +3600,10 @@ export class SimulationStore {
         entityType === "SalesReceipt" ||
         entityType === "CreditMemo" ||
         entityType === "PurchaseOrder" ||
+        // Phase 17 #76 — SalesOrder re-derives TotalAmount on line mod (same
+        // shape as PurchaseOrder). computeTotals always overwrites the derived
+        // header field for SalesOrder so no pre-delete is needed.
+        entityType === "SalesOrder" ||
         entityType === "JournalEntry" ||
         // Phase 17 #75 — Check / Deposit re-derive header totals on line mod.
         // Mirror Bill: computeTotals only sets the header field when undefined
@@ -5223,6 +5239,47 @@ export class SimulationStore {
     for (const tt of timeTrackingSeeds) {
       this.getStore("TimeTracking").set(tt.TxnID as string, tt);
     }
+
+    // Phase 17 #76 — One SalesOrder seed against Acme Corporation referencing
+    // the seeded Consulting Services item. A SalesOrder is a committed-but-not-
+    // yet-invoiced customer order; non-posting, so this doesn't move Acme's
+    // Balance. Two lines so list / update / convert tests can exercise both
+    // single- and multi-line paths. IsManuallyClosed defaults false (the order
+    // is open, awaiting invoicing).
+    const salesOrders = this.getStore("SalesOrder");
+    const salesOrderSeed: StoredEntity = {
+      TxnID: "S0000001-SO",
+      TxnNumber: 1,
+      CustomerRef: { ListID: "80000001-1234567890", FullName: "Acme Corporation" },
+      TxnDate: "2024-11-15",
+      RefNumber: "SO-1001",
+      IsManuallyClosed: false,
+      Memo: "Q4 consulting engagement — block hours plus advisory retainer",
+      SalesOrderLineRet: [
+        {
+          TxnLineID: "L1000001",
+          ItemRef: { ListID: "I0000001", FullName: "Consulting Services" },
+          Desc: "Q4 consulting block — 20 hours",
+          Quantity: 20,
+          Rate: 150.00,
+          Amount: 3000.00,
+        },
+        {
+          TxnLineID: "L1000002",
+          ItemRef: { ListID: "I0000001", FullName: "Consulting Services" },
+          Desc: "December advisory retainer",
+          Quantity: 1,
+          Rate: 500.00,
+          Amount: 500.00,
+        },
+      ],
+      TotalAmount: 3500.00,
+      EditSequence: now,
+      TimeCreated: "2024-11-15T14:00:00",
+      TimeModified: now,
+      IsActive: true,
+    };
+    salesOrders.set(salesOrderSeed.TxnID as string, salesOrderSeed);
 
     // Set ID counter beyond seed data
     this.idCounter = 10000;

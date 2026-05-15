@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (124 total)
+## Tools (129 total)
 
 ### Customers
 | Tool | Description |
@@ -155,6 +155,24 @@ A `PurchaseOrder` is the vendor-side analog of an `Estimate` — a non-posting c
 | `qb_purchase_order_create` | Create a PO. Takes `lines: [{itemName, quantity, cost, description?, memo?}]` (at least one required). `TotalAmount = sum(quantity * cost)`. Optional `dueDate`, `shipToEntity`, `isManuallyClosed`. |
 | `qb_purchase_order_update` | Modify an existing PO. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, cost?, memo?}]`. Header-only mods leave existing lines untouched. `TotalAmount` recomputes after line mods. |
 | `qb_purchase_order_delete` | Delete a PO. Non-posting, so no vendor balance to reverse — pure record removal. |
+
+### Sales Orders
+
+A `SalesOrder` is the customer-side analog of a `PurchaseOrder` — a committed-but-not-yet-invoiced order. **Distinct from `Estimate`:** estimates are quotes (the customer hasn't committed yet); sales orders are committed but not yet fulfilled, used for backorder / shipment / scheduled-service workflows. Like POs, sales orders are non-posting — they do NOT touch `Customer.Balance` or AR. The customer balance only moves when an invoice is created against the order (via `qb_sales_order_convert_to_invoice`, or a manual `qb_invoice_create` that mirrors the SO's lines). Lines use `Rate` (sales side, mirrors `qb_invoice_create`); the simulation derives `TotalAmount` from the line set — sales orders have no separate `Subtotal` header in this server's first cut.
+
+`IsManuallyClosed` is a header flag that marks an order closed regardless of invoicing activity (typical workflows: cancel an order that won't ship, or close an order that's been partially invoiced and the remainder won't be billed). Real QB exposes it on both Add and Mod; this server surfaces it on `qb_sales_order_create` and `qb_sales_order_update`. The simulation stores it on the entity but doesn't drive automation off it (no auto-close when fully invoiced against — that would need a deeper Invoice ↔ SalesOrder linkage that this first cut doesn't model).
+
+`qb_sales_order_update` mirrors `qb_invoice_update` / `qb_purchase_order_update` for header/line edits. Passing `lines` REPLACES the line set wholesale (matching `txnLineID`s are merged in place, lines you don't list are dropped); `TotalAmount` recomputes after line mods. Sales orders are non-posting so there is no customer-balance side effect on either header or line changes. Stale `editSequence` rejects with statusCode 3170.
+
+`qb_sales_order_convert_to_invoice` mirrors `qb_estimate_convert_to_invoice`. Real QB has no single "convert" RPC for sales orders either — this tool reads the source order, submits an `InvoiceAddRq` with `CustomerRef` + `SalesOrderLineRet` carried over (each line mapped to `InvoiceLineAdd`, with optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PONumber` carry-over from the order header when present), and (default) marks the source order `IsManuallyClosed: true`. The mark-closed step runs AFTER the invoice is successfully created, so the new invoice is preserved even if the flip fails (rare — surfaced via `markClosedError` in the response). Pass `markClosed: false` for partial conversions where another invoice will be billed against the remaining lines later (leave the SO open so it stays on the outstanding-orders list). The new invoice posts to AR and bumps the customer's `Balance` by its `BalanceRemaining` exactly like a regular `qb_invoice_create`.
+
+| Tool | Description |
+|------|-------------|
+| `qb_sales_order_list` | List/search sales orders with customer/date/refNumber filters. Set `paginate: true` for iterator-based pagination (auto-defaults `maxReturned` to 500). |
+| `qb_sales_order_create` | Create a sales order. Takes `lines: [{itemName, quantity, rate, amount?, description?}]` (at least one required). `TotalAmount = sum(line amounts)`. Optional `dueDate`, `poNumber`, `isManuallyClosed`. |
+| `qb_sales_order_update` | Modify an existing sales order. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. `TotalAmount` recomputes after line mods. `isManuallyClosed` flips the order's closed state. |
+| `qb_sales_order_delete` | Delete a sales order. Non-posting, so no customer balance to reverse — pure record removal. Invoices already spawned against the SO are NOT touched. |
+| `qb_sales_order_convert_to_invoice` | Convert a sales order to an invoice. Carries `CustomerRef` + lines (and optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PONumber`). Operator-supplied `invoiceTxnDate` / `invoiceDueDate` / `invoiceRefNumber` / `invoiceMemo` override the carried values. Default flips the order `IsManuallyClosed: true` after the invoice is created — pass `markClosed: false` for partial conversions. |
 
 ### Journal Entries
 
@@ -347,7 +365,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (124 tools)     │──│──────────────┐
+                                    │  │ (129 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │
