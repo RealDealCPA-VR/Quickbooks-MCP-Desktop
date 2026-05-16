@@ -552,6 +552,12 @@ export function buildDeleteRequest(
     // TxnID + EditSequence, deletes via TxnDelRq. Four lists in sync (the
     // three runtime arrays PLUS the CLAUDE.md doc list at line 58).
     "StatementCharge",
+    // Phase 17 #79 — VehicleMileage. Schedule C / Form 4562 mileage log; non-
+    // posting (no GL / AR / AP effect). Carries TxnID + TimeCreated/Modified
+    // but NO EditSequence (QBXML SDK exposes no VehicleMileageModRq at any
+    // version through 16.0 — trips are immutable from the SDK's perspective).
+    // Deletes via TxnDelRq (TxnDelType=VehicleMileage). Four lists in sync.
+    "VehicleMileage",
   ].includes(entityType);
 
   if (isTransaction) {

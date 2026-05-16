@@ -112,6 +112,14 @@ const arrayElements = new Set([
   // in QBXML (no *LineRet array — ItemRef / Quantity / Rate / Amount live at
   // the txn header), so only StatementChargeRet is registered here.
   "StatementChargeRet",
+  // Phase 17 #79 — vehicle mileage. VehicleQueryRq returns N VehicleRet rows
+  // (the list of vehicles); VehicleMileageQueryRq returns N VehicleMileageRet
+  // rows (the mileage log trips). Both are header-only — VehicleMileage has
+  // no *LineRet array (each trip is a single row with a VehicleRef + trip
+  // dates + odometers / TotalMiles). Single-hit responses must surface as
+  // arrays so the tool layer's filter / map paths work uniformly.
+  "VehicleRet",
+  "VehicleMileageRet",
 ]);
 
 // ---------------------------------------------------------------------------

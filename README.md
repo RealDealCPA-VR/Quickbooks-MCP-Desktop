@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (141 total)
+## Tools (144 total)
 
 ### Customers
 | Tool | Description |
@@ -275,6 +275,24 @@ QB's `TimeTrackingQueryRq` is the only transaction-type wire request with no `Cu
 | `qb_time_track_list` | List/search TimeTracking entries with filters for `txnId`, worker (`entityName` / `entityListId` — server-side `EntityFilter`), customer (`customerName` / `customerListId` — POST-FILTERED), date range, and `billableOnly` (POST-FILTERED). Each row carries the parent fields plus a derived `hours` decimal. Set `paginate: true` for iterator pagination (auto-defaults `maxReturned` to 500). |
 | `qb_time_track_add` | Record a new TimeTracking entry. Requires a worker (`entityName` / `entityListId`) and either `hours` (decimal — converted to ISO `PT-H-M-S`) or `duration` (pre-formatted ISO). Optional `customerName` / `customerListId` attaches the work to a job; optional `itemServiceName` / `itemServiceListId` names what to bill as; `billable: true` flips `IsBillable` / `BillableStatus` for downstream invoice flow via the Time/Costs dialog. Optional `payrollItemWageName` links to payroll (live QB requires a payroll subscription). Read-only sessions reject with `9001`. Optional `idempotencyKey`. |
 
+### Vehicle Mileage
+
+`qb_vehicle_*` and `qb_vehicle_mileage_*` cover the **Schedule C / Form 4562 mileage log** workflow — the IRS-required record of business miles driven on a self-employed return or a corporate Listed Property schedule. Each `VehicleMileage` entry records ONE trip: a vehicle, a `TripStartDate` + `TripEndDate`, a distance source (either `OdometerStart` + `OdometerEnd` — the sim derives `TotalMiles = end − start` — OR an explicit `TotalMiles` for short trips with no odometer reading), an optional `CustomerRef` for billable mileage, an optional `ItemRef` carrying the per-mile rate, and a `BillableStatus`.
+
+VehicleMileage is a **TRANSACTION** in QB (carries `TxnID`, deletes via `TxnDelRq`) but **non-posting** — no GL effect, no AR/AP movement. Sister surface to `qb_time_track_*`: both are write-once payloads consumed by payroll and the Time/Costs dialog on invoice creation. The four runtime transaction-type lists (builder.ts / manager.ts / simulation-store.ts) plus the [CLAUDE.md](CLAUDE.md) doc list at line 58 all carry `VehicleMileage`.
+
+**No `_update` tool.** The qbXML SDK exposes NO `VehicleMileageModRq` at any version through 16.0 — recorded trips are immutable from the SDK's perspective. If a trip needs to change, the operator deletes it in QB Desktop and re-adds via `qb_vehicle_mileage_add`. Delete is also intentionally omitted from this first cut (mileage logs are auditable records that operators rarely delete); the four-list-sync infrastructure is in place so a future `qb_vehicle_mileage_delete` is a thin add.
+
+Vehicle is a **list entity** (ListID + FullName + IsActive + Desc). This server exposes `qb_vehicle_list` as a read-only discovery surface paired with `qb_vehicle_mileage_add` — vehicles are infrequent setup work (a CPA firm adds a new truck once a year) and operators add them through QB Desktop's UI directly. `qb_vehicle_list` defaults to `ActiveOnly`; pass `includeInactive: true` to see retired vehicles (mileage logs against a retired vehicle still surface in `qb_vehicle_mileage_list` — Vehicle.IsActive only affects which rows show up in the vehicle list itself, not history).
+
+`qb_vehicle_mileage_list` filters by `txnId` / `vehicleName` / `vehicleListId` (server-side `VehicleFilter`) / `customerName` / `customerListId` (POST-FILTERED at the tool layer because QB's `VehicleMileageQueryRq` has no `CustomerFilter`) / `fromDate` / `toDate` (TripStartDate-scoped via `TripDateRangeFilter` — VehicleMileage has NO `TxnDate` field; the trip dates ARE the canonical timestamps) / `billableStatus` (`Billable` | `NotBillable` | `HasBeenBilled` — server-side `BillableStatus` filter). Pagination via `paginate: true` (auto-defaults `maxReturned` to 500).
+
+| Tool | Description |
+|------|-------------|
+| `qb_vehicle_list` | List Vehicles (the discovery surface for `qb_vehicle_mileage_add`). Default `ActiveOnly`; `includeInactive: true` includes retired vehicles. Filter by `nameFilter` (Contains) or `vehicleListId`. Read-only — vehicle CRUD lives in QB Desktop's UI. |
+| `qb_vehicle_mileage_list` | List/search vehicle mileage trips. Filter by `txnId` / `vehicleName` / `vehicleListId` (server-side `VehicleFilter`) / `customerName` / `customerListId` (POST-FILTERED — QB has no `CustomerFilter`) / `fromDate` / `toDate` (TripStartDate window — NOT TxnDate) / `billableStatus`. `paginate: true` auto-defaults `maxReturned` to 500. |
+| `qb_vehicle_mileage_add` | Log a new trip. REQUIRED: `vehicleName` (or `vehicleListId`) AND `tripStartDate` + `tripEndDate` AND either `totalMiles` directly OR BOTH `odometerStart` + `odometerEnd` (sim derives `TotalMiles = end − start` when totalMiles is omitted; explicit `totalMiles` wins). Optional `customerName` / `customerListId` + `itemName` / `itemListId` + `className` + `notes`; `billable: true` → `BillableStatus='Billable'`. **No `_update` tool** — the qbXML SDK has no `VehicleMileageModRq`; delete + recreate via QB Desktop's UI to correct a trip. Read-only sessions reject with `9001`. Optional `idempotencyKey`. |
+
 ### Reference Lists
 
 Read-only lookups for the supporting types that transactions reference by `FullName` or `Name`. Operators need these to discover valid values to pass into invoice/bill/payment creation (the Class on a line, the Terms on an invoice header, the PaymentMethod on a receive-payment, etc.). New entries are defined in QuickBooks itself, not via this server.
@@ -426,7 +444,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (141 tools)     │──│──────────────┐
+                                    │  │ (144 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

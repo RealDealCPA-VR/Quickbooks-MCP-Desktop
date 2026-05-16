@@ -1455,6 +1455,9 @@ export class QBSessionManager {
       // billing; AR-posting. Three runtime lists in sync plus the CLAUDE.md doc
       // list at line 58.
       "StatementCharge",
+      // Phase 17 #79 — VehicleMileage (TxnID + TxnDelRq). Schedule C / Form 4562
+      // mileage log; non-posting. No Mod request in the SDK; no _update tool.
+      "VehicleMileage",
     ].includes(entityType);
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);

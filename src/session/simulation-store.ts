@@ -296,6 +296,42 @@ export class SimulationStore {
       }
     }
 
+    // VehicleFilter (Phase 17 #79 — VehicleMileage). Real QB scopes
+    // VehicleMileageQueryRq via VehicleFilter.{ListID|FullName}, which
+    // matches the VehicleMileage's VehicleRef. Distinct from EntityFilter
+    // because VehicleMileage carries BOTH a VehicleRef (the vehicle the
+    // mileage was logged against) AND optionally a CustomerRef (the
+    // customer the trip was on behalf of) — EntityFilter on this query
+    // type targets neither. Only VehicleMileage carries a VehicleRef in
+    // this server (Vehicle list entities don't have a self-ref); skipped
+    // silently for entity types that don't store one.
+    if (reqData.VehicleFilter && typeof reqData.VehicleFilter === "object") {
+      const vf = reqData.VehicleFilter as Record<string, unknown>;
+      const targetListIds = vf.ListID
+        ? (Array.isArray(vf.ListID)
+            ? (vf.ListID as unknown[]).map(String)
+            : [String(vf.ListID)])
+        : null;
+      const targetNames = vf.FullName
+        ? (Array.isArray(vf.FullName)
+            ? (vf.FullName as unknown[]).map(String)
+            : [String(vf.FullName)])
+        : null;
+      if (targetListIds || targetNames) {
+        results = results.filter((e) => {
+          const ref = e.VehicleRef as Record<string, unknown> | undefined;
+          if (!ref) return false;
+          if (targetListIds && targetListIds.includes(String(ref.ListID ?? ""))) {
+            return true;
+          }
+          if (targetNames && targetNames.includes(String(ref.FullName ?? ""))) {
+            return true;
+          }
+          return false;
+        });
+      }
+    }
+
     // ObjectFilter (Phase 12 #59 — Attachable). Real QB scopes
     // AttachableQueryRq via ObjectFilter.{ListID|TxnID}, which matches
     // against the Attachable's ObjectRef. Only Attachable carries an
@@ -348,6 +384,29 @@ export class SimulationStore {
       }
     }
 
+    // TripDateRangeFilter (Phase 17 #79 — VehicleMileage). Real QB's
+    // VehicleMileageQueryRq scopes the date window by TripStartDate, not
+    // TxnDate (VehicleMileageRet has no TxnDate; the trip dates are the
+    // canonical timestamps on this entity). Only VehicleMileage carries
+    // TripStartDate in this server; skipped silently for entity types
+    // that don't store one. Inclusive on both ends.
+    if (
+      reqData.TripDateRangeFilter &&
+      typeof reqData.TripDateRangeFilter === "object"
+    ) {
+      const dr = reqData.TripDateRangeFilter as Record<string, unknown>;
+      const from = dr.FromTripDate ? String(dr.FromTripDate) : null;
+      const to = dr.ToTripDate ? String(dr.ToTripDate) : null;
+      if (from || to) {
+        results = results.filter((e) => {
+          const d = String(e.TripStartDate ?? "");
+          if (from && d < from) return false;
+          if (to && d > to) return false;
+          return true;
+        });
+      }
+    }
+
     if (
       reqData.ModifiedDateRangeFilter &&
       typeof reqData.ModifiedDateRangeFilter === "object"
@@ -372,6 +431,17 @@ export class SimulationStore {
       } else if (status === "NotPaidOnly") {
         results = results.filter((e) => e.IsPaid !== true);
       }
+    }
+
+    // BillableStatus filter (Phase 17 #79 — VehicleMileage; usable for any
+    // entity that carries a BillableStatus field). Real QB's
+    // VehicleMileageQueryRq scopes by BillableStatus = Billable | NotBillable
+    // | HasBeenBilled. TimeTracking exposes its billable filter at the tool
+    // layer (post-filtered) because QB's TimeTrackingQueryRq has no
+    // BillableStatus filter; only VehicleMileage uses this branch today.
+    if (reqData.BillableStatus) {
+      const target = String(reqData.BillableStatus);
+      results = results.filter((e) => String(e.BillableStatus ?? "") === target);
     }
 
     // RefNumber — exact match. RefNumberFilter (partial match) deferred.
@@ -3584,6 +3654,25 @@ export class SimulationStore {
       result.Amount = qty * rate;
     }
 
+    // Phase 17 #79 — VehicleMileage.TotalMiles = OdometerEnd - OdometerStart.
+    // Derives only when TotalMiles is undefined AND both odometers are
+    // supplied (the operator may log a trip with just TotalMiles and no
+    // odometer reading — short trips, dead-reckoning estimates — and the
+    // explicit value must survive). Real QB enforces "at least one of
+    // (OdometerStart+OdometerEnd) OR TotalMiles" at the wire layer; the
+    // tool layer enforces it upfront via Zod so a malformed payload never
+    // reaches the sim. Negative deltas (odometer rollback) would be a data-
+    // entry error; the sim records the negative value rather than coercing
+    // to zero so the tool layer can surface the anomaly.
+    if (
+      entityType === "VehicleMileage" &&
+      result.TotalMiles === undefined &&
+      result.OdometerStart !== undefined &&
+      result.OdometerEnd !== undefined
+    ) {
+      result.TotalMiles = Number(result.OdometerEnd) - Number(result.OdometerStart);
+    }
+
     return result;
   }
 
@@ -5071,6 +5160,15 @@ export class SimulationStore {
       // customer.Balance moves by +Amount on add, -Amount on delete; mods that
       // change Amount move the balance by the delta. NOT bank-affecting.
       "StatementCharge",
+      // Phase 17 #79 — VehicleMileage. Schedule C / Form 4562 mileage logs.
+      // Carries TxnID + TimeCreated/Modified but NO EditSequence (the QBXML
+      // SDK exposes no VehicleMileageModRq at any version through 16.0, so
+      // there's no _update tool; recorded trips are immutable from the SDK's
+      // perspective). Deletes via TxnDelRq (TxnDelType=VehicleMileage). Non-
+      // posting (no GL effect, no AR/AP movement). NOT bank-affecting. Four
+      // lists in sync (the three runtime arrays PLUS the CLAUDE.md doc list
+      // at line 58).
+      "VehicleMileage",
     ].includes(entityType);
   }
 
@@ -5797,6 +5895,124 @@ export class SimulationStore {
     ];
     for (const tt of timeTrackingSeeds) {
       this.getStore("TimeTracking").set(tt.TxnID as string, tt);
+    }
+
+    // Phase 17 #79 — Vehicle list + VehicleMileage seed (Schedule C / Form 4562
+    // mileage logs). Three vehicles modeled as a list entity (ListID + Name +
+    // IsActive + EditSequence, mirroring Customer/Vendor/Item shape) so
+    // qb_vehicle_list returns something against fresh sim. Four mileage trips
+    // logged against two of the three vehicles, spanning multiple dates, with
+    // mixed BillableStatus and mixed CustomerRef presence — exercises every
+    // list-tool filter (vehicleFilter, tripDateRangeFilter, billableStatus,
+    // customer post-filter). Non-posting: vehicle mileage doesn't move
+    // Customer.Balance / AR / AP, so seeding doesn't disturb the pinned
+    // customer-balance fixtures (Acme=15000 / Global=8500 / TechStart=3200).
+    const vehicleSeeds: StoredEntity[] = [
+      {
+        ListID: "V0000001",
+        Name: "2023 Ford F-150",
+        FullName: "2023 Ford F-150",
+        IsActive: true,
+        Desc: "Primary fieldwork truck — VIN 1FTEW1E8XPFC12345",
+        EditSequence: now,
+        TimeCreated: now,
+        TimeModified: now,
+      },
+      {
+        ListID: "V0000002",
+        Name: "2022 Toyota Camry",
+        FullName: "2022 Toyota Camry",
+        IsActive: true,
+        Desc: "Staff commuter — VIN 4T1G11AK2NU567890",
+        EditSequence: now,
+        TimeCreated: now,
+        TimeModified: now,
+      },
+      {
+        ListID: "V0000003",
+        Name: "2020 Honda Civic (retired)",
+        FullName: "2020 Honda Civic (retired)",
+        IsActive: false,
+        Desc: "Decommissioned 2024-09 — kept on the list for historical mileage logs",
+        EditSequence: now,
+        TimeCreated: now,
+        TimeModified: now,
+      },
+    ];
+    for (const v of vehicleSeeds) {
+      this.getStore("Vehicle").set(v.ListID as string, v);
+    }
+
+    // VehicleMileage seed — 4 trips. F-150 racks up most of the miles (client
+    // site visits + IRS office); Camry has one short trip. Both reference the
+    // standing Consulting Services item for billing rate, two reference Acme
+    // (for the customer post-filter test), one references Global (for the
+    // vehicle-without-customer test variant), and one has no CustomerRef
+    // (internal admin trip — IRS office run).
+    const vehicleMileageSeeds: StoredEntity[] = [
+      {
+        TxnID: "T0000001-VM",
+        TxnNumber: 1,
+        VehicleRef: { ListID: "V0000001", FullName: "2023 Ford F-150" },
+        TripStartDate: "2024-11-04",
+        TripEndDate: "2024-11-04",
+        OdometerStart: 42100,
+        OdometerEnd: 42155,
+        TotalMiles: 55,
+        CustomerRef: { ListID: "80000001-1234567890", FullName: "Acme Corporation" },
+        ItemRef: { ListID: "I0000001", FullName: "Consulting Services" },
+        Notes: "Round trip to Acme HQ for opening audit meeting",
+        BillableStatus: "Billable",
+        TimeCreated: "2024-11-04T18:00:00",
+        TimeModified: now,
+      },
+      {
+        TxnID: "T0000002-VM",
+        TxnNumber: 2,
+        VehicleRef: { ListID: "V0000001", FullName: "2023 Ford F-150" },
+        TripStartDate: "2024-11-05",
+        TripEndDate: "2024-11-05",
+        OdometerStart: 42155,
+        OdometerEnd: 42210,
+        TotalMiles: 55,
+        CustomerRef: { ListID: "80000001-1234567890", FullName: "Acme Corporation" },
+        ItemRef: { ListID: "I0000001", FullName: "Consulting Services" },
+        Notes: "Round trip to Acme HQ for fieldwork day 2",
+        BillableStatus: "Billable",
+        TimeCreated: "2024-11-05T18:30:00",
+        TimeModified: now,
+      },
+      {
+        TxnID: "T0000003-VM",
+        TxnNumber: 3,
+        VehicleRef: { ListID: "V0000002", FullName: "2022 Toyota Camry" },
+        TripStartDate: "2024-11-06",
+        TripEndDate: "2024-11-06",
+        TotalMiles: 28,
+        CustomerRef: { ListID: "80000002-1234567890", FullName: "Global Industries" },
+        ItemRef: { ListID: "I0000001", FullName: "Consulting Services" },
+        Notes: "Tax planning meeting at Global's downtown office (no odometer log)",
+        BillableStatus: "Billable",
+        TimeCreated: "2024-11-06T16:00:00",
+        TimeModified: now,
+      },
+      {
+        TxnID: "T0000004-VM",
+        TxnNumber: 4,
+        VehicleRef: { ListID: "V0000001", FullName: "2023 Ford F-150" },
+        TripStartDate: "2024-11-07",
+        TripEndDate: "2024-11-07",
+        OdometerStart: 42210,
+        OdometerEnd: 42228,
+        TotalMiles: 18,
+        Notes: "IRS office — picked up a CAF letter (no client allocation)",
+        BillableStatus: "NotBillable",
+        TimeCreated: "2024-11-07T11:00:00",
+        TimeModified: now,
+      },
+    ];
+    for (const vm of vehicleMileageSeeds) {
+      this.getStore("VehicleMileage").set(vm.TxnID as string, vm);
     }
 
     // Phase 17 #76 — One SalesOrder seed against Acme Corporation referencing

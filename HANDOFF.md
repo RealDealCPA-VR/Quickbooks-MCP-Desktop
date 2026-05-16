@@ -1,76 +1,68 @@
 # Handoff State
 
-_Last updated: 2026-05-16. **Phase 17 #81 statement charges shipped.** 4 new tools in fresh [src/tools/statement-charges.ts](src/tools/statement-charges.ts) — `qb_statement_charge_list` / `_create` / `_update` / `_delete`. Structurally unique: only transaction type in this server with NO `*LineAdd` array (ItemRef / Quantity / Rate / Amount live at the txn header — single-row billing). New `computeTotals` branch derives `Amount = Quantity * Rate` at header level. AR-positive posting (Customer.Balance moves by +Amount on add, -Amount on delete; mods re-derive Amount on Qty/Rate change and reconcile balance by delta). `adjustPartyBalanceForTxn` + `adjustPartyBalanceForTxnMod` amountField union extended with `"Amount"` (strict improvement; serves any future header-Amount txn type). Four lists in sync (builder.ts / manager.ts / simulation-store.ts + CLAUDE.md doc list at line 58). NEW parser arrayElement: `StatementChargeRet` only (no `*LineRet` — header-level fields). NOT in BANK_AFFECTING_TXN_TYPES. NO seed (matches #80 precedent — preserves existing customer-balance test fixtures). 39 new tests across 7 layers — all green. Tool count 137 → 141; 1236 → 1275 tests green. README sync done: new `### Statement Charges` section between Inventory Adjustments and Journal Entries; architecture diagram inset bumped in both spots. Build + test + simulation banner clean._
+_Last updated: 2026-05-16. **Phase 17 #79 vehicle mileage shipped** — Phase 17 is now CLOSED (every item 75–81 done). 3 new tools in fresh [src/tools/vehicle-mileage.ts](src/tools/vehicle-mileage.ts): `qb_vehicle_list` (read-only Vehicle discovery), `qb_vehicle_mileage_list`, `qb_vehicle_mileage_add`. **NO `_update` tool** (qbXML SDK has no `VehicleMileageModRq` at any version through 16.0) and **NO `_delete` tool in this cut** (mileage logs are auditable; future thin add). Sim store extensions: new `VehicleFilter` handleQuery branch (scopes by `VehicleRef`, distinct from `EntityFilter`), new `TripDateRangeFilter` branch (scopes by `TripStartDate` — VehicleMileage has NO `TxnDate` field), new generic `BillableStatus` filter branch, new `computeTotals` branch deriving `TotalMiles = OdometerEnd − OdometerStart` when undefined (explicit totalMiles wins). 3 vehicles + 4 mileage trips seeded (1 inactive vehicle, 1 NotBillable trip, 1 trip without CustomerRef = IRS office run — covers every filter dimension). Four lists in sync (builder.ts + manager.ts + simulation-store.ts + CLAUDE.md line 58). Parser arrayElements extended with `VehicleRet` + `VehicleMileageRet`. Tool count 141 → 144. 1275 → 1315 tests green (+40 new tests). README sync done: tool count bumped in both spots, new `### Vehicle Mileage` section between Time Tracking and Reference Lists. Build + test + simulation banner clean._
 
 ## Last Session Summary
 
-- **#81 statement charges — DONE.** 4 tools shipped:
-  - `qb_statement_charge_list` — `StatementChargeQueryRq`. Header fields only (no line-Ret on this entity type — see structural notes below). Filters: `txnId / refNumber / customerName / customerListId (server-side EntityFilter) / fromDate / toDate / maxReturned / paginate / iteratorID`. Paginate auto-defaults MaxReturned=500.
-  - `qb_statement_charge_create` — `StatementChargeAddRq`. Required: `customerName | customerListId` AND `itemName | itemListId` AND either explicit `amount` OR both `quantity + rate`. Optional `txnDate / dueDate / refNumber / description / className`. Standard idempotencyKey + read-only gate. Customer.Balance moves by +Amount (= quantity × rate when not explicit).
-  - `qb_statement_charge_update` — `StatementChargeModRq`. Pass `txnId + editSequence` plus any header field. Changing `quantity` OR `rate` without `amount` re-derives `Amount = newQuantity × newRate` via the new "delete-then-recompute" block in handleMod. Explicit `amount` mod wins over qty change. Customer re-target reverses old amount against old customer, applies new to new. Stale editSequence → 3170.
-  - `qb_statement_charge_delete` — `TxnDelRq` with TxnDelType=StatementCharge. Reverses Customer.Balance by -Amount.
+- **#79 vehicle mileage — DONE.** 3 tools shipped:
+  - `qb_vehicle_list` — `VehicleQueryRq`. Read-only Vehicle discovery surface paired with `qb_vehicle_mileage_add`. Filters: `nameFilter` (Contains) / `vehicleListId` (ListID fetch) / `includeInactive` (default false → ActiveOnly) / `maxReturned`. Vehicle CRUD lives in QB Desktop's UI — vehicles are infrequent setup work and operators add them there directly.
+  - `qb_vehicle_mileage_list` — `VehicleMileageQueryRq`. Filters: `txnId` / `vehicleName` / `vehicleListId` (server-side `VehicleFilter`) / `customerName` / `customerListId` (POST-FILTERED at tool layer — QB's `VehicleMileageQueryRq` has no `CustomerFilter`) / `fromDate` / `toDate` (server-side `TripDateRangeFilter` scoping `TripStartDate` — NOT TxnDate) / `billableStatus` (server-side `BillableStatus` filter — `Billable` | `NotBillable` | `HasBeenBilled`) / `maxReturned` / `paginate` / `iteratorID`. Paginate auto-defaults MaxReturned=500.
+  - `qb_vehicle_mileage_add` — `VehicleMileageAddRq`. REQUIRED: `vehicleName | vehicleListId` AND `tripStartDate` + `tripEndDate` AND either `totalMiles` directly OR BOTH `odometerStart` + `odometerEnd`. Optional `customerName | customerListId` / `itemName | itemListId` / `className` / `notes` / `billable` (true → `BillableStatus='Billable'`, false → `'NotBillable'`, unset omits — matches QB default). Standard idempotencyKey + read-only gate.
 
-- **Structural notes — StatementCharge is unique in this server:**
-  - **Single-row at the txn header** — no `*LineAdd` array. ItemRef / Quantity / Rate / Amount live directly on the transaction body. The simulation's `convertLinesAddToRet` pass is a no-op for StatementCharge (no key matches `/^(.+?)Line(s?)Add$/`).
-  - `computeTotals` gets a dedicated branch: `Amount = Quantity * Rate` when `Amount === undefined` (mirrors the Check.Amount / Deposit.DepositTotal / SalesTaxPaymentCheck.TotalAmount "set when undefined" pattern; explicit Amount on create wins).
-  - `handleMod` gets a separate "delete-then-recompute" block that fires when `modData.Amount === undefined && (modData.Quantity !== undefined || modData.Rate !== undefined)` — deletes `updated.Amount` then re-runs computeTotals so the new Qty × Rate sticks.
-  - **`adjustPartyBalanceForTxn` + `adjustPartyBalanceForTxnMod` amountField union extended** to include `"Amount"` (was `"BalanceRemaining" | "AmountDue" | "TotalAmount"`). Strict improvement — any future header-Amount transaction type uses the same helpers.
+- **Structural notes — VehicleMileage is non-posting + immutable:**
+  - **NON-POSTING.** No GL effect, no AR/AP movement. Pinned by a test: `Customer.Balance` does NOT move when a billable trip against Acme is added.
+  - **Immutable from SDK perspective.** The qbXML SDK exposes NO `VehicleMileageModRq` at any version through 16.0 — there is no `_update` tool. If a trip needs to change, operator deletes via QB Desktop's UI and re-adds via `qb_vehicle_mileage_add`. Tool description calls this out loudly.
+  - **VehicleMileage has NO `TxnDate` field.** TripStartDate / TripEndDate ARE the canonical timestamps. The new `TripDateRangeFilter` branch in `handleQuery` is distinct from the existing `TxnDateRangeFilter` branch (which scopes `TxnDate`).
+  - **VehicleMileage is the only transaction with `VehicleRef`.** New `VehicleFilter` branch in `handleQuery` scopes by it — distinct from `EntityFilter` because VehicleMileage carries BOTH a VehicleRef AND optionally a CustomerRef, and `EntityFilter` on this query type targets neither (`EntityFilter` chain is `EntityRef ?? CustomerRef ?? VendorRef ?? PayeeEntityRef` — no VehicleRef coverage).
+  - **`computeTotals` extended** with a VehicleMileage branch deriving `TotalMiles = OdometerEnd − OdometerStart` when TotalMiles is undefined AND both odometers are supplied. Mirrors the Check.Amount / Deposit.DepositTotal / SalesTaxPaymentCheck.TotalAmount / StatementCharge.Amount "derive when undefined" pattern.
+  - **New generic `BillableStatus` filter branch** in `handleQuery`. One-line, usable for any entity carrying BillableStatus. Only VehicleMileage uses it today (TimeTracking post-filters at the tool layer because QB's TimeTrackingQueryRq has no BillableStatus filter; if a future workflow needs server-side billable scoping on another entity type, the branch is already in place).
 
 - **Infrastructure changes (in sync across 4 lists per CLAUDE.md canonical-invariant rule):**
   - `buildDeleteRequest`'s isTransaction in [src/qbxml/builder.ts](src/qbxml/builder.ts)
   - `deleteEntity`'s isTransaction in [src/session/manager.ts](src/session/manager.ts)
   - `isTransactionType` in [src/session/simulation-store.ts](src/session/simulation-store.ts)
   - CLAUDE.md doc list at line 58
-  - **NOT** in `BANK_AFFECTING_TXN_TYPES` — AR-posting, not bank. No ClearedStatus default; doesn't participate in `qb_uncleared_transactions` or `qb_reconciliation_discrepancy`.
-  - 1 new parser arrayElement: `StatementChargeRet` only (no `*LineRet`).
+  - **NOT** in `BANK_AFFECTING_TXN_TYPES` (non-posting, no Bank/CC posting).
+  - 2 new parser arrayElements: `VehicleRet` + `VehicleMileageRet`.
 
-- **Sim handler dispatch (in [src/session/simulation-store.ts](src/session/simulation-store.ts)):**
-  - `handleAdd` post-persist branch after CreditMemo: `adjustPartyBalanceForTxn(finalEntity, "Customer", "Amount", +1)`.
-  - `handleTxnDel` post-store-lookup branch after InventoryAdjustment: `adjustPartyBalanceForTxn(target, "Customer", "Amount", -1)`.
-  - `handleMod` flow: captures `oldPartyAmount = existing.Amount` BEFORE merge (mirrors Invoice BalanceRemaining capture); after merge + optional Amount re-derive, calls `adjustPartyBalanceForTxnMod("Customer", "CustomerRef", "Amount", existing, updated, oldPartyAmount)` for same-customer delta or full reverse-then-apply on customer re-target.
+- **Half-odometer-pair validation order:** the `qb_vehicle_mileage_add` tool checks `hasOdometerStart && !hasOdometerEnd` (or vice versa) BEFORE the generic "missing distance source" check. This means an operator who supplied just one odometer side gets the precise "must come together" message rather than the generic "Provide either totalMiles, or BOTH odometers" message. This ordering was caught + fixed by a failing test in the first run (the test asserted the specific half-pair message via regex).
 
-- **Sim seed: deliberately omitted** (matches #80 precedent — bare `qb_statement_charge_list` returns count=0 against fresh sim; tests build state via `session.addEntity`). Reason: any seeded StatementCharge would change Customer.Balance from the pinned 15000 / 8500 / 3200 values that existing tests (engagement-profitability, customer-balance-detail, ar-aging, trial-balance-export) lock onto. Avoiding the disturbance is the same tradeoff #80 made for InventoryAdjustment.
+- **Sim seed: 3 vehicles + 4 mileage trips:**
+  - Vehicles: `V0000001` "2023 Ford F-150" (active), `V0000002` "2022 Toyota Camry" (active), `V0000003` "2020 Honda Civic (retired)" (inactive — IsActive: false; surfaces in `qb_vehicle_list({includeInactive:true})` only).
+  - Trips on 2024-11-04 / -05 (Acme, F-150, billable, odometer-bracketed) / 2024-11-06 (Global, Camry, billable, no odometer = totalMiles only) / 2024-11-07 (no CustomerRef = IRS office trip, F-150, NotBillable). Covers every filter dimension: customer/no-customer, billable/non-billable, odometer-bracketed/totalMiles-only, 2 active vehicles + skip the inactive one.
+  - Non-posting so seeded mileage doesn't disturb pinned Customer.Balance fixtures (Acme=15000 / Global=8500 / TechStart=3200).
 
-- **No batch tool in this cut.** Operator confirmed: single-charge create is the primary workflow; bulk month-end billing pattern uses N independent create calls. The #43-style atomic batch (qb_journal_entry_batch_create / qb_invoice_batch_create / qb_sales_receipt_batch_create) can be added if operator pain emerges — the infrastructure (executeBatchAdd / multi-request envelope plumbing) is in place.
+- **40 new tests in [tests/vehicle-mileage.test.ts](tests/vehicle-mileage.test.ts) across 4 layers** — all green. Coverage:
+  - sim seed + handleAdd basics (7 — Vehicle ActiveStatus splits, VehicleMileage seed count, TxnID assignment proves transaction routing, TotalMiles derivation from odometer pair, explicit override wins, totalMiles-only persistence, non-posting Customer.Balance unchanged on billable trip)
+  - sim handleQuery filters (4 — VehicleFilter by ListID + FullName matches VehicleRef, TripDateRangeFilter scopes TripStartDate, BillableStatus narrows)
+  - `qb_vehicle_list` (4 — default ActiveOnly, includeInactive, nameFilter Contains, vehicleListId fetch)
+  - `qb_vehicle_mileage_list` (9 — default 4, txnId / vehicleName / vehicleListId / customerName post-filter dropping no-CustomerRef entries / fromDate-toDate / billableStatus filters + paginate auto-default)
+  - `qb_vehicle_mileage_add` (13 — happy paths totalMiles+refs+billable / odometer-derives / explicit-wins / vehicleListId form / billable:false / billable-unset-omits-field, validation errors missing-vehicle / missing-distance-source / half-odometer-pair, idempotency replay + 9002 conflict, read-only 9001 with seed untouched)
 
-- **Limitation documented loudly in README + tool description:** `ReceivePayment.AppliedToTxnAdd` doesn't walk the StatementCharge store yet — `validateTxnApplications` in [src/session/simulation-store.ts](src/session/simulation-store.ts) looks up only the Invoice store. Payments referencing a StatementCharge TxnID will reject with "Invoice not found". Workaround today: customer pays a statement charge via an unapplied `qb_payment_receive` (the customer's open AR drops by TotalAmount but the underlying StatementCharge.Amount field stays unchanged in sim). Real QB closes statement charges via ReceivePayment just like invoices; future work extends `applyTxnApplications` to fan across both stores.
+- **README sync done.** Tool count 141 → 144 in both spots (`## Tools (144 total)` header + architecture diagram `(144 tools)` inset). New `### Vehicle Mileage` section between Time Tracking and Reference Lists explains Schedule C / Form 4562 framing, the non-posting + immutable-from-SDK posture, the read-only Vehicle list decision, the TripStartDate-not-TxnDate filter detail, and the full tool table.
 
-- **Intentional omissions from the tool surface:** `BillingDate` (operator confirmed — rarely shifted; QB uses TxnDate as fallback), `Taxable`, `SalesTaxCodeRef`, `OverrideItemAccountRef`, `Other1`, `Other2`. Keeps the first-cut API surface minimal; extend if a real workflow needs them.
+- **[src/index.ts](src/index.ts) got:** import + register call (line 85 + 229) + new Capabilities bullet (line 23 — "Vehicle mileage logs (Schedule C / Form 4562 — billable + non-billable trips)") + new `qb_vehicle_*` instructions block entry above `qb_time_track_*` + extension of the idempotency-keyed-tools enumeration with `qb_vehicle_mileage_add`.
 
-- **39 new tests in [tests/statement-charges.test.ts](tests/statement-charges.test.ts) across 7 layers** — all green. Coverage:
-  - sim handleAdd (6 — Amount = Qty*Rate derive, explicit Amount override, Amount-only persistence, +Amount AR posting, CustomerRef by ListID, orphan-CustomerRef silent no-op)
-  - sim handleTxnDel (2 — -Amount reversal, unknown TxnID 500 with no state mutation)
-  - sim handleMod (6 — Quantity-only re-derive + balance delta, Rate-only re-derive, explicit Amount wins over qty change, header-only mod preserves Amount, customer re-target reverses-and-applies, stale EditSequence 3170)
-  - `qb_statement_charge_list` (7 — empty fresh sim, post-create surface, txnId / customerName / refNumber / date filters, paginate auto-default MaxReturned=500)
-  - `qb_statement_charge_create` (7 — happy path qty*rate, explicit amount override, missing customerRef / itemRef / amount-source 3120 errors, idempotencyKey replay (verifies AR posted ONCE not twice) + 9002 conflict, read-only 9001)
-  - `qb_statement_charge_update` (7 — header-only mod, qty re-derive, explicit amount wins, customer re-target balance reconcile, stale editSequence 3170, unknown TxnID 500, read-only 9001)
-  - `qb_statement_charge_delete` (3 — happy path with balance reversal, unknown TxnID 500, read-only 9001)
-
-- **README sync done.** Tool count 137 → 141 in both spots (`## Tools (141 total)` header + architecture diagram `(141 tools)` inset). New `### Statement Charges` section between Inventory Adjustments and Journal Entries explains the single-row-at-header structure, the qty*rate vs explicit-amount derivation, AR posting rules, the customer re-target reverse-then-apply policy, and the ReceivePayment limitation.
-
-- **[src/index.ts](src/index.ts) got:** import + register call + new Capabilities bullet ("Statement charges (single-line AR billing without an invoice)") + new `qb_statement_charge_*` instructions block entry above inventory adjustments + extension of the idempotency-keyed-tools enumeration with `qb_statement_charge_create`.
-
-- **Tool count enumeration:** re-counted via `Grep -c "server\.tool\(" src/tools` → **141 distinct `server.tool` calls across 30 files**. Matches the README header.
+- **Tool count enumeration:** re-counted via `(Get-ChildItem "src\tools\*.ts" -File | Select-String -Pattern "server\.tool\(" | Measure-Object).Count` → **144 distinct `server.tool` calls across 31 files**. Matches the README header.
 
 ## Verify Before Continuing
 
 Re-run if the tree has been touched (skip if next session starts within hours):
 
 - [ ] `npm run build` → exit 0 (tsc clean).
-- [ ] `npm test` → `Test Files 51 passed | Tests 1275 passed`.
+- [ ] `npm test` → `Test Files 52 passed | Tests 1315 passed`.
 - [ ] `"" | & node dist/index.js` → exit 0, `Mode: simulation` printed.
-- [ ] **(Windows + QB) #81 first live exercise.** Connect to `VR Tax & Consulting Inc..qbw` (or any company file with at least one active service item and at least one active customer). Walk the statement-charge cycle:
-  1. `qb_item_list({ itemType: "Service" })` — find an active service item; capture its `FullName` and `ListID`.
-  2. `qb_customer_list({})` — find an active customer; capture its `Balance` and `FullName`.
-  3. `qb_statement_charge_create({ customerName: "<customer>", itemName: "<service item>", quantity: 2, rate: 50, refNumber: "SC-TEST-001", description: "Live test charge" })` — confirm `success: true`, `statementCharge.Amount === 100`, and that `qb_customer_list` shows the customer's `Balance` increased by 100.
-  4. `qb_statement_charge_list({ customerName: "<customer>" })` — confirm the new charge surfaces with `Amount: 100`.
-  5. `qb_statement_charge_update({ txnId: "<TxnID>", editSequence: "<editSeq>", quantity: 4 })` — confirm `statementCharge.Amount === 200` (re-derived from new qty × original rate) and the customer's `Balance` increased by another 100 (delta from 100 → 200).
-  6. `qb_statement_charge_delete({ txnId: "<TxnID>" })` — confirm `Balance` reverts to its original pre-test value.
-  - **If a schema-order class of bug surfaces (statusCode -1 from QBXMLRP2)** on `StatementChargeAddRq` / `StatementChargeQueryRq` / `StatementChargeModRq`, capture envelope via `QB_DEBUG_QBXML=1` and pin canonical child order in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts) the way #37 did for `GeneralSummaryReportQueryRq`. The JS key insertion order in the tool layer (per qbxmlops130 schema) is `CustomerRef → TxnDate → RefNumber → DueDate → ItemRef → Desc → Quantity → Rate → ClassRef → Amount`.
-  - **Try a fixed-fee charge** (`{ customerName: "...", itemName: "...", amount: 250 }` with no quantity/rate) to validate the Amount-without-qty/rate branch on real QB. Some live SDK versions may reject this and require Quantity=1 + Rate=Amount; if so, surface the error at the tool layer.
-- [ ] **(Windows + QB) Carried — #80 inventory adjustments first live exercise** against `VR Tax & Consulting Inc..qbw`. (Connect → `qb_item_list({itemType:"Inventory"})` → adjust qty/value → list with includeLineItems → delete; see prior handoff section in todo.md #80 for exact steps.)
-- [ ] **(Windows + QB) Carried — #77 sales tax first live exercise** against `VR Tax & Consulting Inc..qbw`.
-- [ ] **(Windows + QB) Carried — #76 sales orders first live exercise** against `VR Tax & Consulting Inc..qbw`.
+- [ ] **(Windows + QB) #79 first live exercise.** Connect to `VR Tax & Consulting Inc..qbw` (or any company file with at least one active Vehicle — add one in QB Desktop under Lists → Customer & Vendor Profile Lists → Vehicle List if none exists). Walk the mileage cycle:
+  1. `qb_vehicle_list({})` — confirm at least one active vehicle returns. Capture its `FullName` and `ListID`.
+  2. `qb_vehicle_mileage_add({ vehicleName: "<vehicle>", tripStartDate: "<today>", tripEndDate: "<today>", odometerStart: <current odometer>, odometerEnd: <current + 25>, notes: "Live test trip" })` — confirm `success: true`, `vehicleMileage.TotalMiles === 25` (derived from odometer pair), and a TxnID returned.
+  3. `qb_vehicle_mileage_list({ vehicleName: "<vehicle>" })` — confirm the new trip surfaces.
+  4. `qb_vehicle_mileage_add({ vehicleListId: "<listid>", tripStartDate: "<today>", tripEndDate: "<today>", totalMiles: 12, billable: true, customerName: "<any active customer>" })` — confirm explicit totalMiles persists, BillableStatus='Billable', CustomerRef attached.
+  5. `qb_vehicle_mileage_list({ billableStatus: "Billable" })` — confirm only billable trips surface (the trip from step 4 should be there; trip from step 2 should not).
+  - **If a schema-order class of bug surfaces (statusCode -1 from QBXMLRP2)** on `VehicleMileageAddRq` / `VehicleMileageQueryRq` / `VehicleQueryRq`, capture envelope via `QB_DEBUG_QBXML=1` and pin canonical child order in [tests/builder-emit-order.test.ts](tests/builder-emit-order.test.ts) the way #37 did for `GeneralSummaryReportQueryRq`. The JS key insertion order in the tool layer (per qbxmlops130 schema) is `VehicleRef → TripStartDate → TripEndDate → OdometerStart → OdometerEnd → TotalMiles → CustomerRef → ItemRef → ClassRef → Notes → BillableStatus`.
+- [ ] **(Windows + QB) Carried — #81 statement charges first live exercise** against `VR Tax & Consulting Inc..qbw`. (See prior handoff section for exact steps.)
+- [ ] **(Windows + QB) Carried — #80 inventory adjustments first live exercise.**
+- [ ] **(Windows + QB) Carried — #77 sales tax first live exercise.**
+- [ ] **(Windows + QB) Carried — #76 sales orders first live exercise.**
 - [ ] **(Windows + QB) Carried — #70 `qb_engagement_profitability` first live exercise.**
 - [ ] **(Windows + QB) Carried — #78 time tracking first live exercise.** TimeTrackingAddRq canonical child order: `TxnDate → EntityRef → CustomerRef → ItemServiceRef → Duration → ClassRef → PayrollItemWageRef → Notes → IsBillable → BillableStatus`.
 - [ ] **(Windows + QB) Carried — #71 `qb_client_packet` first live exercise.**
@@ -82,63 +74,58 @@ Re-run if the tree has been touched (skip if next session starts within hours):
 
 ## Next Task
 
-**Operator picks next.** With #81 closed, remaining Phase 17 + Phase 13–14 work:
+**Operator picks next.** With #79 closed, **Phase 17 is COMPLETE** (every item 75–81 done). Remaining work clusters:
 
-- **#79 vehicle mileage** (Phase 17) — `qb_vehicle_mileage_add` / `_list` / `qb_vehicle_list`. `VehicleMileageAddRq` / `VehicleMileageQueryRq` / `VehicleQueryRq`. Tax-practice staple (Schedule C / Form 4562 mileage logs). Last remaining Phase 17 item.
 - **Phase 13–14 coverage gaps** — DataExt (#61), sub-customer (#62), memo search (#63), dry-run (#64), better errors (#65), audit log (#66 — Enterprise-only).
 - **#72 generic `qb_transaction_list`** (Phase 16) — composite fanout across the 6 customer-side txn types ("show me everything for customer X in March" → 1 call instead of 6).
-- **Follow-up — StatementCharge in ReceivePayment.AppliedToTxn:** extend `validateTxnApplications` + `applyTxnApplications` in [src/session/simulation-store.ts](src/session/simulation-store.ts) to walk both Invoice AND StatementCharge stores when resolving an AppliedToTxn TxnID. Currently a `qb_payment_receive` with `appliedTo: [{txnId: "<statementChargeTxnId>"}]` rejects with "Invoice not found". Low-priority — operators can pay via an unapplied receive-payment in the meantime, but real QB closes statement charges through ReceivePayment exactly like invoices.
+- **Follow-up — VehicleMileage delete:** if mistake-correction workflows surface, add `qb_vehicle_mileage_delete` as a thin tool over the existing `deleteEntity("VehicleMileage", txnId)` path — the four-list sync infrastructure is already in place, so it's a one-tool add with parallel test coverage (delete happy path / unknown TxnID 500 / read-only 9001 / non-posting invariant — no balance to reverse).
+- **Follow-up — StatementCharge in ReceivePayment.AppliedToTxn:** extend `validateTxnApplications` + `applyTxnApplications` in [src/session/simulation-store.ts](src/session/simulation-store.ts) to walk both Invoice AND StatementCharge stores when resolving an AppliedToTxn TxnID. Currently a `qb_payment_receive` with `appliedTo: [{txnId: "<statementChargeTxnId>"}]` rejects with "Invoice not found". Low-priority — operators can pay via an unapplied receive-payment in the meantime.
 
 ## Context Notes
 
-- **Authoritative tool count is 141** (re-enumerated via `Grep -c "server\.tool\(" src/tools` → 141 distinct calls across 30 files). README + architecture diagram both reflect 141. Don't blindly increment from a HANDOFF figure — re-grep before bumping.
+- **Authoritative tool count is 144** (re-enumerated via `(Get-ChildItem "src\tools\*.ts" -File | Select-String -Pattern "server\.tool\(" | Measure-Object).Count` → 144 distinct calls across 31 files). README + architecture diagram both reflect 144. Don't blindly increment from a HANDOFF figure — re-grep before bumping.
 
-- **#81 StatementCharge is the only single-row-at-header transaction type in this server.** Every other transaction (Invoice, Bill, Estimate, SalesReceipt, CreditMemo, PurchaseOrder, JournalEntry, Deposit, Check, Transfer, BillPaymentCheck, BillPaymentCreditCard, SalesOrder, CreditCardCharge, CreditCardCredit, SalesTaxPaymentCheck, InventoryAdjustment) carries a `*LineAdd` array — even single-line transactions like Check or Deposit go through `convertLinesAddToRet`. StatementCharge breaks the pattern: ItemRef / Quantity / Rate / Amount live directly on the txn body. `convertLinesAddToRet` is a no-op for it; `computeTotals` has a dedicated branch to derive Amount at header level. Future maintainers extending sim handlers: don't grep for "*LineRet" patterns to find StatementCharge — it isn't there.
+- **#79 VehicleMileage has NO `TxnDate` field.** TripStartDate / TripEndDate are the canonical timestamps. The new `TripDateRangeFilter` branch in `handleQuery` is parallel to `TxnDateRangeFilter` (which scopes `TxnDate`). If you add another date-range-scoped tool against VehicleMileage in the future, use TripDateRangeFilter — the TxnDateRangeFilter branch is a no-op against this entity.
 
-- **#81 `adjustPartyBalanceForTxn` + `adjustPartyBalanceForTxnMod` amountField union now includes `"Amount"`.** Strict improvement — was `"BalanceRemaining" | "AmountDue" | "TotalAmount"`, now plus `"Amount"`. Any future header-Amount transaction type can use these helpers without further widening. If you add `"Amount"` to more transaction types, no API change needed.
+- **#79 VehicleMileage is non-posting** — same posture as TimeTracking. No GL effect, no AR/AP movement, not in `BANK_AFFECTING_TXN_TYPES`. Trips with a `CustomerRef` are tagged for billing (Time/Costs dialog) but don't move that customer's `Balance`. A test pins this against Acme.
 
-- **#81 customer re-target on update reverses-then-applies the full Amount.** Same convention as Invoice (`adjustPartyBalanceForTxnMod` with sign=+1). Same-customer mods move balance by the delta (`newAmount − oldAmount`); customer changes trigger full reverse-then-apply. Tests pin both paths.
+- **#79 NO `_update` tool — qbXML SDK has no `VehicleMileageModRq`.** Grepped against qbxmlops20.xml → qbxmlops140.xml — zero hits. Trips are immutable from the SDK's perspective. If an operator asks "how do I correct a trip?" — the answer is delete it in QB Desktop's UI and re-add via `qb_vehicle_mileage_add`. Tool description calls this out loudly.
 
-- **#81 BillingDate / Taxable / SalesTaxCodeRef / OverrideItemAccountRef / Other1 / Other2 intentionally NOT exposed** on the tool surface. Per operator confirmation during scope-setting: BillingDate operators rarely shift (defaults to TxnDate on real QB); tax fields and override-account live in a deferred sales-tax integration; Other1/Other2 are vestigial fields rarely used. Extend if a real workflow surfaces the need.
+- **#79 NO `_delete` tool in this cut** — mileage logs are auditable records (Schedule C / Form 4562) and operators rarely delete them. The four-list sync infrastructure IS in place (`VehicleMileage` is in builder.ts / manager.ts / simulation-store.ts isTransaction lists + CLAUDE.md line 58) so a future `qb_vehicle_mileage_delete` is a thin add — one new tool, ~3 tests (happy path / unknown TxnID 500 / read-only 9001), no sim handler changes (handleTxnDel's generic path handles non-posting delete fine; no balance to reverse).
 
-- **#81 ReceivePayment limitation.** `validateTxnApplications` in [src/session/simulation-store.ts](src/session/simulation-store.ts) hardcodes `this.getStore("Invoice")` — payments referencing a StatementCharge TxnID will reject. Future fix: walk both stores (or any AR-posting transaction store). Two-line change at the validation site plus per-line lookup adjustment in `applyTxnApplications`. Operator can pay statement charges today via unapplied receive-payment (customer's open AR drops by TotalAmount; statement charge's Amount stays unchanged — matches the operator's request that "this is enough for first cut").
+- **#79 half-odometer-pair validation order matters.** The "must come together" check fires BEFORE the generic "totalMiles or pair" check in `qb_vehicle_mileage_add`. An operator who supplied just `odometerStart` (no `odometerEnd`) gets the precise message rather than the generic. A test asserts this via regex; if you reorder these checks the test will catch the regression.
 
-- **#81 four-list sync caught for the third consecutive transaction type** (`InventoryAdjustment` (#80) → `SalesTaxPaymentCheck` (#77) → `TimeTracking` (#78) → now `StatementCharge` (#81)). The rule is: any new transaction type updates four locations — `isTransaction` in [src/qbxml/builder.ts](src/qbxml/builder.ts), `isTransaction` in [src/session/manager.ts](src/session/manager.ts), `isTransactionType` in [src/session/simulation-store.ts](src/session/simulation-store.ts), AND the CLAUDE.md doc list at line 58. Tests catch divergence (TxnDel routing breaks if any list is out of sync) — but the CLAUDE.md doc list has no test coverage; it drifts silently. Future PRs adding a new transaction type: grep for the latest `"StatementCharge"` insertion to find all four sites at once.
+- **#79 `billable` boolean shape:** `true` → `BillableStatus='Billable'`; `false` → `'NotBillable'`; unset omits the field entirely (matches QB default). DIFFERENT FROM TimeTracking which also emits `IsBillable: boolean` alongside `BillableStatus` (the legacy primary boolean + the round-trip enum). VehicleMileage only carries `BillableStatus` — no IsBillable field per the schema.
 
-- **#81 NO seed deliberate omission.** Bare `qb_statement_charge_list` returns count=0 against fresh sim. Avoids disturbing Customer.Balance fixtures (Acme=15000 / Global=8500 / TechStart=3200) that engagement-profitability, customer-balance-detail, ar-aging, and trial-balance-export tests lock onto. Matches the #80 InventoryAdjustment precedent. If a future workflow needs richer fresh-sim StatementCharge experience, the operator creates them via `qb_statement_charge_create` at session start.
+- **#79 four-list sync caught for the FIFTH consecutive transaction type** (`InventoryAdjustment` #80 → `SalesTaxPaymentCheck` #77 → `TimeTracking` #78 → `StatementCharge` #81 → now `VehicleMileage` #79). The rule is unchanged: any new transaction type updates four locations — `isTransaction` in [src/qbxml/builder.ts](src/qbxml/builder.ts), `isTransaction` in [src/session/manager.ts](src/session/manager.ts), `isTransactionType` in [src/session/simulation-store.ts](src/session/simulation-store.ts), AND the CLAUDE.md doc list at line 58. Tests catch divergence (TxnDel routing breaks if any list is out of sync) — but the CLAUDE.md doc list has no test coverage; it drifts silently.
 
 - **Carried gotchas (unchanged from prior handoffs — all still apply):**
-  - **#80 InventoryAdjustment is the first transaction type that mutates ItemInventory state.** No prior transaction touches QuantityOnHand / AverageCost / QuantityOnHandValue.
-  - **#80 two-phase commit invariant** — `applyInventoryAdjustment` validates every line BEFORE mutating any items. Tests pin this.
-  - **#80 NO `_update` tool** — `InventoryAdjustmentModRq` exists but operational pattern is delete + recreate.
-  - **#80 GL posting to AccountRef NOT modeled** in sim's first cut. Same deferred class as #43 JE-line customer-balance bookkeeping.
-  - **#80 SalesReceipt / SalesOrder seed lines reference Widget A** — `tests/sales-by-customer.test.ts:126` and `tests/sales-by-item.test.ts:124`. Seed bump doesn't change Widget A's identity.
+  - **#81 StatementCharge is the only single-row-at-header transaction type** — no `*LineAdd` array; ItemRef/Quantity/Rate/Amount live at the txn HEADER. `convertLinesAddToRet` is a no-op for it.
+  - **#81 `adjustPartyBalanceForTxn` + `adjustPartyBalanceForTxnMod` amountField union now includes `"Amount"`.**
+  - **#81 customer re-target on update reverses-then-applies the full Amount.** Mirrors Invoice's policy.
+  - **#81 ReceivePayment limitation.** `validateTxnApplications` hardcodes the Invoice store — payments referencing a StatementCharge TxnID will reject.
+  - **#80 InventoryAdjustment is the first transaction type that mutates ItemInventory state.** Two-phase commit invariant — `applyInventoryAdjustment` validates every line BEFORE mutating any items.
+  - **#80 NO `_update` tool** — operational pattern is delete + recreate.
   - **#80 AverageCost preserved at zero qty** — pinned test.
-  - **#77 SalesReceipt seed is dated 2025-01-15** deliberately — falls outside the 2024-windowed engagement-profitability tests + the 2025-12 customer-balance-detail tests.
+  - **#77 SalesReceipt seed is dated 2025-01-15** deliberately — falls outside windowed tests.
   - **#77 liability report is HEADER-level only** — per-line tax flagging is not modeled in sim.
-  - **#77 sales-tax agencies are Vendors, not a separate entity** — derived from distinct TaxVendorRef values.
   - **#77 SalesTaxPaymentCheck vs Check distinction** — payment check reduces sales-tax-item liability; regular check posted to a tax-liability account would double-count.
-  - **#77 SalesTaxLiability custom report shape** — emits `Rows / ByAgency / Totals` rather than canonical `Sections / Totals`.
   - **#76 SalesOrder is non-posting** — Customer.Balance does NOT move on SO add or delete.
   - **#76 convert idempotency skip-on-replay** — same pattern as estimate convert.
-  - **Convert-to-invoice idempotency pattern is now a 2x example** (estimate + sales order). Future convert-style composites should follow.
   - **#70 `IncludeLineItems: true` is LOAD-BEARING** for any tool that walks line-level data on Bill/Check/CreditCardCharge/SalesOrder.
   - **#70 customer scope on time is POST-FILTERED.**
   - **#70 customer scope on Bill/Check/CCC is LINE-LEVEL.**
-  - **#70 summary OMITTED when any section is error or any toggle off.**
-  - **#70 customer lookup is the one non-fail-soft path.**
-  - **#70 first cross-tool consumer of `parseDurationToHours`** from [src/tools/time-tracking.ts](src/tools/time-tracking.ts).
   - **#70 `customerRefMatches` accepts EITHER ListID OR FullName match.**
-  - **#78 EntityFilter priority reorder** — `handleQuery` does `EntityRef ?? CustomerRef ?? VendorRef ?? PayeeEntityRef`.
+  - **#78 EntityFilter priority reorder** — `handleQuery` does `EntityRef ?? CustomerRef ?? VendorRef ?? PayeeEntityRef`. #79 adds a parallel `VehicleFilter` branch that scopes `VehicleRef` (NOT in the EntityFilter chain — VehicleMileage carries both VehicleRef and CustomerRef and EntityFilter on this query type targets neither).
   - **#78 Duration is ISO 8601 PT-H-M-S only.**
-  - **#78 IsBillable + BillableStatus co-emission.**
+  - **#78 IsBillable + BillableStatus co-emission.** #79 emits BillableStatus only (no IsBillable — VehicleMileage schema doesn't carry that field).
   - **#71 fail-soft contract** — `sections.<name>` is either the success payload OR an `{ error: {...} }` block.
   - **#71 payroll has THREE skip states** — Pro → 9003, wire-zero → 9004, probe-fail → error.
   - **#71 GL defaults to PnLOnly scope** for cost reasons.
   - **#71 customerListId / customerName is OPTIONAL CONTEXT, NOT A FILTER.** #70 INVERTS this.
   - **#71 AccountQueryRq failure is the only non-fail-soft path** for #71; #70's parallel is CustomerQueryRq failure.
   - **#75 EntityFilter strict improvement** — `handleQuery` matches `PayeeEntityRef` for Check / BillPaymentCheck / BillPaymentCreditCard / CreditCardCharge / CreditCardCredit.
-  - **#75 `computeTotals` Check.Amount / Deposit.DepositTotal** — "set when undefined, preserve explicit overrides". #76 (SalesOrder.TotalAmount) inverts: always derives. #77 (SalesTaxPaymentCheck.TotalAmount) follows the same set-when-undefined pattern. #80 (InventoryAdjustment.TotalAmount) ALWAYS overrides. **#81 (StatementCharge.Amount) follows the "set when undefined, preserve override" pattern** — explicit Amount on create wins; on update the dedicated "delete-then-recompute" block lets a Qty- or Rate-only mod re-derive.
+  - **#75 / #77 / #81 / #79 `computeTotals` "set when undefined, preserve override" pattern** — Check.Amount / Deposit.DepositTotal / SalesTaxPaymentCheck.TotalAmount / StatementCharge.Amount / VehicleMileage.TotalMiles. #76 (SalesOrder.TotalAmount) inverts: always derives. #80 (InventoryAdjustment.TotalAmount) ALWAYS overrides.
   - **#75 Sim does NOT move `Bank.Account.Balance`** on Deposit/Transfer/Check.
   - **#67 default path is zero wire I/O.** Probe is opt-in.
   - **#68 RECON_TOLERANCE = 0.01.**
@@ -146,7 +133,6 @@ Re-run if the tree has been touched (skip if next session starts within hours):
   - **#85 SDK gap is permanent** — `qb_closing_date_set` always 9005 + UI navigation.
   - **Synthetic statusCodes**: 9001 read-only, 9002 idempotency conflict, 9003 edition unsupported, 9004 payroll subscription required, 9005 SDK has no write path.
   - **#86 prompts registration** uses `reg<Args>(entry)` helper + `as const` tuple.
-  - **Four lists must stay in sync** across builder / manager / simulation-store + CLAUDE.md doc list (caught for #77, #78, #80, now #81 in a row).
   - **AR-side `Customer.Balance` discount math is correct; AP-side is NOT** — future `qb_bill_write_off` needs the parallel fix.
   - **Dispatch order in `processRequest`**: non-entity-typed `*QueryRq` / `*ModRq` / `AttachableAddRq` MUST precede the `endsWith` catch-alls.
   - **Iterator wire names diverge**: `iterator`/`iteratorID` on request, `iteratorRemainingCount`/`iteratorID` on response.
