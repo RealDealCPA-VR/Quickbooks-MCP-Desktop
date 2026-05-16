@@ -2824,6 +2824,23 @@ export class SimulationStore {
           data: {},
         };
       }
+    } else if (entityType === "InventoryAdjustment") {
+      // Phase 17 #80 — walks each line, mutates the referenced ItemInventory's
+      // QuantityOnHand / QuantityOnHandValue / AverageCost, and writes derived
+      // QuantityDifference / ValueDifference / Amount back to the line. Pure
+      // pre-validation pass — if any line is malformed the helper returns an
+      // error WITHOUT mutating any item, so a doomed adjustment never leaves
+      // the store in a half-applied state.
+      const applyResult = this.applyInventoryAdjustment(finalEntity);
+      if (!applyResult.ok) {
+        return {
+          type: rsType,
+          statusCode: applyResult.statusCode,
+          statusSeverity: "Error",
+          statusMessage: applyResult.error,
+          data: {},
+        };
+      }
     }
 
     store.set(id, finalEntity);
@@ -3589,6 +3606,254 @@ export class SimulationStore {
       if (!Number.isNaN(amt)) sum += amt;
     }
     return sum;
+  }
+
+  // -----------------------------------------------------------------------
+  // InventoryAdjustment (Phase 17 #80)
+  // -----------------------------------------------------------------------
+
+  // Walks an InventoryAdjustment's lines, mutates the referenced ItemInventory
+  // entries, and writes derived QuantityDifference / ValueDifference / Amount
+  // back to each line so subsequent qb_inventory_adjustment_list calls (and the
+  // delete-time reversal) can read them.
+  //
+  // Two-phase: validates EVERY line first (item lookup, adjustment-shape
+  // sanity, AccountRef present), accumulates the planned per-line mutations,
+  // and only commits after the full set passes. A doomed line in position 5
+  // must not leave items 1-4 partially adjusted.
+  //
+  // Real QB derives ValueDifference for QuantityAdjustment lines as
+  // QuantityDifference * AverageCost. ValueAdjustment lines accept either
+  // NewValue (absolute) or ValueDifference (delta) and may also carry an
+  // independent NewQuantity / QuantityDifference. The sim mirrors both shapes;
+  // the underlying ItemInventory state is updated to keep
+  // QuantityOnHandValue = QuantityOnHand * AverageCost as a class invariant
+  // (when QuantityOnHand > 0; AverageCost is preserved at zero qty).
+  private applyInventoryAdjustment(
+    entity: StoredEntity
+  ): { ok: true } | { ok: false; statusCode: number; error: string } {
+    const accountRef = entity.AccountRef as Record<string, unknown> | undefined;
+    if (!accountRef || (!accountRef.FullName && !accountRef.ListID)) {
+      return {
+        ok: false,
+        statusCode: 3120,
+        error: "InventoryAdjustmentAdd requires AccountRef (FullName or ListID)",
+      };
+    }
+
+    const lines = entity.InventoryAdjustmentLineRet;
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return {
+        ok: false,
+        statusCode: 3120,
+        error: "InventoryAdjustmentAdd requires at least one InventoryAdjustmentLineAdd",
+      };
+    }
+
+    type Plan = {
+      line: Record<string, unknown>;
+      item: StoredEntity;
+      newQuantity: number;
+      newQuantityValue: number;
+      newAverageCost: number;
+      quantityDifference: number;
+      valueDifference: number;
+    };
+    const plans: Plan[] = [];
+    const itemStore = this.getStore("ItemInventory");
+
+    // Track running per-item state so multi-line adjustments against the same
+    // item compose correctly (rare in practice — two lines for one item is
+    // operator error in real QB — but the sim shouldn't crash on it). Map keyed
+    // on the item's ListID; values mirror the ItemInventory state after each
+    // applied plan.
+    const runningQty = new Map<string, number>();
+    const runningValue = new Map<string, number>();
+    const runningAvgCost = new Map<string, number>();
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] as Record<string, unknown>;
+      const itemRef = line.ItemRef as Record<string, unknown> | undefined;
+      if (!itemRef || (!itemRef.FullName && !itemRef.ListID)) {
+        return {
+          ok: false,
+          statusCode: 3120,
+          error: `InventoryAdjustmentLineAdd[${i}] requires ItemRef (FullName or ListID)`,
+        };
+      }
+      const item = this.findInventoryItem(itemRef);
+      if (!item) {
+        return {
+          ok: false,
+          statusCode: 500,
+          error: `Item "${String(itemRef.FullName ?? itemRef.ListID)}" specified in InventoryAdjustmentLineAdd[${i}] cannot be found (must be ItemInventory)`,
+        };
+      }
+
+      const qtyAdj = line.QuantityAdjustment as Record<string, unknown> | undefined;
+      const valAdj = line.ValueAdjustment as Record<string, unknown> | undefined;
+      if (qtyAdj && valAdj) {
+        return {
+          ok: false,
+          statusCode: 3120,
+          error: `InventoryAdjustmentLineAdd[${i}] cannot carry both QuantityAdjustment and ValueAdjustment — pick one`,
+        };
+      }
+      if (!qtyAdj && !valAdj) {
+        return {
+          ok: false,
+          statusCode: 3120,
+          error: `InventoryAdjustmentLineAdd[${i}] requires QuantityAdjustment or ValueAdjustment`,
+        };
+      }
+
+      const itemId = String(item.ListID);
+      const currentQty = runningQty.get(itemId) ?? Number(item.QuantityOnHand ?? 0);
+      const currentAvgCost = runningAvgCost.get(itemId) ?? Number(item.AverageCost ?? item.PurchaseCost ?? 0);
+      const currentValue = runningValue.get(itemId)
+        ?? Number(item.QuantityOnHandValue ?? currentQty * currentAvgCost);
+
+      let quantityDifference = 0;
+      let valueDifference = 0;
+
+      if (qtyAdj) {
+        if (qtyAdj.NewQuantity !== undefined) {
+          quantityDifference = Number(qtyAdj.NewQuantity) - currentQty;
+        } else if (qtyAdj.QuantityDifference !== undefined) {
+          quantityDifference = Number(qtyAdj.QuantityDifference);
+        } else {
+          return {
+            ok: false,
+            statusCode: 3120,
+            error: `InventoryAdjustmentLineAdd[${i}].QuantityAdjustment requires NewQuantity or QuantityDifference`,
+          };
+        }
+        if (!Number.isFinite(quantityDifference)) {
+          return {
+            ok: false,
+            statusCode: 3120,
+            error: `InventoryAdjustmentLineAdd[${i}].QuantityAdjustment is not a finite number`,
+          };
+        }
+        // Pure quantity adjustment — value moves at the current average cost.
+        // Real QB does the same: shrinkage of 5 units at $12 avg cost posts
+        // -$60 to the offset account.
+        valueDifference = quantityDifference * currentAvgCost;
+      } else if (valAdj) {
+        if (valAdj.NewQuantity !== undefined) {
+          quantityDifference = Number(valAdj.NewQuantity) - currentQty;
+        } else if (valAdj.QuantityDifference !== undefined) {
+          quantityDifference = Number(valAdj.QuantityDifference);
+        } // else quantity unchanged on a pure value adjustment
+
+        if (valAdj.NewValue !== undefined) {
+          valueDifference = Number(valAdj.NewValue) - currentValue;
+        } else if (valAdj.ValueDifference !== undefined) {
+          valueDifference = Number(valAdj.ValueDifference);
+        } else {
+          return {
+            ok: false,
+            statusCode: 3120,
+            error: `InventoryAdjustmentLineAdd[${i}].ValueAdjustment requires NewValue or ValueDifference`,
+          };
+        }
+        if (!Number.isFinite(quantityDifference) || !Number.isFinite(valueDifference)) {
+          return {
+            ok: false,
+            statusCode: 3120,
+            error: `InventoryAdjustmentLineAdd[${i}].ValueAdjustment carries a non-finite number`,
+          };
+        }
+      }
+
+      const newQuantity = currentQty + quantityDifference;
+      const newQuantityValue = currentValue + valueDifference;
+      // AverageCost recomputes from the post-adjustment value / qty, EXCEPT
+      // when qty falls to zero — then real QB preserves the prior cost so a
+      // future restock doesn't lose its cost-basis history.
+      const newAverageCost = newQuantity > 0
+        ? newQuantityValue / newQuantity
+        : currentAvgCost;
+
+      plans.push({
+        line,
+        item,
+        newQuantity,
+        newQuantityValue,
+        newAverageCost,
+        quantityDifference,
+        valueDifference,
+      });
+
+      runningQty.set(itemId, newQuantity);
+      runningValue.set(itemId, newQuantityValue);
+      runningAvgCost.set(itemId, newAverageCost);
+    }
+
+    // Commit phase — every plan validated, now mutate.
+    const now = new Date().toISOString();
+    for (const plan of plans) {
+      plan.item.QuantityOnHand = plan.newQuantity;
+      plan.item.QuantityOnHandValue = plan.newQuantityValue;
+      plan.item.AverageCost = plan.newAverageCost;
+      plan.item.TimeModified = now;
+      plan.item.EditSequence = this.nextEditSequence();
+
+      // Drop the input wrappers (real QB normalizes these on read — what comes
+      // back from a query is QuantityDifference + ValueDifference regardless
+      // of which input form the operator used).
+      delete plan.line.QuantityAdjustment;
+      delete plan.line.ValueAdjustment;
+      plan.line.QuantityDifference = plan.quantityDifference;
+      plan.line.ValueDifference = plan.valueDifference;
+      plan.line.Amount = plan.valueDifference;
+    }
+
+    // Header TotalAmount = sum of value deltas (positive when stock went up,
+    // negative on shrinkage). Always overwritten — the operator can't sensibly
+    // override this (it must reconcile with the per-line ValueDifference sum).
+    entity.TotalAmount = plans.reduce((s, p) => s + p.valueDifference, 0);
+    return { ok: true };
+  }
+
+  private reverseInventoryAdjustment(target: StoredEntity): void {
+    const lines = target.InventoryAdjustmentLineRet;
+    if (!Array.isArray(lines)) return;
+    const now = new Date().toISOString();
+    for (const line of lines as Record<string, unknown>[]) {
+      const itemRef = line.ItemRef as Record<string, unknown> | undefined;
+      if (!itemRef) continue;
+      const item = this.findInventoryItem(itemRef);
+      if (!item) continue; // orphan — silently skip
+      const qtyDelta = Number(line.QuantityDifference ?? 0);
+      const valueDelta = Number(line.ValueDifference ?? 0);
+      const newQuantity = Number(item.QuantityOnHand ?? 0) - qtyDelta;
+      const newQuantityValue = Number(item.QuantityOnHandValue ?? 0) - valueDelta;
+      item.QuantityOnHand = newQuantity;
+      item.QuantityOnHandValue = newQuantityValue;
+      item.AverageCost = newQuantity > 0
+        ? newQuantityValue / newQuantity
+        : Number(item.AverageCost ?? 0);
+      item.TimeModified = now;
+      item.EditSequence = this.nextEditSequence();
+    }
+  }
+
+  private findInventoryItem(
+    ref: Record<string, unknown>
+  ): StoredEntity | undefined {
+    const store = this.getStore("ItemInventory");
+    if (ref.ListID) {
+      const hit = store.get(String(ref.ListID));
+      if (hit) return hit;
+    }
+    if (ref.FullName) {
+      const fullName = String(ref.FullName);
+      for (const item of store.values()) {
+        if (String(item.FullName ?? item.Name ?? "") === fullName) return item;
+      }
+    }
+    return undefined;
   }
 
   // -----------------------------------------------------------------------
@@ -4479,6 +4744,13 @@ export class SimulationStore {
       // a deleted invoice shouldn't block memo deletion).
       this.reverseCreditMemoApplication(target);
       this.adjustPartyBalanceForTxn(target, "Customer", "TotalAmount", +1);
+    } else if (entityType === "InventoryAdjustment") {
+      // Phase 17 #80 — walk each line and reverse the qty / value mutations
+      // applied to the ItemInventory store on add. Orphan items (item deleted
+      // out from under the adjustment) are silently skipped — a missing item
+      // must not block transaction deletion (matches the orphan-invoice
+      // policy on credit-memo reversal above).
+      this.reverseInventoryAdjustment(target);
     }
 
     store.delete(txnID);
@@ -4733,6 +5005,12 @@ export class SimulationStore {
       // + EditSequence + lines (one per ItemSalesTaxRef being paid). Bank-affecting
       // (added to BANK_AFFECTING_TXN_TYPES below). Three lists in sync.
       "SalesTaxPaymentCheck",
+      // Phase 17 #80 — InventoryAdjustment. Posts QuantityOnHand / value changes
+      // against ItemInventory rows via per-line QuantityAdjustment /
+      // ValueAdjustment containers. Carries TxnID + EditSequence, deletes via
+      // TxnDelRq. NOT bank-affecting (no Bank/CC posting; the AccountRef header
+      // is a P&L offset — typically Inventory Adjustment expense or COGS).
+      "InventoryAdjustment",
     ].includes(entityType);
   }
 
@@ -4964,7 +5242,12 @@ export class SimulationStore {
     const sampleItems: StoredEntity[] = [
       { ListID: "I0000001", Name: "Consulting Services", FullName: "Consulting Services", IsActive: true, ItemType: "Service", Description: "Professional consulting services", Price: 150.00, EditSequence: now, TimeCreated: "2024-01-15T09:00:00", TimeModified: now },
       { ListID: "I0000002", Name: "Software License", FullName: "Software License", IsActive: true, ItemType: "NonInventory", Description: "Annual software license", Price: 499.00, EditSequence: now, TimeCreated: "2024-01-15T09:00:00", TimeModified: now },
-      { ListID: "I0000003", Name: "Widget A", FullName: "Widget A", IsActive: true, ItemType: "Inventory", Description: "Standard widget", Price: 25.00, Cost: 12.00, EditSequence: now, TimeCreated: "2024-02-01T10:00:00", TimeModified: now },
+      // Phase 17 #80 — ItemInventory rows carry QuantityOnHand + AverageCost +
+      // QuantityOnHandValue so qb_inventory_adjustment_* has live state to
+      // mutate against fresh seed. Class invariant: QuantityOnHandValue =
+      // QuantityOnHand * AverageCost.
+      { ListID: "I0000003", Name: "Widget A", FullName: "Widget A", IsActive: true, ItemType: "Inventory", Description: "Standard widget", Price: 25.00, Cost: 12.00, QuantityOnHand: 100, AverageCost: 12.00, QuantityOnHandValue: 1200.00, EditSequence: now, TimeCreated: "2024-02-01T10:00:00", TimeModified: now },
+      { ListID: "I0000004", Name: "Widget B", FullName: "Widget B", IsActive: true, ItemType: "Inventory", Description: "Premium widget", Price: 50.00, Cost: 22.00, QuantityOnHand: 40, AverageCost: 22.00, QuantityOnHandValue: 880.00, EditSequence: now, TimeCreated: "2024-02-01T10:00:00", TimeModified: now },
     ];
 
     // Route each seed item into its per-subtype store. ItemType is the

@@ -540,6 +540,11 @@ export function buildDeleteRequest(
     // but its lines reduce sales-tax-item liability rather than expense GL.
     // Carries TxnID + EditSequence, deletes via TxnDelRq. Three lists in sync.
     "SalesTaxPaymentCheck",
+    // Phase 17 #80 — InventoryAdjustment. Posted via InventoryAdjustmentAddRq;
+    // each line adjusts one ItemInventory's QuantityOnHand and/or AverageCost
+    // (via QuantityAdjustment / ValueAdjustment containers). Carries TxnID +
+    // EditSequence, deletes via TxnDelRq. Three lists in sync.
+    "InventoryAdjustment",
   ].includes(entityType);
 
   if (isTransaction) {

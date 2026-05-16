@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (134 total)
+## Tools (137 total)
 
 ### Customers
 | Tool | Description |
@@ -195,6 +195,28 @@ Sales-tax agencies are **not a separate entity** in real QB — they're regular 
 | `qb_sales_tax_agency_list` | List sales-tax agencies (Vendors referenced as `TaxVendorRef` on any active `SalesTaxItem`). Each row carries `agencyName` / `agencyListId` / `taxItems: [{name, listId, taxRate}]` + (default) full `vendorDetails`. Pass `includeVendorDetails: false` to skip the per-agency Vendor lookup. |
 | `qb_sales_tax_liability_report` | Run the Sales Tax Liability report. Returns `rows` (per tax item) + `byAgency` (per agency rollup) + `totals` (grand). Each row: `agencyName / taxItemName / taxRate / taxCollected / taxPaid / taxPayable`. Filters: `fromDate`, `toDate`, `basis`. |
 | `qb_sales_tax_payment_create` | Write a sales-tax payment check (`SalesTaxPaymentCheckAddRq`). Required: `bankAccountName` (or `bankAccountListId`), `payeeName` (or `payeeListId`), `lines: [{salesTaxItemName, amount}]` (at least one). `TotalAmount` derives from the line sum. Idempotency key supported. |
+
+### Inventory Adjustments
+
+`qb_inventory_adjustment_*` covers the operational primitive every client carrying inventory needs: shrinkage write-offs after a physical count, periodic count corrections, value write-downs for obsolete or damaged stock, and value write-ups for reappraisal. Each adjustment carries an `AccountRef` header (the offsetting GL account — typically `Inventory Adjustment` expense, `Cost of Goods Sold`, or a dedicated `Shrinkage Expense`) plus one or more lines. Per line, the operator picks one of three shapes:
+
+- **Pure quantity adjustment** via `newQuantity` (absolute) OR `quantityDifference` (signed delta — negative for shrinkage). Value moves at the item's current `AverageCost` server-side: `ValueDifference = quantityDifference × AverageCost`.
+- **Pure value adjustment** via `newValue` (absolute total) OR `valueDifference` (signed dollar delta). Used to reprice without changing count — e.g. write down obsolete inventory from $50/each to $20/each. The unit count stays the same; `AverageCost` recomputes.
+- **Combined value + quantity adjustment** — both branches in one line. Real QB requires the value side to be explicit when both move (otherwise it derives value at current `AverageCost`).
+
+The simulation mutates `ItemInventory.QuantityOnHand` / `QuantityOnHandValue` / `AverageCost` on every referenced item. **`AverageCost` recomputes from post-adjustment value/qty**, EXCEPT when `QuantityOnHand` falls to zero — then the prior cost is preserved (matches real QB; a future restock keeps its cost-basis history). **Two-phase commit** at the sim layer: every line is validated before any mutation lands, so a malformed line in position 5 won't leave items 1-4 partially adjusted. **On query**, real QB normalizes both input shapes — every line returns `QuantityDifference + ValueDifference` regardless of which input form was used; the sim mirrors. `TotalAmount = Σ ValueDifference` (negative on shrinkage).
+
+`qb_inventory_adjustment_delete` reverses every line's qty/value delta against the still-present `ItemInventory` row. Orphan items (item deleted out from under the adjustment) are silently skipped — a missing item must not block transaction deletion.
+
+There is **no `_update` tool** — `InventoryAdjustmentModRq` exists in the QBXML SDK but the operational pattern in real QB is delete + recreate, and the recompute logic for partial line edits (rewind old deltas, apply new) is meaningfully more complex than a regular `_update`. Operators delete + re-add when an adjustment needs to change.
+
+**Enterprise-only fields** (`SerialNumber`, `LotNumber`, `InventorySiteRef`, `InventorySiteLocationRef`) are intentionally NOT exposed — they require QuickBooks Enterprise with Advanced Inventory enabled. **GL posting** to `AccountRef` is NOT modeled in sim's first cut (matches the deferred JE-line customer-balance behavior — real QB posts the offset automatically). Reports / TB walks see the `InventoryAdjustment` in the transaction-list if scoped to `AccountRef` but won't see implicit balancing entries.
+
+| Tool | Description |
+|------|-------------|
+| `qb_inventory_adjustment_list` | List inventory adjustments with `txnId` / `refNumber` / `accountName` / `accountListId` / date-range filters. Pass `includeLineItems: true` to surface each row's `InventoryAdjustmentLineRet` (per-line `ItemRef` + `QuantityDifference` + `ValueDifference` + `Amount`). Default false — header totals only. |
+| `qb_inventory_adjustment_create` | Create an adjustment. Required: `accountName` (or `accountListId`) + `lines: [{itemName | itemListId, …}]` (at least one). Each line picks one shape: quantity (`newQuantity` XOR `quantityDifference`), value (`newValue` XOR `valueDifference`), or combined (any value field paired with any quantity field). Optional `txnDate` / `refNumber` / `memo` / `customerName` (cost allocation) / `className`. `idempotencyKey` supported. |
+| `qb_inventory_adjustment_delete` | Delete an adjustment. Reverses every line's qty/value delta against the still-present `ItemInventory` row (orphan items silently skipped). After delete, each affected item's QuantityOnHand / QuantityOnHandValue / AverageCost return to their pre-adjustment state. |
 
 ### Journal Entries
 
@@ -387,7 +409,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (134 tools)     │──│──────────────┐
+                                    │  │ (137 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

@@ -1447,6 +1447,10 @@ export class QBSessionManager {
       "TimeTracking",
       // Phase 17 #77 — SalesTaxPaymentCheck (TxnID + TxnDelRq).
       "SalesTaxPaymentCheck",
+      // Phase 17 #80 — InventoryAdjustment (TxnID + TxnDelRq). Posts qty / value
+      // changes against ItemInventory rows; sim mutates the items on add and
+      // reverses on delete.
+      "InventoryAdjustment",
     ].includes(entityType);
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);

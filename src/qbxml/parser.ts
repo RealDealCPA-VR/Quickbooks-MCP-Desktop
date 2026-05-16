@@ -101,6 +101,12 @@ const arrayElements = new Set([
   "ItemSalesTaxGroupRet",
   "SalesTaxPaymentCheckRet",
   "SalesTaxPaymentCheckLineRet",
+  // Phase 17 #80 — inventory adjustments. InventoryAdjustmentQueryRq returns N
+  // InventoryAdjustmentRet rows; each carries an InventoryAdjustmentLineRet
+  // array (one line per item being adjusted). Single-hit responses must still
+  // surface as arrays so the tool layer's filter / map paths work uniformly.
+  "InventoryAdjustmentRet",
+  "InventoryAdjustmentLineRet",
 ]);
 
 // ---------------------------------------------------------------------------
