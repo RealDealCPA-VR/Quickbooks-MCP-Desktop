@@ -104,7 +104,12 @@
       "PowerShell(\"\" | & node \"c:/Users/VR/Projects/Quickbooks MCP Desktop/dist/index.js\" 2>&1; \"EXIT=$LASTEXITCODE\")",
       "Bash(awk -F: '{sum+=$2} END {print \"total: \" sum}')",
       "PowerShell(npm run build 2>&1 | Select-Object -Last 8; \"BUILD_EXIT=$LASTEXITCODE\"; npm test 2>&1 | Select-Object -Last 15; \"TEST_EXIT=$LASTEXITCODE\")",
-      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 8; \"EXIT=$LASTEXITCODE\")"
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 8; \"EXIT=$LASTEXITCODE\")",
+      "Bash(Get-ChildItem \"src\\\\tools\\\\*.ts\" -File)",
+      "Bash(Select-String -Pattern \"server\\\\.tool\\\\\\(\")",
+      "Bash(Measure-Object)",
+      "Bash(xargs grep -c \"server\\\\.tool\\\\\\(\")",
+      "Bash(awk -F: '{sum+=$2} END {print sum}')"
     ]
   }
 }
