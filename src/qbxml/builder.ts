@@ -545,6 +545,13 @@ export function buildDeleteRequest(
     // (via QuantityAdjustment / ValueAdjustment containers). Carries TxnID +
     // EditSequence, deletes via TxnDelRq. Three lists in sync.
     "InventoryAdjustment",
+    // Phase 17 #81 — StatementCharge. Service-business T&M billing without a
+    // formal invoice; structurally single-line (ItemRef + Quantity + Rate at
+    // the txn header — no *LineAdd array, unlike Invoice/Bill). AR-posting
+    // (Customer.Balance moves by +Amount on add, -Amount on delete). Carries
+    // TxnID + EditSequence, deletes via TxnDelRq. Four lists in sync (the
+    // three runtime arrays PLUS the CLAUDE.md doc list at line 58).
+    "StatementCharge",
   ].includes(entityType);
 
   if (isTransaction) {

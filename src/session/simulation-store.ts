@@ -2857,6 +2857,15 @@ export class SimulationStore {
       // BalanceRemaining drops); the customer's overall open balance moves
       // by the full TotalAmount either way. Reversed in handleTxnDel.
       this.adjustPartyBalanceForTxn(finalEntity, "Customer", "TotalAmount", -1);
+    } else if (entityType === "StatementCharge") {
+      // Phase 17 #81 — Customer.Balance moves by +Amount on creation. Same
+      // posting shape as Invoice (AR-positive), but Amount lives at the
+      // header (no BalanceRemaining/AppliedAmount; statement charges don't
+      // participate in qb_payment_receive's AppliedToTxn flow — operators
+      // close them via a customer statement payment cycle, which from this
+      // server's perspective is a separate ReceivePayment that closes the
+      // underlying AR balance, not the StatementCharge txn directly).
+      this.adjustPartyBalanceForTxn(finalEntity, "Customer", "Amount", +1);
     }
 
     return {
@@ -3561,6 +3570,20 @@ export class SimulationStore {
       result.TotalAmount = lineSum;
     }
 
+    // Phase 17 #81 — StatementCharge.Amount = Quantity * Rate. Structurally
+    // unique among transaction types in this server: ItemRef / Quantity / Rate
+    // live at the TXN HEADER (no *LineAdd / *LineRet array), so Amount derives
+    // at header level rather than via convertLinesAddToRet's per-line walk.
+    // Derives only when undefined so an explicit Amount override on create wins
+    // (mirrors the Check.Amount / Deposit.DepositTotal / SalesTaxPaymentCheck
+    // pattern). handleMod's StatementCharge branch deletes Amount before
+    // re-running computeTotals so a Quantity- or Rate-only mod re-derives.
+    if (entityType === "StatementCharge" && result.Amount === undefined) {
+      const qty = Number(result.Quantity ?? 0);
+      const rate = Number(result.Rate ?? 0);
+      result.Amount = qty * rate;
+    }
+
     return result;
   }
 
@@ -3908,7 +3931,7 @@ export class SimulationStore {
   private adjustPartyBalanceForTxn(
     txn: StoredEntity,
     partyType: "Customer" | "Vendor",
-    amountField: "BalanceRemaining" | "AmountDue" | "TotalAmount",
+    amountField: "BalanceRemaining" | "AmountDue" | "TotalAmount" | "Amount",
     sign: 1 | -1
   ): void {
     const refField = partyType === "Customer" ? "CustomerRef" : "VendorRef";
@@ -4029,7 +4052,12 @@ export class SimulationStore {
           ? Number(existing.BalanceRemaining ?? 0)
           : entityType === "CreditMemo"
             ? Number(existing.TotalAmount ?? 0)
-            : 0;
+            // Phase 17 #81 — StatementCharge tracks Customer.Balance through
+            // its header Amount field. Capture BEFORE the merge so the delta
+            // path can reconcile.
+            : entityType === "StatementCharge"
+              ? Number(existing.Amount ?? 0)
+              : 0;
     const lineModResult = this.applyLineMods(existing, modData);
 
     const strippedModData = lineModResult.lineModKeys.size > 0
@@ -4096,6 +4124,21 @@ export class SimulationStore {
       updated = this.computeTotals(updated, entityType);
     }
 
+    // Phase 17 #81 — StatementCharge has no line array, so the line-mod block
+    // above never fires for it. Re-derive Amount when Quantity or Rate moved
+    // but the operator did not pass an explicit Amount (mirrors the Check.Amount
+    // / Deposit.DepositTotal "delete-then-recompute" pattern). Explicit
+    // modData.Amount wins by leaving the existing Amount value intact through
+    // the merge above.
+    if (
+      entityType === "StatementCharge" &&
+      modData.Amount === undefined &&
+      (modData.Quantity !== undefined || modData.Rate !== undefined)
+    ) {
+      delete updated.Amount;
+      updated = this.computeTotals(updated, entityType);
+    }
+
     // JE balance invariant re-check on every mod — both line mods (which can
     // unbalance the entry) and header-only mods (defensive — should already
     // be balanced from the prior add/mod). Return 3030 BEFORE persist so a
@@ -4135,6 +4178,14 @@ export class SimulationStore {
       this.adjustPartyBalanceForTxnMod(
         "Customer", "CustomerRef", "TotalAmount",
         existing, updated, oldPartyAmount, -1
+      );
+    } else if (entityType === "StatementCharge") {
+      // Phase 17 #81 — AR-positive (same sign convention as Invoice). Same-
+      // customer: balance moves by (newAmount − oldAmount). Customer re-target:
+      // reverse oldAmount against old customer, apply newAmount to new customer.
+      this.adjustPartyBalanceForTxnMod(
+        "Customer", "CustomerRef", "Amount",
+        existing, updated, oldPartyAmount
       );
     }
 
@@ -4461,7 +4512,7 @@ export class SimulationStore {
   private adjustPartyBalanceForTxnMod(
     partyType: "Customer" | "Vendor",
     refField: "CustomerRef" | "VendorRef",
-    amountField: "AmountDue" | "BalanceRemaining" | "TotalAmount",
+    amountField: "AmountDue" | "BalanceRemaining" | "TotalAmount" | "Amount",
     beforeTxn: StoredEntity,
     afterTxn: StoredEntity,
     oldAmount: number,
@@ -4751,6 +4802,9 @@ export class SimulationStore {
       // must not block transaction deletion (matches the orphan-invoice
       // policy on credit-memo reversal above).
       this.reverseInventoryAdjustment(target);
+    } else if (entityType === "StatementCharge") {
+      // Phase 17 #81 — reverse the AR-positive posting (was +Amount on add).
+      this.adjustPartyBalanceForTxn(target, "Customer", "Amount", -1);
     }
 
     store.delete(txnID);
@@ -5011,6 +5065,12 @@ export class SimulationStore {
       // TxnDelRq. NOT bank-affecting (no Bank/CC posting; the AccountRef header
       // is a P&L offset — typically Inventory Adjustment expense or COGS).
       "InventoryAdjustment",
+      // Phase 17 #81 — StatementCharge. Service-business T&M billing without a
+      // formal invoice. Structurally single-line (ItemRef + Quantity + Rate at
+      // the txn header — no *LineAdd array, unlike Invoice/Bill). AR-posting:
+      // customer.Balance moves by +Amount on add, -Amount on delete; mods that
+      // change Amount move the balance by the delta. NOT bank-affecting.
+      "StatementCharge",
     ].includes(entityType);
   }
 

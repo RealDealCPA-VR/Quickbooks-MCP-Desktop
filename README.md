@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (137 total)
+## Tools (141 total)
 
 ### Customers
 | Tool | Description |
@@ -218,6 +218,23 @@ There is **no `_update` tool** — `InventoryAdjustmentModRq` exists in the QBXM
 | `qb_inventory_adjustment_create` | Create an adjustment. Required: `accountName` (or `accountListId`) + `lines: [{itemName | itemListId, …}]` (at least one). Each line picks one shape: quantity (`newQuantity` XOR `quantityDifference`), value (`newValue` XOR `valueDifference`), or combined (any value field paired with any quantity field). Optional `txnDate` / `refNumber` / `memo` / `customerName` (cost allocation) / `className`. `idempotencyKey` supported. |
 | `qb_inventory_adjustment_delete` | Delete an adjustment. Reverses every line's qty/value delta against the still-present `ItemInventory` row (orphan items silently skipped). After delete, each affected item's QuantityOnHand / QuantityOnHandValue / AverageCost return to their pre-adjustment state. |
 
+### Statement Charges
+
+`qb_statement_charge_*` covers service-business **time-and-materials billing without a formal invoice**. A statement charge accumulates on a customer's account and rolls up onto the customer statement at month-end — useful for hourly engagements where every billable session is recorded as a separate line on the customer's running tab, then a single Statement print summarizes them at the end of the period. (QB Desktop's Create Statements UI is what produces the actual customer-facing statement PDF; the qbXML SDK does not expose statement generation, so this tool only manages the underlying charges that feed into it.)
+
+Structurally StatementCharge is **unique** among this server's transaction types — it is **single-row** at the txn header. `ItemRef` / `Quantity` / `Rate` / `Amount` live directly on the transaction body, NOT in a `*LineAdd` array. There is one ItemRef per StatementCharge; for multi-line work-style billing the operator creates one statement charge per line (each gets its own `TxnID` + `RefNumber` and a distinct row on the customer's statement). The simulation's `convertLinesAddToRet` pass is a no-op for StatementCharge (no key matches the `*LineAdd` pattern) and `computeTotals` derives `Amount + Balance` from the header fields directly.
+
+**AR posting:** `Customer.Balance` moves by `+Amount` on create and `-Amount` on delete. Update: signed delta (`newAmount − oldAmount`) if the same customer; full reverse-then-apply if the `CustomerRef` itself changed. Mirrors `qb_invoice_update`'s policy on customer re-target. **Amount derivation:** explicit `amount` wins; otherwise `Amount = quantity × rate` when both are supplied. On update, an explicit `amount` arg wins over the `quantity × rate` re-derivation; passing `quantity` OR `rate` without `amount` drops the stored `Amount` and re-derives from the merged values.
+
+**Limitation:** sim's first cut does NOT walk `ReceivePayment.AppliedToTxnAdd` across the StatementCharge store — a payment referencing a statement charge `TxnID` will reject with "Invoice not found" because `validateTxnApplications` looks up only the Invoice store. Real QB closes statement charges via `ReceivePayment` just like invoices; future work extends `applyTxnApplications` to fan across both stores. For now, when a customer pays a statement charge, record an unapplied `ReceivePayment` (no `appliedTo` arg) — the customer's open AR drops by `TotalAmount` but the underlying `StatementCharge.Balance` field stays unchanged in sim.
+
+| Tool | Description |
+|------|-------------|
+| `qb_statement_charge_list` | List statement charges with `txnId` / `refNumber` / `customerName` / `customerListId` (server-side EntityFilter) / date-range filters. `paginate: true` auto-defaults `maxReturned` to 500 (QB's per-batch cap). |
+| `qb_statement_charge_create` | Create a charge. REQUIRED: `customerName` (or `customerListId`) AND `itemName` (or `itemListId`) AND either explicit `amount` OR both `quantity + rate`. Optional `txnDate` / `dueDate` / `refNumber` / `description` / `className`. `idempotencyKey` supported. Customer.Balance moves by `+Amount`. |
+| `qb_statement_charge_update` | Update a charge. Pass `txnId` + `editSequence` (from a prior list) plus any header fields. Changing `quantity` OR `rate` without `amount` re-derives `Amount = newQuantity × newRate`. Customer re-target reverses old amount against old customer, applies new amount to new. Stale editSequence → 3170. |
+| `qb_statement_charge_delete` | Delete a charge. Customer.Balance reverses by `-Amount`. Irreversible. |
+
 ### Journal Entries
 
 A `JournalEntry` is the structural outlier of the transaction family — every other transaction posts from a single side (invoice → AR, bill → AP, etc.) but a JE is fundamentally two-sided: every entry carries a `debits` array AND a `credits` array, each line naming a GL account by full name. The hard invariant is `sum(debits.amount) === sum(credits.amount)` to the cent (real QB rejects unbalanced entries with statusCode 3030; the simulation matches this and validates **before persist** on both create and update so a doomed entry never lands in the store). The simulation stores `TotalDebit` + `TotalCredit` on the entry for inspection (always equal by invariant); there is no single `TotalAmount` header field on a JE.
@@ -409,7 +426,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (137 tools)     │──│──────────────┐
+                                    │  │ (141 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

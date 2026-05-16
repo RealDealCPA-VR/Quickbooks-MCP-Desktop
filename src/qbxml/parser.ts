@@ -107,6 +107,11 @@ const arrayElements = new Set([
   // surface as arrays so the tool layer's filter / map paths work uniformly.
   "InventoryAdjustmentRet",
   "InventoryAdjustmentLineRet",
+  // Phase 17 #81 — statement charges. StatementChargeQueryRq returns N
+  // StatementChargeRet rows. Each StatementCharge is structurally single-line
+  // in QBXML (no *LineRet array — ItemRef / Quantity / Rate / Amount live at
+  // the txn header), so only StatementChargeRet is registered here.
+  "StatementChargeRet",
 ]);
 
 // ---------------------------------------------------------------------------

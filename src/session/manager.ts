@@ -1451,6 +1451,10 @@ export class QBSessionManager {
       // changes against ItemInventory rows; sim mutates the items on add and
       // reverses on delete.
       "InventoryAdjustment",
+      // Phase 17 #81 — StatementCharge (TxnID + TxnDelRq). Service-business T&M
+      // billing; AR-posting. Three runtime lists in sync plus the CLAUDE.md doc
+      // list at line 58.
+      "StatementCharge",
     ].includes(entityType);
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);
