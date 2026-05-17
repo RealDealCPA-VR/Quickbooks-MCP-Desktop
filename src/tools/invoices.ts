@@ -48,13 +48,123 @@ const invoiceLineModSchema = z
     { message: "New invoice lines (no txnLineID) require itemName/itemListId and either amount or (quantity + rate)" }
   );
 
+// Phase 13 #60 — pull contact fields off the Customer entity and attach them
+// as `customerContact` on each invoice. Single CustomerQueryRq for invoices
+// that surface a CustomerRef.ListID (one wire call regardless of result size)
+// plus a follow-up FullName query for any ListID-less entries (rare in live
+// QB; common in malformed sim data). Mutates the invoice rows in place.
+// Fail-soft: a CustomerQueryRq failure surfaces as a `warning` on the
+// response without poisoning the primary InvoiceQueryRq result.
+const CUSTOMER_CONTACT_FIELDS = [
+  "Email",
+  "Phone",
+  "AltPhone",
+  "Fax",
+  "Contact",
+  "AltContact",
+  "CompanyName",
+  "FirstName",
+  "MiddleName",
+  "LastName",
+  "JobTitle",
+] as const;
+
+function pickContactFields(
+  customer: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const field of CUSTOMER_CONTACT_FIELDS) {
+    const value = customer[field];
+    if (value !== undefined && value !== null && value !== "") {
+      out[field] = value;
+    }
+  }
+  return out;
+}
+
+async function enrichInvoicesWithCustomerContact(
+  session: QBSessionManager,
+  invoices: Record<string, unknown>[],
+): Promise<{ warning?: string }> {
+  if (invoices.length === 0) return {};
+
+  const listIds = new Set<string>();
+  const fullNames = new Set<string>();
+  for (const inv of invoices) {
+    const ref = inv.CustomerRef as Record<string, unknown> | undefined;
+    if (!ref) continue;
+    const listId = ref.ListID ? String(ref.ListID) : "";
+    if (listId) {
+      listIds.add(listId);
+    } else if (ref.FullName) {
+      fullNames.add(String(ref.FullName));
+    }
+  }
+
+  if (listIds.size === 0 && fullNames.size === 0) return {};
+
+  const byListId = new Map<string, Record<string, unknown>>();
+  const byFullName = new Map<string, Record<string, unknown>>();
+  const warnings: string[] = [];
+
+  // CustomerQueryRq filters are mutually exclusive — ListID and FullName can't
+  // be mixed in one call. Issue up to two queries (rare in practice that the
+  // FullName call fires; live QB invoices always carry CustomerRef.ListID).
+  if (listIds.size > 0) {
+    try {
+      const customers = await session.queryEntity("Customer", {
+        ListID: Array.from(listIds),
+      });
+      for (const c of customers) {
+        const id = c.ListID ? String(c.ListID) : "";
+        const name = c.FullName ? String(c.FullName) : c.Name ? String(c.Name) : "";
+        if (id) byListId.set(id, c);
+        if (name) byFullName.set(name, c);
+      }
+    } catch (err) {
+      warnings.push(
+        `CustomerQueryRq (ListID) failed during customer-contact join: ${(err as Error).message ?? "unknown error"}`,
+      );
+    }
+  }
+  if (fullNames.size > 0) {
+    try {
+      const customers = await session.queryEntity("Customer", {
+        FullName: Array.from(fullNames),
+      });
+      for (const c of customers) {
+        const id = c.ListID ? String(c.ListID) : "";
+        const name = c.FullName ? String(c.FullName) : c.Name ? String(c.Name) : "";
+        if (id) byListId.set(id, c);
+        if (name) byFullName.set(name, c);
+      }
+    } catch (err) {
+      warnings.push(
+        `CustomerQueryRq (FullName) failed during customer-contact join: ${(err as Error).message ?? "unknown error"}`,
+      );
+    }
+  }
+
+  for (const inv of invoices) {
+    const ref = inv.CustomerRef as Record<string, unknown> | undefined;
+    if (!ref) continue;
+    const listId = ref.ListID ? String(ref.ListID) : "";
+    const name = ref.FullName ? String(ref.FullName) : "";
+    const match = (listId && byListId.get(listId)) || (name && byFullName.get(name));
+    if (!match) continue;
+    inv.customerContact = pickContactFields(match);
+  }
+
+  return warnings.length > 0 ? { warning: warnings.join("; ") } : {};
+}
+
 export function registerInvoiceTools(
   server: McpServer,
   getSession: () => QBSessionManager
 ): void {
   server.tool(
     "qb_invoice_list",
-    "List or search invoices in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface InvoiceLineRet (the per-line breakdown — item, qty, rate, amount, TxnLineID). Set includeCustomFields:true to surface DataExtRet (custom-field) values per invoice.",
+    "List or search invoices in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface InvoiceLineRet (the per-line breakdown — item, qty, rate, amount, TxnLineID). Set includeCustomFields:true to surface DataExtRet (custom-field) values per invoice. Set includeCustomerContact:true to attach a customerContact sub-object (Email / Phone / AltPhone / Fax / Contact / AltContact / CompanyName / FirstName / MiddleName / LastName / JobTitle) to every invoice — one extra CustomerQueryRq call regardless of result size; replaces the per-customer qb_customer_list lookup the collection-email workflow used to require.",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
       customerListId: z.string().optional().describe("Filter by customer ListID"),
@@ -67,6 +177,7 @@ export function registerInvoiceTools(
       includeLineItems: z.boolean().optional().describe("When true, each invoice row carries its InvoiceLineRet array (item, qty, rate, amount, TxnLineID per line). Default false — header totals only, matching real QB's *QueryRq default behavior."),
       includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned invoice. Pass customFieldOwnerId for non-default namespaces."),
       customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
+      includeCustomerContact: z.boolean().optional().describe("When true, attach a customerContact sub-object (Email / Phone / AltPhone / Fax / Contact / AltContact / CompanyName / FirstName / MiddleName / LastName / JobTitle — present fields only) to every returned invoice. Triggers a follow-up CustomerQueryRq scoped to the unique CustomerRef.ListIDs in the result (one extra wire call, not one per invoice). If the join fails, invoices still return without contact fields and the response carries a `warning`. Useful for collection-email workflows that previously required a per-customer qb_customer_list lookup."),
       maxReturned: z.number().optional().describe("Maximum results. Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."),
       paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
       iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
@@ -116,6 +227,9 @@ export function registerInvoiceTools(
             iterator: args.iteratorID ? "Continue" : "Start",
             iteratorID: args.iteratorID,
           });
+          const contactEnrichment = args.includeCustomerContact
+            ? await enrichInvoicesWithCustomerContact(session, result.entities)
+            : {};
           return {
             content: [{
               type: "text" as const,
@@ -128,16 +242,24 @@ export function registerInvoiceTools(
                 ...(result.iteratorID !== undefined
                   ? { iteratorID: result.iteratorID }
                   : {}),
+                ...(contactEnrichment.warning ? { warning: contactEnrichment.warning } : {}),
               }, null, 2),
             }],
           };
         }
 
         const invoices = await session.queryEntity("Invoice", filters);
+        const contactEnrichment = args.includeCustomerContact
+          ? await enrichInvoicesWithCustomerContact(session, invoices)
+          : {};
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ count: invoices.length, invoices }, null, 2),
+            text: JSON.stringify({
+              count: invoices.length,
+              invoices,
+              ...(contactEnrichment.warning ? { warning: contactEnrichment.warning } : {}),
+            }, null, 2),
           }],
         };
       } catch (err) {

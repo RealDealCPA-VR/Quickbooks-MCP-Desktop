@@ -113,7 +113,8 @@
       "PowerShell($result = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $result)",
       "Bash(node scripts/refactor-error-wrappers.mjs)",
       "Bash(\"C:\\\\nvm4w\\\\nodejs\\\\node.exe\" --version)",
-      "PowerShell(& \"C:\\\\nvm4w\\\\nodejs\\\\node.exe\" \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\scripts\\\\verify-item65-error-hints.mjs\")"
+      "PowerShell(& \"C:\\\\nvm4w\\\\nodejs\\\\node.exe\" \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\scripts\\\\verify-item65-error-hints.mjs\")",
+      "PowerShell(\"\" | & node \"c:/Users/VR/Projects/Quickbooks MCP Desktop/dist/index.js\"; \"EXIT=$LASTEXITCODE\")"
     ]
   }
 }
