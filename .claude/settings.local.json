@@ -109,7 +109,11 @@
       "Bash(Select-String -Pattern \"server\\\\.tool\\\\\\(\")",
       "Bash(Measure-Object)",
       "Bash(xargs grep -c \"server\\\\.tool\\\\\\(\")",
-      "Bash(awk -F: '{sum+=$2} END {print sum}')"
+      "Bash(awk -F: '{sum+=$2} END {print sum}')",
+      "PowerShell($result = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $result)",
+      "Bash(node scripts/refactor-error-wrappers.mjs)",
+      "Bash(\"C:\\\\nvm4w\\\\nodejs\\\\node.exe\" --version)",
+      "PowerShell(& \"C:\\\\nvm4w\\\\nodejs\\\\node.exe\" \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\scripts\\\\verify-item65-error-hints.mjs\")"
     ]
   }
 }

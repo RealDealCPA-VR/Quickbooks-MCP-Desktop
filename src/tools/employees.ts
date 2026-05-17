@@ -5,7 +5,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
-import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { formatToolError } from "../util/format-tool-error.js";
 import { EMAIL_RE, ISO_DATE_RE, PHONE_RE } from "../util/validators.js";
 
 export function registerEmployeeTools(
@@ -44,20 +44,7 @@ export function registerEmployeeTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EmployeeQueryRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EmployeeQueryRq failed" });
       }
     }
   );
@@ -100,20 +87,7 @@ export function registerEmployeeTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EmployeeAddRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EmployeeAddRq failed" });
       }
     }
   );
@@ -155,20 +129,7 @@ export function registerEmployeeTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EmployeeModRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EmployeeModRq failed" });
       }
     }
   );
@@ -195,20 +156,7 @@ export function registerEmployeeTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EmployeeModRq (make_inactive) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EmployeeModRq (make_inactive) failed" });
       }
     }
   );
@@ -230,20 +178,7 @@ export function registerEmployeeTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "ListDelRq (Employee) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "ListDelRq (Employee) failed" });
       }
     }
   );

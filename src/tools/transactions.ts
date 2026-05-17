@@ -23,6 +23,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { formatToolError } from "../util/format-tool-error.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 
 // Txn types that accept EntityFilter scoping by Customer (CustomerRef).
@@ -225,20 +226,7 @@ export function registerTransactionTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "TransactionQueryRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "TransactionQueryRq failed" });
       }
     }
   );
@@ -536,20 +524,7 @@ export function registerTransactionTools(
           }
         }
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "qb_transaction_list failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "qb_transaction_list failed" });
       }
 
       // Chronological sort with TimeCreated tiebreaker for same-date rows.

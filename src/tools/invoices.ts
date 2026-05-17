@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { formatToolError } from "../util/format-tool-error.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 
 const invoiceLineSchema = z.object({
@@ -140,20 +141,7 @@ export function registerInvoiceTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "InvoiceQueryRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "InvoiceQueryRq failed" });
       }
     }
   );
@@ -232,20 +220,7 @@ export function registerInvoiceTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "InvoiceAddRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "InvoiceAddRq failed" });
       }
     }
   );
@@ -359,20 +334,7 @@ export function registerInvoiceTools(
           results = await session.executeBatchAdd("Invoice", dataList);
         }
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "Batch InvoiceAddRq envelope failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "Batch InvoiceAddRq envelope failed" });
       }
 
       const allPosted = results.every((r) => r.status === "posted");
@@ -577,20 +539,7 @@ export function registerInvoiceTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "InvoiceModRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "InvoiceModRq failed" });
       }
     }
   );
@@ -612,20 +561,7 @@ export function registerInvoiceTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "TxnDelRq (Invoice) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "TxnDelRq (Invoice) failed" });
       }
     }
   );
@@ -673,20 +609,7 @@ export function registerInvoiceTools(
           IncludeLineItems: true,
         });
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "InvoiceQueryRq (duplicate source read) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "InvoiceQueryRq (duplicate source read) failed" });
       }
 
       const source = matches[0];
@@ -794,20 +717,7 @@ export function registerInvoiceTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "InvoiceAddRq (duplicate) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "InvoiceAddRq (duplicate) failed" });
       }
     }
   );
@@ -860,20 +770,7 @@ export function registerInvoiceTools(
       try {
         matches = await session.queryEntity("Invoice", { TxnID: args.txnId });
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "InvoiceQueryRq (write-off source read) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "InvoiceQueryRq (write-off source read) failed" });
       }
 
       const source = matches[0];
@@ -1006,20 +903,7 @@ export function registerInvoiceTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "ReceivePaymentAdd (write-off) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "ReceivePaymentAdd (write-off) failed" });
       }
     }
   );

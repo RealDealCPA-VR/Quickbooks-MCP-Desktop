@@ -13,6 +13,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { formatToolError } from "../util/format-tool-error.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 
 const estimateLineSchema = z.object({
@@ -100,20 +101,7 @@ export function registerEstimateTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EstimateQueryRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EstimateQueryRq failed" });
       }
     }
   );
@@ -188,20 +176,7 @@ export function registerEstimateTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EstimateAddRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EstimateAddRq failed" });
       }
     }
   );
@@ -264,20 +239,7 @@ export function registerEstimateTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EstimateModRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EstimateModRq failed" });
       }
     }
   );
@@ -299,20 +261,7 @@ export function registerEstimateTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "TxnDelRq (Estimate) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "TxnDelRq (Estimate) failed" });
       }
     }
   );
@@ -347,20 +296,7 @@ export function registerEstimateTools(
           IncludeLineItems: true,
         });
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "EstimateQueryRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "EstimateQueryRq failed" });
       }
       const estimate = matches[0];
       if (!estimate) {
@@ -457,20 +393,7 @@ export function registerEstimateTools(
           invoice = await session.addEntity("Invoice", invoiceData);
         }
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "InvoiceAddRq (estimate convert) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "InvoiceAddRq (estimate convert) failed" });
       }
 
       // Mark accepted AFTER successful invoice creation (default behavior).

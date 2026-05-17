@@ -49,6 +49,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { formatToolError } from "../util/format-tool-error.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 
 // ---------------------------------------------------------------------------
@@ -104,20 +105,7 @@ export function registerSalesTaxTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "SalesTaxCodeQueryRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "SalesTaxCodeQueryRq failed" });
       }
     },
   );
@@ -209,20 +197,7 @@ export function registerSalesTaxTools(
         if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
         salesTaxItems = await session.queryEntity("ItemSalesTax", filters);
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "ItemSalesTaxQueryRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "ItemSalesTaxQueryRq failed" });
       }
 
       // Group items by agency. Key on ListID when present, FullName otherwise
@@ -356,20 +331,7 @@ export function registerSalesTaxTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "GeneralSummaryReportQueryRq (SalesTaxLiability) failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "GeneralSummaryReportQueryRq (SalesTaxLiability) failed" });
       }
     },
   );
@@ -471,20 +433,7 @@ export function registerSalesTaxTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
-        const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              statusCode: e.statusCode ?? -1,
-              statusMessage: e.message ?? "SalesTaxPaymentCheckAddRq failed",
-              ...(humanReadable ? { humanReadable } : {}),
-            }),
-          }],
-          isError: true,
-        };
+        return formatToolError(err, { fallbackMessage: "SalesTaxPaymentCheckAddRq failed" });
       }
     },
   );

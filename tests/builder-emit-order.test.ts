@@ -805,3 +805,127 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
     expect(order).toEqual(["OwnerID", "AssignToObject"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 14 #65 — schema-order map consistency.
+// ---------------------------------------------------------------------------
+// `src/util/qbxml-schema-order.ts` exports SCHEMA_ORDER as the canonical
+// child sequence per request type, used at runtime by formatToolError to
+// surface the canonical order to agents when QB rejects a payload. The
+// inline `it(...)` cases above are the SOURCE OF TRUTH — each asserts the
+// builder emits children in a specific order. SCHEMA_ORDER is derived
+// from them.
+//
+// This block verifies the map agrees with the inline pins. If an inline
+// test's expected sequence is NOT a subsequence of SCHEMA_ORDER[reqType],
+// either the map is wrong or the inline pin diverged from the schema —
+// either way the runtime hint would mislead an agent.
+import { SCHEMA_ORDER, findSchemaOrderForField } from "../src/util/qbxml-schema-order.js";
+
+describe("SCHEMA_ORDER map consistency", () => {
+  // Each entry below is `[requestType, fields-that-must-appear-in-order]`.
+  // The fields are the inline-pinned subsequences from the `it(...)` cases
+  // above; they must appear in SCHEMA_ORDER[requestType] in the same
+  // relative order (subsequence, not contiguous).
+  const PINNED_SUBSEQUENCES: ReadonlyArray<[string, readonly string[]]> = [
+    ["CustomerQueryRq", ["ListID", "MaxReturned", "ActiveStatus", "NameFilter", "OwnerID"]],
+    ["InvoiceQueryRq", [
+      "TxnID", "MaxReturned", "ModifiedDateRangeFilter", "TxnDateRangeFilter",
+      "EntityFilter", "AccountFilter", "RefNumberFilter", "CurrencyFilter",
+      "PaidStatus", "IncludeLineItems", "OwnerID",
+    ]],
+    ["BillQueryRq", [
+      "MaxReturned", "TxnDateRangeFilter", "EntityFilter", "PaidStatus",
+      "IncludeLineItems",
+    ]],
+    ["EstimateQueryRq", [
+      "TxnID", "RefNumber", "MaxReturned", "TxnDateRangeFilter",
+      "EntityFilter", "IncludeLineItems",
+    ]],
+    ["SalesReceiptQueryRq", [
+      "TxnID", "RefNumber", "MaxReturned", "TxnDateRangeFilter",
+      "EntityFilter", "IncludeLineItems",
+    ]],
+    ["CreditMemoQueryRq", [
+      "TxnID", "RefNumber", "MaxReturned", "TxnDateRangeFilter",
+      "EntityFilter", "IncludeLineItems",
+    ]],
+    ["PurchaseOrderQueryRq", [
+      "TxnID", "RefNumber", "MaxReturned", "TxnDateRangeFilter",
+      "EntityFilter", "IncludeLineItems",
+    ]],
+    ["JournalEntryQueryRq", [
+      "TxnID", "MaxReturned", "ModifiedDateRangeFilter", "TxnDateRangeFilter",
+      "IncludeLineItems",
+    ]],
+    ["TransactionQueryRq", ["MaxReturned", "TxnDateRangeFilter", "AccountFilter"]],
+    ["DataExtDefQueryRq", ["OwnerID", "AssignToObject"]],
+    ["GeneralSummaryReportQueryRq", [
+      "GeneralSummaryReportType", "ReportPeriod", "ReportEntityFilter",
+      "ReportItemFilter", "SummarizeColumnsBy", "IncludeSubcolumns",
+      "ReportBasis",
+    ]],
+    ["GeneralDetailReportQueryRq", [
+      "GeneralDetailReportType", "ReportPeriod", "ReportAccountFilter",
+      "ReportEntityFilter", "ReportItemFilter",
+      "ReportModifiedDateRangeFilter", "ReportBasis", "IncludeColumn",
+    ]],
+    ["CustomDetailReportQueryRq", [
+      "CustomDetailReportType", "ReportPeriod", "ReportAccountFilter",
+      "ReportClearedStatusFilter", "ReportModifiedDateRangeFilter",
+      "ReportBasis", "IncludeColumn",
+    ]],
+    ["PayrollSummaryReportQueryRq", [
+      "PayrollSummaryReportType", "ReportPeriod", "SummarizeColumnsBy",
+      "ReportEntityFilter",
+    ]],
+  ];
+
+  function isSubsequence(needle: readonly string[], haystack: readonly string[]): boolean {
+    let i = 0;
+    for (const h of haystack) {
+      if (h === needle[i]) i++;
+      if (i === needle.length) return true;
+    }
+    return i === needle.length;
+  }
+
+  for (const [reqType, pinned] of PINNED_SUBSEQUENCES) {
+    it(`SCHEMA_ORDER[${reqType}] contains the inline-pinned sequence in canonical order`, () => {
+      const canonical = SCHEMA_ORDER[reqType];
+      expect(canonical, `SCHEMA_ORDER missing entry for ${reqType}`).toBeDefined();
+      expect(
+        isSubsequence(pinned, canonical),
+        `SCHEMA_ORDER[${reqType}] does not contain pinned subsequence in order.\n` +
+          `  pinned:    ${pinned.join(" → ")}\n` +
+          `  canonical: ${canonical.join(" → ")}`,
+      ).toBe(true);
+    });
+  }
+
+  it("no duplicate fields within any SCHEMA_ORDER entry", () => {
+    for (const [reqType, fields] of Object.entries(SCHEMA_ORDER)) {
+      const seen = new Set<string>();
+      for (const f of fields) {
+        expect(seen.has(f), `duplicate "${f}" in SCHEMA_ORDER[${reqType}]`).toBe(false);
+        seen.add(f);
+      }
+    }
+  });
+
+  it("findSchemaOrderForField surfaces every request that declares a field", () => {
+    // OwnerID is shared by ~14 entity query types — confirm the reverse
+    // index returns more than one candidate (so the agent sees the field
+    // belongs to multiple requests) and at least Customer + Invoice are
+    // both present.
+    const candidates = findSchemaOrderForField("OwnerID");
+    const names = candidates.map((c) => c.request);
+    expect(names).toContain("CustomerQueryRq");
+    expect(names).toContain("InvoiceQueryRq");
+    expect(candidates.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("findSchemaOrderForField returns [] for an unknown field", () => {
+    expect(findSchemaOrderForField("NoSuchFieldExists")).toEqual([]);
+  });
+});

@@ -18,7 +18,15 @@
 
 const TABLE: Record<number, string> = {
   500: "Object not found in QuickBooks",
+  // 3000 + 3110 added 2026-05-17 after Phase 14 #65 live verification surfaced
+  // them against `VR Tax & Consulting Inc..qbw`:
+  //   - 3000 fires for invalid object IDs (e.g. bogus TxnID on a Mod call).
+  //     QB's message format: 'The given object ID "X" in the field "Y" is invalid.'
+  //   - 3110 fires for invalid enum values (e.g. PaidStatus="NotARealEnum"). QB
+  //     surfaces the field name in quotes; the #65 hint heuristic extracts it.
+  3000: "Invalid object identifier — the given ID does not resolve to a record (often a stale TxnID or ListID)",
   3030: "Journal entry debits and credits do not balance",
+  3110: "Invalid enumerated value or argument — the supplied value is not allowed for this field at the current qbXML version",
   3120: "Required field missing or invalid value",
   3170: "Modify rejected — record was changed since last read (stale EditSequence)",
   3260: "Insufficient permission — the operation is blocked (commonly: cannot delete a record with transaction history)",

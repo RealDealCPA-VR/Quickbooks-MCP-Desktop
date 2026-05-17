@@ -36,7 +36,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
-import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
+import { formatToolError } from "../util/format-tool-error.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 
 // IRS general 1099-NEC and 1099-MISC reporting threshold (TY2024+). The few
@@ -538,19 +538,15 @@ function errorResponse(
   statusMessage: string,
   _extra: Record<string, unknown> | null
 ): { content: Array<{ type: "text"; text: string }>; isError: true } {
-  const humanReadable = qbStatusCodeMessage(statusCode);
-  return {
-    content: [{
-      type: "text" as const,
-      text: JSON.stringify({
-        success: false,
-        statusCode,
-        statusMessage,
-        ...(humanReadable ? { humanReadable } : {}),
-      }),
-    }],
-    isError: true,
-  };
+  // Synthesizes a thrown-style error so formatToolError can apply the
+  // status-code table + the #65 heuristic uniformly with every other
+  // tool error path. The cast is safe because formatToolError only reads
+  // `.message` + `.statusCode` and the helper's return type satisfies
+  // the caller's narrower shape.
+  return formatToolError(
+    { message: statusMessage, statusCode },
+    { fallbackMessage: statusMessage },
+  );
 }
 
 // Re-exports used by tests for direct unit testing without the MCP transport.
