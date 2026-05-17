@@ -14,14 +14,16 @@ export function registerVendorTools(
 ): void {
   server.tool(
     "qb_vendor_list",
-    "List or search vendors in QuickBooks Desktop.",
+    "List or search vendors in QuickBooks Desktop. Set includeCustomFields:true to surface DataExtRet (custom-field) values on every returned vendor — discover defined CFs via qb_custom_field_list.",
     {
       nameFilter: z.string().optional().describe("Filter vendors by name (partial match)"),
       activeOnly: z.boolean().optional().describe("Only return active vendors (default true)"),
       maxReturned: z.number().optional().describe("Maximum number of results"),
       listId: z.string().optional().describe("Fetch a specific vendor by ListID"),
+      includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned vendor. Pass the OwnerID namespace via customFieldOwnerId (default '0')."),
+      customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
     },
-    async ({ nameFilter, activeOnly, maxReturned, listId }) => {
+    async ({ nameFilter, activeOnly, maxReturned, listId, includeCustomFields, customFieldOwnerId }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -30,6 +32,8 @@ export function registerVendorTools(
       if (maxReturned) filters.MaxReturned = maxReturned;
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
+      // Phase 13 #61 — OwnerID slots at the END of the *QueryRq filter sequence.
+      if (includeCustomFields) filters.OwnerID = customFieldOwnerId ?? "0";
 
       try {
         const vendors = await session.queryEntity("Vendor", filters);

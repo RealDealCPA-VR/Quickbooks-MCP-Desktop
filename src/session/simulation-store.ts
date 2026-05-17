@@ -135,6 +135,16 @@ export class SimulationStore {
           // The generic handleQuery would treat it as a per-type query against
           // a "Transaction" store (which doesn't exist) and return empty.
           response = this.handleTransactionQuery(key, reqData);
+        } else if (key === "DataExtDefQueryRq") {
+          // Phase 13 #61 — custom-field DEFINITION discovery. Distinct from
+          // the generic *QueryRq path because it accepts an AssignToObject
+          // repeating filter ("show me the CF defs that apply to Customer")
+          // that handleQuery doesn't model. The store IS keyed by
+          // `${OwnerID}|${DataExtName}` rather than ListID; the dedicated
+          // handler filters across the unkeyed value set so that detail is
+          // hidden from callers. Must precede the `endsWith("QueryRq")`
+          // catch-all.
+          response = this.handleDataExtDefQuery(key, reqData);
         } else if (key.endsWith("QueryRq")) {
           response = this.handleQuery(key, reqData);
         } else if (key === "AttachableAddRq") {
@@ -497,6 +507,29 @@ export class SimulationStore {
       String(reqData.IncludeLineItems ?? "").toLowerCase() === "true";
     if (!includeLineItems) {
       results = results.map((e) => this.stripLineRetKeys(e));
+    }
+
+    // OwnerID gate (Phase 13 #61). Real QB strips DataExtRet from *QueryRq
+    // responses unless the request carries an <OwnerID> filter naming a
+    // custom-field namespace. Without an OwnerID the operator sees no CF
+    // data; with `OwnerID=0` (the standard company-defined namespace) every
+    // *Ret element gets its DataExtRet children for matching defs. The sim
+    // stores entities with their full DataExtRet arrays (seed data + future
+    // qb_custom_field_set would populate them), so we mirror QB's strip
+    // here. Default-strip preserves the existing list-tool response shape
+    // for callers that didn't opt in.
+    //
+    // Filter logic when OwnerID IS present: keep only DataExtRet entries
+    // whose OwnerID matches the requested value. This lets callers scope
+    // to a single namespace without the third-party-app fields bleeding in.
+    const ownerIdRaw = reqData.OwnerID;
+    const ownerIdFilter = ownerIdRaw !== undefined && ownerIdRaw !== ""
+      ? String(ownerIdRaw)
+      : null;
+    if (ownerIdFilter === null) {
+      results = results.map((e) => this.stripDataExtKeys(e));
+    } else {
+      results = results.map((e) => this.filterDataExtByOwner(e, ownerIdFilter));
     }
 
     if (results.length === 0) {
@@ -4583,6 +4616,47 @@ export class SimulationStore {
     return out;
   }
 
+  // Phase 13 #61 — strip DataExtRet from a single entity. Mirror of
+  // stripLineRetKeys; called on every entity in a *QueryRs result set
+  // when the request did NOT carry an OwnerID filter (real QB does the
+  // same — custom-field values are hidden by default).
+  private stripDataExtKeys(
+    entity: StoredEntity,
+  ): StoredEntity {
+    if (entity.DataExtRet === undefined) return entity;
+    const out: StoredEntity = {};
+    for (const [k, v] of Object.entries(entity)) {
+      if (k === "DataExtRet") continue;
+      out[k] = v;
+    }
+    return out;
+  }
+
+  // Phase 13 #61 — keep only DataExtRet entries whose OwnerID matches the
+  // requested namespace. Called when the request DID carry an OwnerID.
+  // Entities without any DataExtRet pass through unchanged; entities whose
+  // DataExtRet array contains no matching entry get the key dropped (rather
+  // than left as an empty array — the parser would emit an empty
+  // `<DataExtRet/>` element on a future serialization round trip).
+  private filterDataExtByOwner(
+    entity: StoredEntity,
+    ownerId: string,
+  ): StoredEntity {
+    const dx = entity.DataExtRet;
+    if (dx === undefined) return entity;
+    const arr = Array.isArray(dx) ? dx : [dx];
+    const kept = (arr as Record<string, unknown>[]).filter(
+      (d) => String(d.OwnerID ?? "") === ownerId,
+    );
+    const out: StoredEntity = { ...entity };
+    if (kept.length === 0) {
+      delete out.DataExtRet;
+    } else {
+      out.DataExtRet = kept;
+    }
+    return out;
+  }
+
   // Adjusts party (Customer or Vendor) balance(s) after a transaction mod.
   // Same party → signed delta on the (possibly new) amount field.
   // Party changed → reverse the old party's bump, apply the new party's.
@@ -4677,6 +4751,83 @@ export class SimulationStore {
   //   - The response (AttachableRet) carries derived FileName /
   //     FileSize / FileExtension fields — NOT the FileReference shape
   //     the caller sent. Sim derives these from disk via fs.statSync
+  // -----------------------------------------------------------------------
+  // DataExtDef query (Phase 13 #61)
+  // -----------------------------------------------------------------------
+
+  // Returns the set of custom-field DEFINITIONS the company file knows about,
+  // one DataExtDefRet per (OwnerID, DataExtName) pair. Filterable by OwnerID
+  // (defaults to all owners) and AssignToObject (the entity type a CF applies
+  // to — Customer/Vendor/Invoice/etc.; the filter is OR-style when repeated,
+  // matching real QB).
+  //
+  // Wire shape per the QBXML SDK:
+  //   <DataExtDefQueryRq>
+  //     <OwnerID>...</OwnerID>?
+  //     <AssignToObject>...</AssignToObject>*
+  //     <IncludeAssignToObject>true</IncludeAssignToObject>?
+  //   </DataExtDefQueryRq>
+  //
+  // IncludeAssignToObject defaults to true on the wire — the AssignToObject
+  // array is part of the definition's identity, so the sim emits it always
+  // (the inverse — strip-by-default — would force every caller to opt in
+  // and surface nothing useful by default).
+  private handleDataExtDefQuery(
+    reqType: string,
+    reqData: Record<string, unknown>,
+  ): QBXMLResponseBody {
+    const rsType = reqType.replace("Rq", "Rs");
+    const store = this.getStore("DataExtDef");
+    let results: StoredEntity[] = Array.from(store.values());
+
+    // OwnerID is a SINGLE filter on this request (not repeated like
+    // AssignToObject) — narrows to one custom-field namespace. Default
+    // surface returns every OwnerID the sim knows about; pass "0" to scope
+    // to the standard company-defined fields.
+    if (reqData.OwnerID !== undefined && reqData.OwnerID !== "") {
+      const target = String(reqData.OwnerID);
+      results = results.filter((d) => String(d.OwnerID ?? "") === target);
+    }
+
+    // AssignToObject filter — narrows defs to those applicable to one of
+    // the named entity types. The match is "any of" (a def with
+    // AssignToObject: [Customer, Vendor] matches a filter of [Vendor] and
+    // also a filter of [Customer]). fast-xml-parser packs repeated elements
+    // as either an array (≥2 occurrences) or a single value (exactly one);
+    // normalize both shapes to an array.
+    if (reqData.AssignToObject !== undefined) {
+      const raw = reqData.AssignToObject;
+      const wanted = Array.isArray(raw)
+        ? (raw as unknown[]).map(String)
+        : [String(raw)];
+      results = results.filter((d) => {
+        const ato = d.AssignToObject;
+        const list = Array.isArray(ato) ? (ato as unknown[]).map(String) : [];
+        for (const w of wanted) if (list.includes(w)) return true;
+        return false;
+      });
+    }
+
+    if (results.length === 0) {
+      return {
+        type: rsType,
+        statusCode: 1,
+        statusSeverity: "Info",
+        statusMessage:
+          "A query request did not find a matching object in QuickBooks",
+        data: {},
+      };
+    }
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: { DataExtDefRet: results },
+    };
+  }
+
   //     and path.basename/extname.
   //
   // Returns the AttachableRet wrapped in {AttachableRet: <entity>} so
@@ -5207,6 +5358,24 @@ export class SimulationStore {
         EditSequence: now,
         TimeCreated: "2024-01-15T09:00:00",
         TimeModified: now,
+        // Phase 13 #61 — exercise the DataExt round trip on a non-trivial
+        // entity. handleQuery strips DataExtRet unless the request carries
+        // an <OwnerID> filter, so this is invisible by default and shows up
+        // only via qb_customer_list({ includeCustomFields: true }).
+        DataExtRet: [
+          {
+            OwnerID: "0",
+            DataExtName: "Engagement Type",
+            DataExtType: "STR255TYPE",
+            DataExtValue: "1120-S",
+          },
+          {
+            OwnerID: "0",
+            DataExtName: "Partner Assigned",
+            DataExtType: "STR255TYPE",
+            DataExtValue: "V. Vasquez",
+          },
+        ],
       },
       {
         ListID: "80000002-1234567890",
@@ -5310,6 +5479,17 @@ export class SimulationStore {
         EditSequence: now,
         TimeCreated: "2024-01-05T09:00:00",
         TimeModified: now,
+        // Phase 13 #61 — DataExt round trip on a vendor. Mirrors the Acme
+        // seed so the Vendor side of qb_custom_field_list / vendor_list with
+        // includeCustomFields has non-trivial dev results.
+        DataExtRet: [
+          {
+            OwnerID: "0",
+            DataExtName: "1099 Box",
+            DataExtType: "STR255TYPE",
+            DataExtValue: "NEC-1",
+          },
+        ],
       },
       {
         ListID: "90000004-1234567890",
@@ -5432,6 +5612,17 @@ export class SimulationStore {
         EditSequence: now,
         TimeCreated: "2024-11-01T09:00:00",
         TimeModified: now,
+        // Phase 13 #61 — transaction-level custom field. Lets the test suite
+        // verify the DataExt round trip survives across both list (Customer)
+        // and transaction (Invoice) entity shapes.
+        DataExtRet: [
+          {
+            OwnerID: "0",
+            DataExtName: "Project Code",
+            DataExtType: "STR255TYPE",
+            DataExtValue: "PRJ-2024-Q4",
+          },
+        ],
       },
       {
         TxnID: "T0000002-INV",
@@ -6229,6 +6420,72 @@ export class SimulationStore {
       TimeModified: now,
     };
     this.getStore("SalesReceipt").set(taxedReceipt.TxnID as string, taxedReceipt);
+
+    // Phase 13 #61 — DataExtDef seed. One DataExtDefRet per defined custom
+    // field; AssignToObject is repeated within each def for every entity
+    // type that can carry the field. Real QB stores these against the
+    // company file (set up via Lists → Templates / Add/Edit Multiple List
+    // Entries → Custom Fields); the sim mirrors that with a flat store.
+    //
+    // Key format: `${OwnerID}|${DataExtName}` so the same DataExtName can
+    // live under different OwnerIDs (third-party app namespaces use UUID
+    // OwnerIDs; the standard company-defined namespace is OwnerID="0").
+    //
+    // Values mirror the operator's typical CPA-firm setup:
+    //   - "Engagement Type" / "Partner Assigned" on Customer (tax-form
+    //     classification + book-of-business attribution).
+    //   - "1099 Box" on Vendor (per-vendor 1099 box override the operator
+    //     uses to override QB's default classification at filing time).
+    //   - "Project Code" on Invoice / Estimate / SalesReceipt (job-costing
+    //     tag that ties revenue back to a project tracker).
+    const dataExtDefs: StoredEntity[] = [
+      {
+        ListID: "DED-0001",
+        OwnerID: "0",
+        DataExtName: "Engagement Type",
+        DataExtType: "STR255TYPE",
+        AssignToObject: ["Customer"],
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "DED-0002",
+        OwnerID: "0",
+        DataExtName: "Partner Assigned",
+        DataExtType: "STR255TYPE",
+        AssignToObject: ["Customer"],
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "DED-0003",
+        OwnerID: "0",
+        DataExtName: "1099 Box",
+        DataExtType: "STR255TYPE",
+        AssignToObject: ["Vendor"],
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "DED-0004",
+        OwnerID: "0",
+        DataExtName: "Project Code",
+        DataExtType: "STR255TYPE",
+        AssignToObject: ["Invoice", "Estimate", "SalesReceipt"],
+        EditSequence: now,
+        TimeCreated: "2024-01-01T00:00:00",
+        TimeModified: now,
+      },
+    ];
+    const dataExtDefStore = this.getStore("DataExtDef");
+    for (const def of dataExtDefs) {
+      const owner = String(def.OwnerID ?? "0");
+      const name = String(def.DataExtName ?? "");
+      dataExtDefStore.set(`${owner}|${name}`, def);
+    }
 
     // Set ID counter beyond seed data
     this.idCounter = 10000;

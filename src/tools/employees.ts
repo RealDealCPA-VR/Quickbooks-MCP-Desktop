@@ -14,14 +14,16 @@ export function registerEmployeeTools(
 ): void {
   server.tool(
     "qb_employee_list",
-    "List or search employees in QuickBooks Desktop.",
+    "List or search employees in QuickBooks Desktop. Set includeCustomFields:true to surface DataExtRet (custom-field) values per employee.",
     {
       nameFilter: z.string().optional().describe("Filter employees by name"),
       activeOnly: z.boolean().optional().describe("Only return active employees"),
       maxReturned: z.number().optional().describe("Maximum results"),
       listId: z.string().optional().describe("Fetch a specific employee by ListID"),
+      includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned employee. Pass customFieldOwnerId for non-default namespaces."),
+      customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
     },
-    async ({ nameFilter, activeOnly, maxReturned, listId }) => {
+    async ({ nameFilter, activeOnly, maxReturned, listId, includeCustomFields, customFieldOwnerId }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -30,6 +32,8 @@ export function registerEmployeeTools(
       if (maxReturned) filters.MaxReturned = maxReturned;
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
+      // Phase 13 #61 — OwnerID slots at the END of the EmployeeQueryRq filter sequence.
+      if (includeCustomFields) filters.OwnerID = customFieldOwnerId ?? "0";
 
       try {
         const employees = await session.queryEntity("Employee", filters);

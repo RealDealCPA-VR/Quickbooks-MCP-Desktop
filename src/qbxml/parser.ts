@@ -120,6 +120,18 @@ const arrayElements = new Set([
   // arrays so the tool layer's filter / map paths work uniformly.
   "VehicleRet",
   "VehicleMileageRet",
+  // Phase 13 #61 — custom fields (DataExt). DataExtRet is the per-entity
+  // custom-field VALUE block ({OwnerID, DataExtName, DataExtType, DataExtValue})
+  // that QB attaches to *Ret elements when the query carried <OwnerID>.
+  // DataExtDefRet is the per-OwnerID custom-field DEFINITION block returned by
+  // DataExtDefQueryRq ({OwnerID, DataExtName, DataExtType, AssignToObject*}).
+  // AssignToObject is repeated WITHIN a single DataExtDefRet (one per entity
+  // type that can carry the field — Customer, Vendor, Invoice, etc.); without
+  // it in the array set, a definition that targets exactly one entity type
+  // would deserialize as a string instead of a single-element array.
+  "DataExtRet",
+  "DataExtDefRet",
+  "AssignToObject",
 ]);
 
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ export function registerItemTools(
 ): void {
   server.tool(
     "qb_item_list",
-    "List or search items (products and services) in QuickBooks Desktop. Omit itemType to query all subtypes. Set paginate:true (with itemType) to use iterator-based pagination — pagination cannot fan out across subtypes, so itemType is required when paginating. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset.",
+    "List or search items (products and services) in QuickBooks Desktop. Omit itemType to query all subtypes. Set paginate:true (with itemType) to use iterator-based pagination — pagination cannot fan out across subtypes, so itemType is required when paginating. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. Set includeCustomFields:true to surface DataExtRet (custom-field) values per item.",
     {
       itemType: itemTypeSchema.optional()
         .describe("Restrict to a single subtype. Omit to query all five subtypes and merge. Required when paginate:true."),
@@ -35,8 +35,10 @@ export function registerItemTools(
       listId: z.string().optional().describe("Fetch a specific item by ListID"),
       paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Requires itemType — iterators are scoped to a single request type, so the multi-subtype fan-out path is incompatible. Auto-defaults maxReturned to 500 if unset."),
       iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate, and itemType must match the original request type."),
+      includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned item. Pass customFieldOwnerId for non-default namespaces."),
+      customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
     },
-    async ({ itemType, nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID }) => {
+    async ({ itemType, nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID, includeCustomFields, customFieldOwnerId }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -51,6 +53,8 @@ export function registerItemTools(
       if (effectiveMaxReturned) filters.MaxReturned = effectiveMaxReturned;
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
+      // Phase 13 #61 — OwnerID slots at the END of the Item*QueryRq filter sequence.
+      if (includeCustomFields) filters.OwnerID = customFieldOwnerId ?? "0";
 
       const wantsPagination = Boolean(paginate || iteratorID);
       if (wantsPagination && !itemType) {

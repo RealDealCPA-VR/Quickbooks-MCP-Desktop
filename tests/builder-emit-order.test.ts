@@ -728,4 +728,80 @@ describe("buildQueryRequest — emits children in insertion order (schema-order 
       "ActiveStatus",
     ]);
   });
+
+  // Phase 13 #61 — OwnerID schema-order pin. OwnerID is the LAST child in the
+  // *QueryRq <xs:sequence> for every entity type that supports custom fields
+  // (after NameFilter on list entities; after IncludeLineItems on transaction
+  // entities). The tool layer (customers / vendors / invoices / bills / items /
+  // accounts / employees) populates filters in that order; this test pins it
+  // so a future filter-dict edit cannot silently slot OwnerID before the
+  // type-specific tail and re-introduce the schema-order bug class for the
+  // custom-fields surface.
+  it("CustomerQueryRq with OwnerID: OwnerID emits LAST after NameFilter", () => {
+    const xml = buildQueryRequest("Customer", {
+      ListID: "X-1",
+      MaxReturned: 100,
+      ActiveStatus: "ActiveOnly",
+      NameFilter: { MatchCriterion: "Contains", Name: "Acme" },
+      OwnerID: "0",
+    });
+    const order = emittedChildOrder(xml, "CustomerQueryRq", [
+      "ListID",
+      "MaxReturned",
+      "ActiveStatus",
+      "NameFilter",
+      "OwnerID",
+    ]);
+    expect(order).toEqual([
+      "ListID",
+      "MaxReturned",
+      "ActiveStatus",
+      "NameFilter",
+      "OwnerID",
+    ]);
+  });
+
+  it("InvoiceQueryRq with OwnerID: OwnerID emits LAST after IncludeLineItems", () => {
+    const xml = buildQueryRequest("Invoice", {
+      TxnID: "T-1",
+      MaxReturned: 100,
+      TxnDateRangeFilter: { FromTxnDate: "2026-01-01", ToTxnDate: "2026-12-31" },
+      EntityFilter: { FullName: "Acme" },
+      PaidStatus: "NotPaidOnly",
+      IncludeLineItems: true,
+      OwnerID: "0",
+    });
+    const order = emittedChildOrder(xml, "InvoiceQueryRq", [
+      "TxnID",
+      "MaxReturned",
+      "TxnDateRangeFilter",
+      "EntityFilter",
+      "PaidStatus",
+      "IncludeLineItems",
+      "OwnerID",
+    ]);
+    expect(order).toEqual([
+      "TxnID",
+      "MaxReturned",
+      "TxnDateRangeFilter",
+      "EntityFilter",
+      "PaidStatus",
+      "IncludeLineItems",
+      "OwnerID",
+    ]);
+  });
+
+  it("DataExtDefQueryRq: OwnerID → AssignToObject", () => {
+    // DataExtDefQueryRq carries a tight 2-child schema sequence — the
+    // qb_custom_field_list tool populates filters in this exact order.
+    const xml = buildQueryRequest("DataExtDef", {
+      OwnerID: "0",
+      AssignToObject: "Customer",
+    });
+    const order = emittedChildOrder(xml, "DataExtDefQueryRq", [
+      "OwnerID",
+      "AssignToObject",
+    ]);
+    expect(order).toEqual(["OwnerID", "AssignToObject"]);
+  });
 });

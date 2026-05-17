@@ -9,7 +9,7 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (145 total)
+## Tools (146 total)
 
 ### Customers
 | Tool | Description |
@@ -307,6 +307,7 @@ Read-only lookups for the supporting types that transactions reference by `FullN
 | `qb_sales_rep_list` | List Sales Reps (keyed by Initial). |
 | `qb_customer_type_list` | List Customer Types (Commercial, Residential, Government, etc.). |
 | `qb_vendor_type_list` | List Vendor Types (Supplier, Subcontractor, etc.). |
+| `qb_custom_field_list` | List custom-field (DataExt) DEFINITIONS configured on the company file — one row per `(OwnerID, DataExtName)` pair with `DataExtType` + `AssignToObject` (the entity types each def applies to). Wraps `DataExtDefQueryRq`. Scope to one namespace via `ownerId` (`"0"` = standard company-defined; UUIDs = third-party app namespaces); narrow to defs applicable to a specific entity type via `assignToObject` (Customer / Vendor / Invoice / etc.). Pair with `includeCustomFields: true` on the entity list tools — `qb_customer_list` / `qb_vendor_list` / `qb_invoice_list` / `qb_bill_list` / `qb_item_list` / `qb_account_list` / `qb_employee_list` all accept the flag; when set, every returned row carries a `DataExtRet` array with that entity's custom-field VALUES filtered to the requested OwnerID (default `"0"`). Real QB strips `DataExtRet` from query responses by default, mirrored here — opt-in only, which keeps the default response payloads lean. Read-only — DataExtAdd / DataExtMod / DataExtDel for setting CF VALUES is deferred; operators set CF values in QB Desktop directly. |
 
 ### Reports & Queries
 | Tool | Description |
@@ -445,7 +446,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (145 tools)     │──│──────────────┐
+                                    │  │ (146 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │

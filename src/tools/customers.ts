@@ -19,7 +19,7 @@ export function registerCustomerTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_customer_list",
-    "List or search customers in QuickBooks. Returns customer records matching filters. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset.",
+    "List or search customers in QuickBooks. Returns customer records matching filters. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. Set includeCustomFields:true to surface DataExtRet (custom-field) values on every returned customer — discover defined CFs via qb_custom_field_list.",
     {
       nameFilter: z.string().optional().describe("Filter customers by name (partial match)"),
       activeOnly: z.boolean().optional().describe("Only return active customers (default true)"),
@@ -27,8 +27,10 @@ export function registerCustomerTools(
       listId: z.string().optional().describe("Fetch a specific customer by ListID"),
       paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
       iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
+      includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned customer. Pass the OwnerID namespace via customFieldOwnerId (default '0' — the standard company-defined namespace). Stripped by default to keep payloads lean; discover defined CFs via qb_custom_field_list."),
+      customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
     },
-    async ({ nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID }) => {
+    async ({ nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID, includeCustomFields, customFieldOwnerId }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -60,6 +62,12 @@ export function registerCustomerTools(
       }
       if (nameFilter) {
         filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
+      }
+      // Phase 13 #61 — OwnerID slots at the END of the *QueryRq filter
+      // sequence (after the type-specific tail). buildQueryRequest preserves
+      // insertion order so populating it last produces schema-compliant XML.
+      if (includeCustomFields) {
+        filters.OwnerID = customFieldOwnerId ?? "0";
       }
 
       try {

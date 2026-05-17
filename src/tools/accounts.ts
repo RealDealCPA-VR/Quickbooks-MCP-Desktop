@@ -20,7 +20,7 @@ export function registerAccountTools(
 ): void {
   server.tool(
     "qb_account_list",
-    "List the chart of accounts from QuickBooks Desktop. Returns all accounts or filtered by type.",
+    "List the chart of accounts from QuickBooks Desktop. Returns all accounts or filtered by type. Set includeCustomFields:true to surface DataExtRet (custom-field) values per account.",
     {
       accountType: z.string().optional().describe(
         `Filter by account type: ${ACCOUNT_TYPES.join(", ")}`
@@ -28,8 +28,10 @@ export function registerAccountTools(
       activeOnly: z.boolean().optional().describe("Only return active accounts"),
       nameFilter: z.string().optional().describe("Filter by account name"),
       listId: z.string().optional().describe("Fetch a specific account by ListID"),
+      includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned account. Pass customFieldOwnerId for non-default namespaces."),
+      customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
     },
-    async ({ accountType, activeOnly, nameFilter, listId }) => {
+    async ({ accountType, activeOnly, nameFilter, listId, includeCustomFields, customFieldOwnerId }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -39,6 +41,8 @@ export function registerAccountTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
       if (accountType) filters.AccountType = accountType;
+      // Phase 13 #61 — OwnerID slots at the END of the AccountQueryRq filter sequence.
+      if (includeCustomFields) filters.OwnerID = customFieldOwnerId ?? "0";
 
       try {
         const accounts = await session.queryEntity("Account", filters);

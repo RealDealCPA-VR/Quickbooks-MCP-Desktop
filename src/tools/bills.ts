@@ -99,7 +99,7 @@ export function registerBillTools(
 ): void {
   server.tool(
     "qb_bill_list",
-    "List or search bills (accounts payable) in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface ExpenseLineRet + ItemLineRet (account/amount on the expense lines, item/qty/cost on item lines).",
+    "List or search bills (accounts payable) in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface ExpenseLineRet + ItemLineRet (account/amount on the expense lines, item/qty/cost on item lines). Set includeCustomFields:true to surface DataExtRet (custom-field) values per bill.",
     {
       vendorName: z.string().optional().describe("Filter by vendor name"),
       vendorListId: z.string().optional().describe("Filter by vendor ListID"),
@@ -109,6 +109,8 @@ export function registerBillTools(
       paidStatus: z.enum(["All", "PaidOnly", "NotPaidOnly"]).optional()
         .describe("Filter by payment status"),
       includeLineItems: z.boolean().optional().describe("When true, each bill row carries its ExpenseLineRet + ItemLineRet arrays. Default false — header totals only, matching real QB's *QueryRq default behavior."),
+      includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned bill. Pass customFieldOwnerId for non-default namespaces."),
+      customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
       maxReturned: z.number().optional().describe("Maximum results. Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."),
       paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
       iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
@@ -138,6 +140,11 @@ export function registerBillTools(
       }
       if (args.paidStatus) filters.PaidStatus = args.paidStatus;
       if (args.includeLineItems) filters.IncludeLineItems = true;
+      // Phase 13 #61 — OwnerID slots after IncludeLineItems in the BillQueryRq
+      // schema sequence.
+      if (args.includeCustomFields) {
+        filters.OwnerID = args.customFieldOwnerId ?? "0";
+      }
 
       try {
         if (args.paginate || args.iteratorID) {
