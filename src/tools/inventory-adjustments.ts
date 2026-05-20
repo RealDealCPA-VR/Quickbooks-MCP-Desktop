@@ -174,6 +174,7 @@ export function registerInventoryAdjustmentTools(
       lines: z.array(inventoryAdjustmentLineSchema).min(1)
         .describe("Per-item adjustment lines. At least one required."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate adjustment (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -238,6 +239,26 @@ export function registerInventoryAdjustmentTools(
         return lineData;
       });
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("InventoryAdjustment", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { inventoryAdjustment: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "InventoryAdjustmentAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("InventoryAdjustment", data, args.idempotencyKey)
@@ -260,12 +281,33 @@ export function registerInventoryAdjustmentTools(
 
   server.tool(
     "qb_inventory_adjustment_delete",
-    "Delete an inventory adjustment from QuickBooks Desktop. The simulation REVERSES every line's qty/value delta against the still-present ItemInventory row (orphan items are silently skipped — a deleted item won't block adjustment deletion). After delete, each affected item's QuantityOnHand / QuantityOnHandValue / AverageCost return to their pre-adjustment state. WARNING: Irreversible.",
+    "Delete an inventory adjustment from QuickBooks Desktop. The simulation REVERSES every line's qty/value delta against the still-present ItemInventory row (orphan items are silently skipped — a deleted item won't block adjustment deletion). After delete, each affected item's QuantityOnHand / QuantityOnHandValue / AverageCost return to their pre-adjustment state. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the inventory adjustment to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("InventoryAdjustment", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (InventoryAdjustment) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("InventoryAdjustment", txnId);
         return {

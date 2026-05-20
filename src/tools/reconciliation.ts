@@ -70,14 +70,43 @@ export function registerReconciliationTools(
 ): void {
   server.tool(
     "qb_cleared_status_update",
-    "Mark a bank/credit-card transaction as Cleared / NotCleared / Pending — the canonical bank-reconciliation primitive in the QBXML SDK (wraps ClearedStatusModRq). Targets one of the seven bank-affecting transaction types (Check, BillPaymentCheck, BillPaymentCreditCard, Deposit, Transfer, CreditCardCharge, CreditCardCredit); calling against any other transaction type (Invoice/Bill/JE/etc.) returns statusCode 3120 because their headers don't carry cleared status. Pass `txnId` for a whole-transaction update (the typical reconcile flow for a check or deposit); pass `txnId` + `txnLineId` to flip cleared status on a single split line of a multi-line transaction (e.g. one line of a multi-account Deposit). The mutation is naturally idempotent — flipping Cleared on an already-Cleared txn is a server-side no-op, so this tool does NOT accept an idempotencyKey arg (the cache wouldn't add value). A read-only session (qb_session_connect({readOnly: true})) rejects this call with statusCode 9001 before any envelope is built. Unknown txnId returns 500; invalid clearedStatus value returns 3120. WORKFLOW: while QB Desktop's reconciliation screen is open and showing the bank statement, use this tool to mark each matching txn Cleared in bulk through an agent — replaces clicking through every line by hand. Read side (which txns are uncleared) is a Phase 11 follow-up that requires CustomDetailReportQueryRq infrastructure; for now use the QB Desktop UI to discover uncleared txns and pass their TxnIDs here.",
+    "Mark a bank/credit-card transaction as Cleared / NotCleared / Pending — the canonical bank-reconciliation primitive in the QBXML SDK (wraps ClearedStatusModRq). Targets one of the seven bank-affecting transaction types (Check, BillPaymentCheck, BillPaymentCreditCard, Deposit, Transfer, CreditCardCharge, CreditCardCredit); calling against any other transaction type (Invoice/Bill/JE/etc.) returns statusCode 3120 because their headers don't carry cleared status. Pass `txnId` for a whole-transaction update (the typical reconcile flow for a check or deposit); pass `txnId` + `txnLineId` to flip cleared status on a single split line of a multi-line transaction (e.g. one line of a multi-account Deposit). The mutation is naturally idempotent — flipping Cleared on an already-Cleared txn is a server-side no-op, so this tool does NOT accept an idempotencyKey arg (the cache wouldn't add value). A read-only session (qb_session_connect({readOnly: true})) rejects this call with statusCode 9001 before any envelope is built. Unknown txnId returns 500; invalid clearedStatus value returns 3120. Pass `dryRun: true` to preview without committing. WORKFLOW: while QB Desktop's reconciliation screen is open and showing the bank statement, use this tool to mark each matching txn Cleared in bulk through an agent — replaces clicking through every line by hand. Read side (which txns are uncleared) is a Phase 11 follow-up that requires CustomDetailReportQueryRq infrastructure; for now use the QB Desktop UI to discover uncleared txns and pass their TxnIDs here.",
     {
       txnId: z.string().min(1).describe("TxnID of the bank/CC transaction to update. From a prior qb_check_list / qb_bill_payment_list / etc., or from QB Desktop's reconciliation screen."),
       clearedStatus: z.enum(["Cleared", "NotCleared", "Pending"]).describe("New cleared status. Cleared = reconciled (matched against a statement line); NotCleared = open / not yet reconciled; Pending = downloaded but not finalized (typical for bank-feed flows)."),
       txnLineId: z.string().optional().describe("Optional TxnLineID — flip cleared status on a single split line within the transaction. Use for multi-line Deposits or Checks where only one split line cleared. Omit (default) to update the whole transaction's cleared status."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.updateClearedStatusDryRun({
+            txnId: args.txnId,
+            clearedStatus: args.clearedStatus,
+            txnLineId: args.txnLineId,
+          });
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                clearedStatus: args.clearedStatus,
+                txnId: args.txnId,
+                ...(args.txnLineId ? { txnLineId: args.txnLineId } : {}),
+                ...rest,
+                ...(entity ? { result: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "ClearedStatusModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.updateClearedStatus({
           txnId: args.txnId,

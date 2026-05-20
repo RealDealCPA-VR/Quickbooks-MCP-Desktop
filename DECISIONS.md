@@ -29,6 +29,132 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-20 — Streaming responses research (Phase 16 #73) — MCP SDK has no streaming primitive for tool result bodies; reframed as server-side iterator exhaustion
+
+**Chosen:** Reject "true" streaming at the `server.tool` callback layer. Implement #73 as `autoExhaust: boolean` on the 7 paginated list tools — server-side loops `queryEntityPaginated` until `iteratorRemainingCount === 0` and returns the merged result as a single `CallToolResult`. Hard `maxBatches` cap (default 20) prevents runaway scans; cap hit returns partial result + final `iteratorID` for caller-driven resumption.
+
+**Why:** Investigated `@modelcontextprotocol/sdk@1.29.0` source. The `ToolCallback<Args>` type signature (mcp.d.ts:261) is `(args, extra) => CallToolResult | Promise<CallToolResult>` — explicit single-return contract, NOT `AsyncGenerator<CallToolResult>`. Each `tools/call` request resolves to exactly one `CallToolResult` at the JSON-RPC framing layer. Streaming-of-content does not exist as a first-class primitive. Three SDK-adjacent mechanisms exist but none deliver result-body chunking:
+
+1. **`extra.sendNotification`** (`RequestHandlerExtra.sendNotification`, protocol.d.ts:207) — emit `notifications/progress` `{ progress, total?, message? }` or `notifications/message` mid-call. Advisory only — for UI ticks, not result data. Client only sees them if it passed a `progressToken` in `params._meta`. No MCP client renders progress notifications in any user-visible way on stdio today.
+2. **`server.experimental.tasks.registerToolTask`** (mcp.d.ts:32) — register a tool with `createTask` / `getTask` / `getTaskResult` handlers. Client polls via `tasks/get` / `tasks/result` (with optional `pollInterval`). Side-channel `TaskMessageQueue` can queue intermediate messages.
+3. **`Protocol.requestStream`** (protocol.d.ts:345) — experimental CLIENT-side `AsyncGenerator<ResponseMessage>` consuming `taskCreated` / `taskStatus` / `result` / `error` events. Lifecycle stream, not result chunks.
+
+Rejected option 1 as a primary mechanism — it's UI sugar, not the feature operators asked for. Rejected option 2 (experimental tasks API) for two reasons: (a) explicitly marked "experimental, may change without notice" — locking a load-bearing operator workflow into shifting SDK surface is a maintenance bet; (b) client-polled, requires `TaskStore` + `TaskMessageQueue` plumbing in `src/index.ts` (the in-memory variants ship in the SDK at `experimental/tasks/stores/in-memory`), and would ship without a consumer (Claude Code stdio doesn't exercise task semantics).
+
+The original #73 premise was also wrong on a load-bearing point: "QB can produce one stream" — it cannot. QBXML's iterator cap (`MaxReturned` ~500/batch) is a server-side QuickBooks Desktop constraint. A 2,000-customer dump is exactly 4 wire round trips to QB regardless of MCP-layer shape. The cost #73 actually targets is **LLM-side round trips** (4 `tools/call` invocations vs. 1), not wire-side fetch time. Server-side iterator collapse collapses the LLM side without depending on any MCP streaming surface.
+
+**Alternatives rejected:**
+- **AsyncGenerator return from `server.tool`** — not supported by the SDK type signature. Would require forking the SDK or dropping below `McpServer` and registering raw request handlers directly. Both reject the project convention of "register via `server.tool(name, description, zodSchema, handler)` — never bypass the SDK" (CLAUDE.md).
+- **Progress notifications as a primary delivery mechanism** — advisory only, no MCP client renders them today, would ship without a consumer.
+- **Experimental task-based tools (`registerToolTask`)** — marked experimental, requires non-trivial plumbing in `src/index.ts` (TaskStore + TaskMessageQueue), no consumer on the operator side, locks a load-bearing operator workflow into shifting SDK surface.
+- **Status quo (caller-driven iterator loop)** — operator already has this via `paginate: true` + `iteratorID`. The complaint in todo.md #73 is the 4 round-trip LLM-side cost, not the wire shape. Status quo is not the answer.
+
+**Tradeoffs / consequences:**
+- `autoExhaust: true` is a **single slow tool response** instead of N fast ones — that's the inherent tradeoff for batch-dump UX. The operator chose latency-per-call vs. round-trip count.
+- `maxBatches` cap is a hard guardrail — under default 20, a tool can return up to ~10k rows (20 × 500/batch). Books larger than that need the caller to either bump `maxBatches` explicitly OR resume via the returned `iteratorID`. Default deliberately favors safety over completeness — silent unbounded scans on a multi-million-customer book would be worse than a cap-hit warning.
+- The wire-cost analysis is asymmetric: **MCP-side round trips collapse 4→1, QB-side round trips stay 4** (`queryEntityPaginated` makes the same N calls under the hood). If a future operator says "this is still too slow," the answer is "QB Desktop's wire cap is the floor" — there is no MCP-layer fix.
+- The bound on the response body grows with `maxBatches`. A 10k-customer response at ~1KB/row = ~10MB JSON in one `CallToolResult` — well below the stdio transport's effective ceiling but larger than the typical paginated response (~500KB). Memory cost is one-shot (the result accumulates in-process, gets stringified, gets emitted, gets GC'd) — no streaming back-pressure path.
+- The `iteratorID` returned on a cap-hit is **only valid in live mode** for resumption — sim's `queryEntityPaginated` doesn't maintain cross-call iterator state (Continue is treated as exhausted). The `autoExhaust` path emits a sim-side warning if it hits the cap (rare — sim seed sizes are well under 500 rows per entity type) noting that resumption only works against real QB.
+- Iterator state is per-`*QueryRq` envelope on the QB side, so `autoExhaust` cannot combine filters across types (e.g. "every entity in the book"). It's strictly a single-entity-type collapse.
+
+**Revisit when:**
+- An MCP client emerges that meaningfully renders progress notifications on stdio AND an operator workflow has UI feedback as a hard requirement — then layer Option B (`extra.sendNotification` between iterator pages) on top of `autoExhaust`. ~30 LoC per tool, one shared `emitProgress` helper.
+- The SDK promotes `registerToolTask` out of experimental AND a downstream orchestration consumer (not Claude Code) needs the polling shape. Migration would be a per-tool `taskSupport: 'optional'` opt-in — non-destructive over `autoExhaust`; both can coexist.
+- Memory pressure from a 10k-row `CallToolResult` becomes a real bottleneck (currently theoretical — no observed instance).
+
+---
+
+## 2026-05-20 — qb_audit_log wire shape (Phase 14 #66) — `CustomDetailReportQueryRq` with `CustomDetailReportType=AuditTrail`, NOT `TxnReportQueryRq`
+
+**Chosen:** Route `qb_audit_log` through `CustomDetailReportQueryRq` with `CustomDetailReportType=AuditTrail`. Reuse the existing `buildCustomDetailReportRequest` builder + `extractCustomDetailReportData` adapter — no new builder, no new parser surface. Manager exposes a thin convenience method `runAuditTrailReport({ fromDate?, toDate? })` that hardcodes the report type + canonical IncludeColumn list (`User` / `TimeModified` / `ModifyType` / `ChangedField` / `OldValue` / `NewValue` / `TxnID` / `TxnType`).
+
+**Why:** `AuditTrail` is a value in the QBXML SDK's `CustomDetailReportType` enum (alongside `CustomTxnDetail` / `CustomSummary`) — NOT a value in `TxnReportType`. The prior HANDOFF.md speculated `TxnReportQueryRq (audit-trail mode)` but that enum doesn't include `AuditTrail`. Going down that path would have failed at QBXML XSD validation on the first live call (statusCode -1 "found an error when parsing"). Operator-confirmed the `CustomDetailReportQueryRq` route before implementation.
+
+**Alternatives rejected:**
+- `TxnReportQueryRq` with audit-trail mode (the HANDOFF guess) — `TxnReportType` enum does not include `AuditTrail`; would fail XSD validation in live.
+- New dedicated builder (`buildAuditTrailReportRequest`) — would duplicate the `CustomDetailReport` envelope shape. Reuse via `reportType="AuditTrail"` is structurally identical to the operator-already-validated bank-rec read path.
+- Skip the tool, defer Phase 14 #66 to a future session — operator explicitly picked the `CustomDetailReportQueryRq` route and asked to proceed.
+
+**Tradeoffs / consequences:**
+- `qb_audit_log` shares the `CustomDetailReportQueryRq` wire path with `qb_uncleared_transactions` / `qb_reconciliation_discrepancy` — a parser regression on the row-tree adapter (`adaptLiveCustomDetailReportRet`) breaks all three. The existing CustomDetailReport tests pin the row-tree shape; the AuditTrail tests pin the column-by-title mapping. Both layers must stay green.
+- `CustomDetailReportType="AuditTrail"` differs from `CustomTxnDetail` in that it does NOT require a `ReportAccountFilter` (audit entries span every entity type, not a single account). The sim's `handleCustomDetailReportQuery` dispatches to `handleAuditTrailReport` BEFORE the `CustomTxnDetail`-specific account-filter requirement — a future refactor that hoists the account-filter check above the dispatch will silently break the AuditTrail path (test pins this).
+- `txnId` scoping has no wire-level filter (`CustomDetailReportQueryRq` accepts no `TxnIDFilter`) — the tool layer post-filters after a 2-year default lookback fetch. Cost noted in tool description: on a very-large audit log (multi-year heavy-mutation books) a 2-year fetch may be slow. If operator workflows demand it, relax the both-args XOR to AND-combine: `dateRange` narrows the wire-side fetch + `txnId` post-filters within that window.
+- The seeded audit-trail entries are static — sim does NOT auto-generate audit events on entity mutations (would require event-sourcing the entire sim store, a much larger refactor). Tests that exercise the audit log against sim mutations would need to either (a) extend the sim to event-source — out of #66 scope, or (b) add to `auditTrail` directly via a sim-test-only helper. Today, all #66 tests use the static seed.
+- Snapshot/restore extended to clone `auditTrail` — defensive against a future event-sourced sim path. Today there's no audit-mutating code, so the clone is a no-op cost-wise (8 entries × structuredClone).
+- Column titles in `IncludeColumn` are best-effort inferred from QB Desktop's Audit Trail report UI labels — exact wire names await live verification against an Enterprise install. Tool layer reads columns by title with `""` defaults — tolerant to column-name drift; live mismatch surfaces as empty strings for affected fields, not a runtime crash. Fix would be in `runAuditTrailReport`'s IncludeColumn list, not the row mapper.
+
+**Revisit when:** First live exercise against an Enterprise QB install reveals column-name mismatch or schema-validation failure on the envelope (status -1 "found an error when parsing"). The HANDOFF's "Live verification deferred" caveat is the trigger.
+
+---
+
+## 2026-05-20 — Dry-run mechanical rollout (Phase 14 #64a) — `dryRun: z.boolean().optional()` threaded into all ~50 simple-mutation tools; composite tools deferred to V2 per a per-tool decision matrix
+
+**Chosen:** Hand-thread the V1 pattern into every `*_create` / `*_update` / `*_delete` / `*_apply` / `*_make_inactive` tool whose handler reduces to a single `addEntity` / `modifyEntity` / `deleteEntity` / `updateClearedStatus` primitive call. Skip any tool whose handler reads-then-mutates, runs compensating-rollback logic, or fans out to multiple mutation primitives — those need bespoke V2 decisions. Codemod was considered and rejected: per-tool pre-validation varies (vendorName-or-vendorListId guards, line-source guards, hierarchy parent resolution, etc.), and the rolled-up Edit-tool budget for 62 mechanical transformations (~5-10 min/tool of attentive hand-threading) was lower than the round-trip cost of writing a robust codemod that handles all the variation. Build-passes-after-every-domain cadence catches mistakes early.
+
+**Domains threaded (24 files, 62 dryRun-bearing handlers):**
+- list entities: `accounts` (4: add/update/make_inactive/delete), `vendors` (3), `employees` (4: includes make_inactive), `items` (3: subtype-aware via `Item${args.itemType}`), `customers` (2 new: update/delete)
+- transaction entities — AR side: `invoices` (1 new: update), `estimates` (3), `sales-orders` (3), `sales-receipts` (3), `credit-memos` (4: includes apply), `statement-charges` (3), `payments` (2: receive/apply)
+- transaction entities — AP side: `bills` (3), `purchase-orders` (3), `checks` (3)
+- transaction entities — banking: `deposits` (3), `transfers` (3), `journal-entries` (3)
+- transaction entities — other: `inventory-adjustments` (2), `time-tracking` (1), `vehicle-mileage` (1), `sales-tax` (1: payment_create), `attachments` (2)
+- specialty primitive: `reconciliation` (1: `cleared_status_update` uses `updateClearedStatusDryRun`)
+
+**Composite outliers deliberately NOT threaded in this sweep (need V2 per-tool design):**
+- Originally flagged in V1 handoff: `qb_invoice_write_off`, `qb_invoice_batch_create`, `qb_sales_receipt_batch_create`, `qb_journal_entry_batch_create`, `qb_invoice_duplicate`, `qb_estimate_convert_to_invoice`
+- **Newly added to outlier set** (same logic — read-then-mutate or fan-out to multiple primitives): `qb_bill_duplicate`, `qb_journal_entry_duplicate`, `qb_sales_receipt_duplicate`, `qb_sales_order_convert_to_invoice`, `qb_bill_pay` (composite that creates BillPaymentCheck/BillPaymentCreditCard against open bills)
+
+**Per-tool transformation pattern (verbatim across all 62 handlers):**
+```ts
+// schema field:
+dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
+
+// handler branch (inserted immediately BEFORE the existing real-call try { ... }):
+if (args.dryRun) {
+  try {
+    const preview = await session.<addEntityDryRun|modifyEntityDryRun|deleteEntityDryRun|updateClearedStatusDryRun>(<entity-type>, <data | id>, <args.idempotencyKey if applicable>);
+    const { entity, ...rest } = preview;
+    return { content: [{ type: "text" as const, text: JSON.stringify({
+      success: true, dryRun: true, ...rest, ...(entity ? { <domain-key>: entity } : {}),
+    }, null, 2) }] };
+  } catch (err) {
+    return formatToolError(err, { fallbackMessage: "<RqName> dry-run failed" });
+  }
+}
+```
+
+The domain key (`customer`, `invoice`, `bill`, `vendor`, `account`, `check`, `deposit`, `transfer`, `estimate`, `salesOrder`, `salesReceipt`, `creditMemo`, `statementCharge`, `payment`, `purchaseOrder`, `journalEntry`, `inventoryAdjustment`, `timeTracking`, `vehicleMileage`, `salesTaxPayment`, `attachment`, `employee`, `item`, `deleted`) is the same key the real-call path uses — preserves response shape for the `success: true` case.
+
+**Tests:** +4 new tool-surface tests in [tests/dry-run.test.ts](tests/dry-run.test.ts) Layer 7, filling the coverage gaps the V1 pilot's 3 tools didn't pin:
+- list-entity update (`qb_account_update` — Account.Description NOT modified)
+- list-entity delete (`qb_account_delete` — Account still present)
+- transaction-entity update (`qb_bill_update` — Bill.Memo NOT modified)
+- cleared_status_update (`qb_cleared_status_update` — ClearedStatus NOT modified)
+
+Total tests 1479 → 1483. Tool count unchanged at 147 (`dryRun` is a flag on existing tools, not a new tool surface).
+
+**Why hand-thread over codemod:**
+- **Pre-validation variance is real.** `qb_bill_create` has a "either vendorName or vendorListId" pre-check + an "expense or item lines required" pre-check; `qb_check_create` has a "either accountName or accountListId" pre-check + the same line-source check; `qb_statement_charge_create` has a "amount OR quantity+rate" derivation guard. A codemod that handles all of these correctly is a small parser, not a regex. The Edit-tool round-trip cost of writing + testing that parser exceeded the per-tool hand-thread cost.
+- **Build-after-every-domain cadence is the safety net.** TypeScript catches shape mismatches immediately — `npm run build` ran clean after each 2-4 tool batch. Codemod would have run all 62 transformations before any feedback, multiplying debug surface.
+- **Description prose is per-tool.** Some tools got "Pass `dryRun: true` to preview without committing." appended to their existing description; the V1 pilots got bespoke language explaining the composition matrix. A codemod would either ignore descriptions (worse for operator-discoverability) or need a regex per tool family (no time savings).
+
+**Alternatives rejected:**
+- **One-shot codemod** — see above; not zero-cost given variance, and would skip the build-after-batch safety net.
+- **Per-domain test file (one sanity test per tool)** — would add ~60 tests for ~0 marginal pin value. The pattern is identical across handlers; TypeScript validates the shape; the 4 Layer-7 tests cover the pattern families that V1 didn't pin (list-modify, list-delete, txn-modify, special primitive). One sanity test per primitive pattern beats one per tool.
+- **Thread composite outliers anyway with "best-effort" previews** — A `qb_invoice_write_off` preview that ran the read but skipped the compensating-rollback path would silently misreport "this would work" when the real call could still fail mid-rollback. Deferring to V2 with explicit per-tool decisions preserves the dry-run safety guarantee (a successful dry-run accurately predicts the real call).
+
+**Tradeoffs / consequences:**
+- **Composite outliers are now an explicit V2 deferral with named tools, not "everything else."** The 11-tool outlier list (6 originally flagged + 5 added by this sweep + `qb_bill_pay`) is the definitive set needing bespoke V2 designs. Each needs a per-tool question answered before threading: peek the idempotency cache? snapshot before the read? what does "would happen" mean when the rollback path could itself fail? Defer until operator-feedback on V1 makes the ergonomics worth iterating on.
+- **`qb_credit_memo_apply` + `qb_payment_apply` ARE threaded** even though they sound composite. Both are pure `modifyEntity` wrappers — they don't fan out to multiple primitives, just send a `*ModRq` with an `AppliedToTxnMod` array. The sim store's `handleMod` does the AR-balance reversal/re-application atomically inside the single mutation, so `modifyEntityDryRun`'s snapshot/restore captures the entire side-effect surface.
+- **`qb_account_make_inactive` + `qb_employee_make_inactive`** — these are thin wrappers over `modifyEntity({ IsActive: false })`. Threaded the same way as `_update`; both share the `dryRun: true` preview shape.
+- **`time-tracking` has a small post-processing wrinkle.** The real call derives `hours` from the persisted Duration as part of the response. The dry-run path mirrors this — derives `hours` from `entity.Duration` before constructing the response — so the dry-run preview's `timeTracking.hours` matches what the real call would return.
+
+**Revisit when:**
+- An operator runs the V1 dry-run against a real workflow and reports an ergonomics gap (e.g. preview output too verbose, or a missing field).
+- A composite outlier reaches the top of the priority queue. The first composite-V2 candidates are probably `qb_invoice_batch_create` and `qb_journal_entry_batch_create` (high-impact monthly recurring flows where preview before commit is most valuable).
+- A new mutation tool is added — it MUST land with `dryRun` threaded (the pattern is now baseline expectation, not opt-in).
+
+---
+
 ## 2026-05-20 — Dry-run mode (Phase 14 #64) V1 — manager-layer primitives + snapshot/restore + three composition decisions pinned
 
 **Chosen:** Phase 14 #64 ships dry-run mode in two layers. (1) **Manager layer** — new `addEntityDryRun` / `modifyEntityDryRun` / `deleteEntityDryRun` / `executeBatchAddDryRun` / `updateClearedStatusDryRun` methods on [QBSessionManager](src/session/manager.ts), each returning a typed `DryRunResult` (or `DryRunBatchResult`). Sim mode runs the operation against a snapshot of the sim store and restores it in a `finally` block — observable side-effects are zero. Live mode (Option B below) builds the QBXML envelope and returns it without hitting the wire. (2) **Sim store** — new `snapshot()` / `restore(snap)` primitives on [SimulationStore](src/session/simulation-store.ts) that deep-clone the `stores: Map<string, EntityStore>` and `idCounter` via `structuredClone`. (3) **Pilot tool surface** — `dryRun: z.boolean().optional()` threaded into three representative tools: `qb_customer_add` (simplest list entity + idempotency composition), `qb_invoice_create` (transaction with lines + Customer.Balance side effect), `qb_invoice_delete` (transaction delete with side effects). Composition with read-only (`#42`) and idempotency keys (`#47`) completes the safety triad.

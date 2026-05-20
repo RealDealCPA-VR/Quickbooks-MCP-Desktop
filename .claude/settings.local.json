@@ -116,7 +116,8 @@
       "PowerShell(& \"C:\\\\nvm4w\\\\nodejs\\\\node.exe\" \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\scripts\\\\verify-item65-error-hints.mjs\")",
       "PowerShell(\"\" | & node \"c:/Users/VR/Projects/Quickbooks MCP Desktop/dist/index.js\"; \"EXIT=$LASTEXITCODE\")",
       "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $out)",
-      "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $out | Select-String -Pattern \"Mode:|Company file:|stdio|tools\" | ForEach-Object { $_.ToString\\(\\) })"
+      "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $out | Select-String -Pattern \"Mode:|Company file:|stdio|tools\" | ForEach-Object { $_.ToString\\(\\) })",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

@@ -139,6 +139,7 @@ export function registerCreditMemoTools(
       appliedTo: z.array(appliedToSchema).optional()
         .describe("Optional invoice applications — each entry closes part or all of an invoice's BalanceRemaining at create time. sum(amount) must be ≤ TotalAmount; the difference becomes RemainingValue (unapplied credit)."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate credit memo (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -196,6 +197,26 @@ export function registerCreditMemoTools(
         }));
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("CreditMemo", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { creditMemo: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "CreditMemoAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("CreditMemo", data, args.idempotencyKey)
@@ -229,6 +250,7 @@ export function registerCreditMemoTools(
       memo: z.string().optional().describe("New memo"),
       lines: z.array(creditMemoLineModSchema).optional()
         .describe("Replacement line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -263,6 +285,26 @@ export function registerCreditMemoTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("CreditMemo", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { creditMemo: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "CreditMemoModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("CreditMemo", data);
         return {
@@ -285,6 +327,7 @@ export function registerCreditMemoTools(
       editSequence: z.string().describe("EditSequence from a prior qb_credit_memo_list — must match or the mod is rejected with statusCode 3170"),
       applyTo: z.array(appliedToSchema)
         .describe("Replacement application set. Pass an empty array to fully unapply the credit (it becomes pure customer credit again)."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -297,6 +340,26 @@ export function registerCreditMemoTools(
           PaymentAmount: line.amount,
         })),
       };
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("CreditMemo", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { creditMemo: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "CreditMemoModRq (apply) dry-run failed" });
+        }
+      }
 
       try {
         const result = await session.modifyEntity("CreditMemo", data);
@@ -314,12 +377,33 @@ export function registerCreditMemoTools(
 
   server.tool(
     "qb_credit_memo_delete",
-    "Delete a credit memo. Reverses the AR posting: customer Balance moves by +TotalAmount and any applied invoices have their BalanceRemaining restored by the previously-applied amount. WARNING: Irreversible.",
+    "Delete a credit memo. Reverses the AR posting: customer Balance moves by +TotalAmount and any applied invoices have their BalanceRemaining restored by the previously-applied amount. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the credit memo to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("CreditMemo", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (CreditMemo) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("CreditMemo", txnId);
         return {

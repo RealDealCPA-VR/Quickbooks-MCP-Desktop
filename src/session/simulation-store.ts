@@ -26,6 +26,29 @@ interface StoredEntity {
 
 type EntityStore = Map<string, StoredEntity>;
 
+/**
+ * Audit-trail entry (Phase 14 #66 — qb_audit_log).
+ *
+ * Real QB Enterprise auto-generates these on every entity mutation; the sim
+ * doesn't (sim is a snapshot store, not an event-sourced one) so we seed a
+ * static set so the read-side filters can be exercised. Field shape matches
+ * what the tool layer emits — see qb_audit_log's docstring for the contract.
+ *
+ * `changedField` / `oldValue` / `newValue` are present on `Modified` events;
+ * absent on `Added` / `Deleted` (the entity as a whole landed or vanished —
+ * no per-field diff to report).
+ */
+interface AuditTrailEntry {
+  txnId: string;
+  txnType: string;
+  user: string;
+  timeModified: string;
+  modifyType: "Added" | "Modified" | "Deleted";
+  changedField?: string;
+  oldValue?: string;
+  newValue?: string;
+}
+
 // ---------------------------------------------------------------------------
 // XML parser for incoming requests
 // ---------------------------------------------------------------------------
@@ -45,6 +68,11 @@ const xmlParser = new XMLParser({
 export class SimulationStore {
   private stores: Map<string, EntityStore> = new Map();
   private idCounter = 1000;
+  // Phase 14 #66 — qb_audit_log. Static seed (real QB Enterprise auto-generates
+  // on every mutation; sim doesn't event-source). Snapshot/restore clones this
+  // for the dry-run primitives so a future audit-write code path won't leak
+  // mutations through restore.
+  private auditTrail: AuditTrailEntry[] = [];
 
   constructor() {
     this.seedData();
@@ -71,7 +99,11 @@ export class SimulationStore {
    * nested arrays / dates / nulls / nested objects without needing per-entity
    * shape knowledge.
    */
-  snapshot(): { stores: Map<string, EntityStore>; idCounter: number } {
+  snapshot(): {
+    stores: Map<string, EntityStore>;
+    idCounter: number;
+    auditTrail: AuditTrailEntry[];
+  } {
     const clonedStores = new Map<string, EntityStore>();
     for (const [entityType, store] of this.stores) {
       const clonedStore: EntityStore = new Map();
@@ -80,7 +112,11 @@ export class SimulationStore {
       }
       clonedStores.set(entityType, clonedStore);
     }
-    return { stores: clonedStores, idCounter: this.idCounter };
+    return {
+      stores: clonedStores,
+      idCounter: this.idCounter,
+      auditTrail: structuredClone(this.auditTrail),
+    };
   }
 
   /**
@@ -93,9 +129,14 @@ export class SimulationStore {
    * Swaps both fields atomically. The snapshot is consumed (not re-cloned) —
    * callers should not retain the snapshot after restore.
    */
-  restore(snap: { stores: Map<string, EntityStore>; idCounter: number }): void {
+  restore(snap: {
+    stores: Map<string, EntityStore>;
+    idCounter: number;
+    auditTrail: AuditTrailEntry[];
+  }): void {
     this.stores = snap.stores;
     this.idCounter = snap.idCounter;
+    this.auditTrail = snap.auditTrail;
   }
 
   // -----------------------------------------------------------------------
@@ -1438,12 +1479,21 @@ export class SimulationStore {
     const rsType = reqType.replace("Rq", "Rs");
 
     const reportType = String(reqData.CustomDetailReportType ?? "CustomTxnDetail");
+
+    // Phase 14 #66 — AuditTrail is a separate report type with its own
+    // schema (no per-txn-posting walk; rows are per-field-modification events).
+    // Dispatch before the CustomTxnDetail-specific account-filter requirement
+    // (AuditTrail has no ReportAccountFilter requirement).
+    if (reportType === "AuditTrail") {
+      return this.handleAuditTrailReport(rsType, reqData);
+    }
+
     if (reportType !== "CustomTxnDetail") {
       return {
         type: rsType,
         statusCode: 3120,
         statusSeverity: "Error",
-        statusMessage: `Unsupported CustomDetailReportType: ${reportType} (only CustomTxnDetail is implemented in simulation)`,
+        statusMessage: `Unsupported CustomDetailReportType: ${reportType} (only CustomTxnDetail and AuditTrail are implemented in simulation)`,
         data: {},
       };
     }
@@ -1567,6 +1617,81 @@ export class SimulationStore {
             { Title: "ClearedStatus", Type: "Text" },
             { Title: "TxnID", Type: "Text" },
             { Title: "TimeModified", Type: "Text" },
+          ],
+          Rows: rows,
+        },
+      },
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // AuditTrail handler (Phase 14 #66 — qb_audit_log)
+  // -----------------------------------------------------------------------
+
+  // Emits per-field-modification rows from the static audit-trail seed,
+  // filtered by ReportPeriod against `timeModified` (date-only slice — the
+  // ReportPeriod inputs are conventionally YYYY-MM-DD; TimeModified is full
+  // ISO 8601). Sorted desc by timeModified to match the tool layer's contract
+  // (most-recent-first; matches how QB Desktop's Audit Trail report renders).
+  //
+  // Live mode emits the same {Columns, Rows} shape via QB's row-tree →
+  // adaptLiveCustomDetailReportRet path; sim emits it directly. Column titles
+  // match what we want the tool layer to consume (User / TimeModified /
+  // ModifyType / ChangedField / OldValue / NewValue / TxnID / TxnType).
+  //
+  // No ReportAccountFilter requirement (unlike CustomTxnDetail) — audit
+  // entries span every entity type, and QB's wire-side report doesn't accept
+  // an account filter for AuditTrail. txnId scoping is done by the tool
+  // layer post-fetch (CustomDetailReportQueryRq has no TxnIDFilter).
+  private handleAuditTrailReport(
+    rsType: string,
+    reqData: Record<string, unknown>
+  ): QBXMLResponseBody {
+    const reportPeriod = (reqData.ReportPeriod as Record<string, unknown> | undefined) ?? {};
+    const fromDate = reportPeriod.FromReportDate ? String(reportPeriod.FromReportDate) : null;
+    const toDate = reportPeriod.ToReportDate ? String(reportPeriod.ToReportDate) : null;
+
+    const filtered = this.auditTrail.filter((e) => {
+      const dateOnly = e.timeModified.slice(0, 10);
+      if (fromDate && dateOnly < fromDate) return false;
+      if (toDate && dateOnly > toDate) return false;
+      return true;
+    });
+
+    filtered.sort((a, b) =>
+      a.timeModified < b.timeModified ? 1 : a.timeModified > b.timeModified ? -1 : 0
+    );
+
+    const rows = filtered.map((e) => ({
+      User: e.user,
+      TimeModified: e.timeModified,
+      ModifyType: e.modifyType,
+      ChangedField: e.changedField ?? "",
+      OldValue: e.oldValue ?? "",
+      NewValue: e.newValue ?? "",
+      TxnID: e.txnId,
+      TxnType: e.txnType,
+    }));
+
+    return {
+      type: rsType,
+      statusCode: 0,
+      statusSeverity: "Info",
+      statusMessage: "Status OK",
+      data: {
+        ReportRet: {
+          ReportTitle: "Audit Trail",
+          ...(fromDate ? { FromReportDate: fromDate } : {}),
+          ...(toDate ? { ToReportDate: toDate } : {}),
+          Columns: [
+            { Title: "User", Type: "Text" },
+            { Title: "TimeModified", Type: "Text" },
+            { Title: "ModifyType", Type: "Text" },
+            { Title: "ChangedField", Type: "Text" },
+            { Title: "OldValue", Type: "Text" },
+            { Title: "NewValue", Type: "Text" },
+            { Title: "TxnID", Type: "Text" },
+            { Title: "TxnType", Type: "Text" },
           ],
           Rows: rows,
         },
@@ -6642,6 +6767,84 @@ export class SimulationStore {
       const name = String(def.DataExtName ?? "");
       dataExtDefStore.set(`${owner}|${name}`, def);
     }
+
+    // Audit-trail seed (Phase 14 #66 — qb_audit_log). Real QB Enterprise
+    // auto-generates these on every entity mutation; the sim is a snapshot
+    // store, so we hand-seed a handful of plausible entries to exercise the
+    // tool-layer filters (txnId scope, dateRange scope, modifyType variety,
+    // user variety). Entries span Added / Modified / Deleted across a
+    // multi-week window so dateRange-narrowing tests have something to bite.
+    //
+    // TxnIDs here are synthetic — not tied to the seeded transaction stores.
+    // The audit log is logically separate (Real QB retains audit entries
+    // even for deleted transactions), so cross-referencing isn't required.
+    this.auditTrail = [
+      {
+        txnId: "AUDIT-TXN-1001",
+        txnType: "Invoice",
+        user: "Admin",
+        timeModified: "2025-03-01T09:15:32",
+        modifyType: "Added",
+      },
+      {
+        txnId: "AUDIT-TXN-1001",
+        txnType: "Invoice",
+        user: "Jane (Bookkeeper)",
+        timeModified: "2025-03-05T14:22:10",
+        modifyType: "Modified",
+        changedField: "Memo",
+        oldValue: "",
+        newValue: "Net 30 — payment expected by 2025-04-04",
+      },
+      {
+        txnId: "AUDIT-TXN-1001",
+        txnType: "Invoice",
+        user: "Admin",
+        timeModified: "2025-04-12T11:03:45",
+        modifyType: "Modified",
+        changedField: "Subtotal",
+        oldValue: "1500.00",
+        newValue: "1650.00",
+      },
+      {
+        txnId: "AUDIT-TXN-2001",
+        txnType: "Bill",
+        user: "Admin",
+        timeModified: "2025-04-15T08:42:00",
+        modifyType: "Added",
+      },
+      {
+        txnId: "AUDIT-TXN-2001",
+        txnType: "Bill",
+        user: "Jane (Bookkeeper)",
+        timeModified: "2025-04-18T16:30:21",
+        modifyType: "Deleted",
+      },
+      {
+        txnId: "AUDIT-TXN-3001",
+        txnType: "Check",
+        user: "Admin",
+        timeModified: "2025-05-02T10:11:55",
+        modifyType: "Added",
+      },
+      {
+        txnId: "AUDIT-TXN-3001",
+        txnType: "Check",
+        user: "Admin",
+        timeModified: "2025-05-09T13:48:09",
+        modifyType: "Modified",
+        changedField: "ClearedStatus",
+        oldValue: "NotCleared",
+        newValue: "Cleared",
+      },
+      {
+        txnId: "AUDIT-TXN-4001",
+        txnType: "JournalEntry",
+        user: "Jane (Bookkeeper)",
+        timeModified: "2025-05-15T17:25:14",
+        modifyType: "Added",
+      },
+    ];
 
     // Set ID counter beyond seed data
     this.idCounter = 10000;

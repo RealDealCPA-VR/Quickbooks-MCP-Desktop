@@ -19,29 +19,71 @@ export function registerCustomerTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_customer_list",
-    "List or search customers in QuickBooks. Returns customer records matching filters. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. Set includeCustomFields:true to surface DataExtRet (custom-field) values on every returned customer — discover defined CFs via qb_custom_field_list. Hierarchy filters (parentListID / jobOnly) are POST-FILTERED — QBXML's CustomerQueryRq has no ParentRef filter at any version through 16.0; the wire query returns the full set (or paginated batch) and the tool filters in-process. Combine with includeInactive carefully under paginate — see qb_customer_jobs for an entity-scoped alternative that pre-validates the parent.",
+    "List or search customers in QuickBooks. Returns customer records matching filters. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. Set autoExhaust:true (Phase 16 #73) to fully exhaust the iterator server-side and return the merged result in one call — caps at maxBatches (default 20 = ~10k rows). When paginate or autoExhaust is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. Set includeCustomFields:true to surface DataExtRet (custom-field) values on every returned customer — discover defined CFs via qb_custom_field_list. Hierarchy filters (parentListID / jobOnly) are POST-FILTERED — QBXML's CustomerQueryRq has no ParentRef filter at any version through 16.0; the wire query returns the full set (or paginated batch) and the tool filters in-process. Under autoExhaust the post-filter is applied to the FULL accumulated set (no missed-match caveat). See qb_customer_jobs for an entity-scoped alternative that pre-validates the parent. Caching (Phase 16 #74): unfiltered calls (no nameFilter, listId, parentListID, jobOnly, includeCustomFields, paginate, or iteratorID) hit a 5-minute lookup cache by default — response carries fromCache:true on hit. Pass useCache:false to force fresh; call qb_cache_invalidate({entity:'Customer'}) to clear after an out-of-band edit in QB Desktop UI.",
     {
       nameFilter: z.string().optional().describe("Filter customers by name (partial match)"),
       activeOnly: z.boolean().optional().describe("Only return active customers (default true)"),
-      maxReturned: z.number().optional().describe("Maximum number of results. Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."),
+      maxReturned: z.number().optional().describe("Maximum number of results per wire batch. Defaults to 500 when paginate or autoExhaust is enabled (QB's per-batch cap); otherwise QB-driven."),
       listId: z.string().optional().describe("Fetch a specific customer by ListID"),
-      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
-      iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset. Mutually exclusive with autoExhaust."),
+      iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate. Mutually exclusive with autoExhaust (autoExhaust always starts a fresh iterator)."),
+      autoExhaust: z.boolean().optional().describe("Phase 16 #73: server-side iterator exhaustion. Loops queryEntityPaginated until iteratorRemainingCount === 0 (or maxBatches cap) and returns the merged result as ONE response — collapses 4× tool round trips for a 2,000-row dump into 1. Hard-capped by maxBatches (default 20 = ~10k rows). Cap-hit returns the partial result + final iteratorID for caller-driven resumption. Mutually exclusive with paginate / iteratorID."),
+      maxBatches: z.number().int().positive().optional().describe("Safety cap on autoExhaust batch count (default 20). Each batch is one wire round trip to QuickBooks Desktop (~500 rows per batch). Only meaningful when autoExhaust:true."),
       includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned customer. Pass the OwnerID namespace via customFieldOwnerId (default '0' — the standard company-defined namespace). Stripped by default to keep payloads lean; discover defined CFs via qb_custom_field_list."),
       customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
-      parentListID: z.string().optional().describe("POST-FILTER: return only direct children (jobs) of the customer with this ListID. QBXML has no ParentRef filter at the wire level so this is applied in-process after the wire query — combine with paginate carefully (matches past the first batch may be missed). For an entity-scoped equivalent that pre-validates the parent and supports recursive descendants, use qb_customer_jobs."),
-      jobOnly: z.boolean().optional().describe("POST-FILTER: return only sub-customers (jobs) — customers carrying a ParentRef. Excludes top-level customers (Sublevel 0). Same post-filter caveat under paginate."),
+      parentListID: z.string().optional().describe("POST-FILTER: return only direct children (jobs) of the customer with this ListID. QBXML has no ParentRef filter at the wire level so this is applied in-process after the wire query — combine with paginate carefully (matches past the first batch may be missed). Under autoExhaust the filter is applied to the FULL accumulated set. For an entity-scoped equivalent that pre-validates the parent and supports recursive descendants, use qb_customer_jobs."),
+      jobOnly: z.boolean().optional().describe("POST-FILTER: return only sub-customers (jobs) — customers carrying a ParentRef. Excludes top-level customers (Sublevel 0). Same post-filter caveat under paginate; full-set semantics under autoExhaust."),
+      useCache: z.boolean().optional().describe("Phase 16 #74: read/write through the 5-minute MCP-side lookup cache for unfiltered calls. Default true. Any filter arg (nameFilter, listId, parentListID, jobOnly, includeCustomFields, paginate, iteratorID) bypasses cache. Pass false to force a fresh wire fetch even on an unfiltered call. Cache is per company file and clears on qb_company_open."),
     },
-    async ({ nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID, includeCustomFields, customFieldOwnerId, parentListID, jobOnly }) => {
+    async ({ nameFilter, activeOnly, maxReturned, listId, paginate, iteratorID, autoExhaust, maxBatches, includeCustomFields, customFieldOwnerId, parentListID, jobOnly, useCache }) => {
       const session = getSession();
+
+      // Phase 16 #73 — autoExhaust mutex. autoExhaust always starts a fresh
+      // iterator and runs it to completion; passing paginate / iteratorID
+      // alongside is contradictory (the caller is asking for both server-side
+      // collapse and caller-driven pagination).
+      if (autoExhaust && (paginate || iteratorID)) {
+        return formatToolError(
+          new Error("autoExhaust is mutually exclusive with paginate / iteratorID — autoExhaust starts a fresh iterator server-side and runs it to completion"),
+          { fallbackMessage: "Invalid arguments" }
+        );
+      }
+
+      // Phase 16 #74 — lookup cache eligibility (see accounts.ts).
+      // parentListID and jobOnly are POST-filters but they still scope the
+      // visible result, so they bypass cache. autoExhaust + paginate +
+      // iteratorID bypass the READ but autoExhaust still WRITES on completion.
+      const isUnfilteredCall =
+        !nameFilter &&
+        !listId &&
+        !parentListID &&
+        !jobOnly &&
+        !includeCustomFields &&
+        activeOnly !== false;
+      const isRegularCall = !paginate && !iteratorID && !autoExhaust;
+      const cacheRead = useCache !== false && isUnfilteredCall && isRegularCall;
+      const cacheWrite = useCache !== false && isUnfilteredCall;
+      if (cacheRead) {
+        const cached = session.getLookupCache().get("Customer");
+        if (cached) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ count: cached.length, customers: cached, fromCache: true }, null, 2),
+            }],
+          };
+        }
+      }
+
       const filters: Record<string, unknown> = {};
 
       // Pagination requires MaxReturned — QB rejects iterator requests without it
       // ("There is a missing element: MaxReturned"). Default to 500 (QB's
-      // effective per-batch cap) when the caller flips paginate on but doesn't
-      // specify a value, so `paginate: true` alone is a usable contract.
+      // effective per-batch cap) when the caller flips paginate or autoExhaust
+      // on but doesn't specify a value, so `paginate: true` / `autoExhaust:
+      // true` alone is a usable contract.
       const effectiveMaxReturned =
-        maxReturned ?? (paginate || iteratorID ? 500 : undefined);
+        maxReturned ?? (paginate || iteratorID || autoExhaust ? 500 : undefined);
 
       // QBXML schema for CustomerQueryRq (and every other *QueryRq with the
       // standard filter sequence) requires children in this order, per the
@@ -91,6 +133,65 @@ export function registerCustomerTools(
       };
 
       try {
+        if (autoExhaust) {
+          // Phase 16 #73 — loop queryEntityPaginated until exhausted OR
+          // maxBatches cap. Each iteration is one wire round trip to QB.
+          // Filter post-application runs on the FULL accumulated set, so
+          // parentListID / jobOnly are correct under autoExhaust (vs.
+          // paginate where they're per-batch and may miss matches).
+          const cap = maxBatches ?? 20;
+          const accumulated: Record<string, unknown>[] = [];
+          let nextIteratorID: string | undefined;
+          let batches = 0;
+          let remaining = Infinity;
+          let capHit = false;
+          while (remaining > 0) {
+            if (batches >= cap) {
+              capHit = true;
+              break;
+            }
+            const batch = await session.queryEntityPaginated("Customer", filters, {
+              iterator: batches === 0 ? "Start" : "Continue",
+              iteratorID: nextIteratorID,
+            });
+            accumulated.push(...batch.entities);
+            batches += 1;
+            // The exhaustion signal is iteratorRemainingCount === 0; a missing
+            // count means the iterator wasn't running (sim's Continue path
+            // returns empty + no metadata — treat as exhausted).
+            remaining = batch.iteratorRemainingCount ?? 0;
+            nextIteratorID = batch.iteratorID;
+          }
+          const filtered = applyHierarchyFilters(accumulated);
+          const warnings: string[] = [];
+          if (capHit) {
+            warnings.push(
+              `autoExhaust cap hit after ${batches} batches (~${accumulated.length} rows accumulated). Increase maxBatches or resume via iteratorID. NOTE: iteratorID resumption only works against live QB — simulation does not maintain cross-call iterator state.`
+            );
+          }
+          // Phase 16 #74 — write-back on full exhaustion. Cache the raw
+          // accumulated set (not the post-filtered slice — applyHierarchy
+          // is identity here when isUnfilteredCall, but keep the contract
+          // explicit) so a subsequent unfiltered call reads the same shape.
+          if (cacheWrite && !capHit) {
+            session.getLookupCache().set("Customer", accumulated);
+          }
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                count: filtered.length,
+                customers: filtered,
+                batchesExhausted: batches,
+                ...(capHit && nextIteratorID
+                  ? { iteratorID: nextIteratorID, iteratorRemainingCount: remaining }
+                  : {}),
+                ...(warnings.length ? { warnings } : {}),
+              }, null, 2),
+            }],
+          };
+        }
+
         if (paginate || iteratorID) {
           const result = await session.queryEntityPaginated("Customer", filters, {
             iterator: iteratorID ? "Continue" : "Start",
@@ -115,6 +216,9 @@ export function registerCustomerTools(
         }
 
         const customers = await session.queryEntity("Customer", filters);
+        if (cacheWrite) {
+          session.getLookupCache().set("Customer", customers);
+        }
         const filtered = applyHierarchyFilters(customers);
         return {
           content: [{
@@ -371,7 +475,7 @@ export function registerCustomerTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_customer_update",
-    "Update an existing customer in QuickBooks Desktop.",
+    "Update an existing customer in QuickBooks Desktop. Pass `dryRun: true` to preview without committing.",
     {
       listId: z.string().describe("ListID of the customer to update"),
       editSequence: z.string().describe("EditSequence for optimistic locking"),
@@ -384,6 +488,7 @@ export function registerCustomerTools(
       isActive: z.boolean().optional().describe("Set active/inactive status"),
       accountNumber: z.string().optional().describe("New account number"),
       notes: z.string().optional().describe("New notes"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -401,6 +506,26 @@ export function registerCustomerTools(
       if (args.isActive !== undefined) data.IsActive = args.isActive;
       if (args.accountNumber) data.AccountNumber = args.accountNumber;
       if (args.notes) data.Notes = args.notes;
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("Customer", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { customer: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "CustomerModRq dry-run failed" });
+        }
+      }
 
       try {
         const result = await session.modifyEntity("Customer", data);
@@ -421,12 +546,33 @@ export function registerCustomerTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_customer_delete",
-    "Delete a customer from QuickBooks Desktop. WARNING: This is irreversible.",
+    "Delete a customer from QuickBooks Desktop. WARNING: This is irreversible. Pass `dryRun: true` to preview without committing.",
     {
       listId: z.string().describe("ListID of the customer to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ listId }) => {
+    async ({ listId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("Customer", listId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "ListDelRq (Customer) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("Customer", listId);
         return {

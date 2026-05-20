@@ -148,6 +148,7 @@ export function registerJournalEntryTools(
       credits: z.array(journalLineSchema).min(1)
         .describe("Credit-side lines. At least one required. sum(credits.amount) must equal sum(debits.amount)."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate journal entry (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -160,6 +161,26 @@ export function registerJournalEntryTools(
 
       data.JournalDebitLineAdd = args.debits.map(buildJELineAdd);
       data.JournalCreditLineAdd = args.credits.map(buildJELineAdd);
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("JournalEntry", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { journalEntry: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "JournalEntryAddRq dry-run failed" });
+        }
+      }
 
       try {
         const { entity: result, replayed } = args.idempotencyKey
@@ -426,6 +447,7 @@ export function registerJournalEntryTools(
         .describe("Replacement debit-side line set. Existing debit lines whose TxnLineID is not listed will be dropped."),
       credits: z.array(journalLineModSchema).optional()
         .describe("Replacement credit-side line set. Existing credit lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -441,6 +463,26 @@ export function registerJournalEntryTools(
 
       if (args.debits) data.JournalDebitLineMod = args.debits.map(buildJELineMod);
       if (args.credits) data.JournalCreditLineMod = args.credits.map(buildJELineMod);
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("JournalEntry", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { journalEntry: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "JournalEntryModRq dry-run failed" });
+        }
+      }
 
       try {
         const result = await session.modifyEntity("JournalEntry", data);
@@ -580,12 +622,33 @@ export function registerJournalEntryTools(
 
   server.tool(
     "qb_journal_entry_delete",
-    "Delete a journal entry from QuickBooks Desktop. JEs aren't tracked against AR/AP balances in this server, so there's no balance reversal — this is purely a record removal. WARNING: Irreversible.",
+    "Delete a journal entry from QuickBooks Desktop. JEs aren't tracked against AR/AP balances in this server, so there's no balance reversal — this is purely a record removal. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the JE to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("JournalEntry", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (JournalEntry) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("JournalEntry", txnId);
         return {

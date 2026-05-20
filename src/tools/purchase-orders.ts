@@ -136,6 +136,7 @@ export function registerPurchaseOrderTools(
       lines: z.array(purchaseOrderLineSchema).min(1)
         .describe("PO line items. At least one required."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate PO (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -181,6 +182,26 @@ export function registerPurchaseOrderTools(
         return lineData;
       });
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("PurchaseOrder", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { purchaseOrder: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "PurchaseOrderAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("PurchaseOrder", data, args.idempotencyKey)
@@ -217,6 +238,7 @@ export function registerPurchaseOrderTools(
       isManuallyClosed: z.boolean().optional().describe("Mark/unmark the PO as manually closed"),
       lines: z.array(purchaseOrderLineModSchema).optional()
         .describe("Replacement line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -254,6 +276,26 @@ export function registerPurchaseOrderTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("PurchaseOrder", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { purchaseOrder: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "PurchaseOrderModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("PurchaseOrder", data);
         return {
@@ -270,12 +312,33 @@ export function registerPurchaseOrderTools(
 
   server.tool(
     "qb_purchase_order_delete",
-    "Delete a purchase order from QuickBooks Desktop. POs aren't posted to AP, so there's no vendor-balance reversal — this is purely a record removal. WARNING: Irreversible.",
+    "Delete a purchase order from QuickBooks Desktop. POs aren't posted to AP, so there's no vendor-balance reversal — this is purely a record removal. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the PO to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("PurchaseOrder", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (PurchaseOrder) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("PurchaseOrder", txnId);
         return {

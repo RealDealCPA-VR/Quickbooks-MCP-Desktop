@@ -227,6 +227,7 @@ export function registerTimeTrackingTools(
       notes: z.string().optional().describe("Free-form notes / work description (printed on timesheet reports + the Time/Costs dialog)"),
       billable: z.boolean().optional().describe("When true, marks the entry as billable (IsBillable=true, BillableStatus='Billable'). Required for downstream invoice flow via the Time/Costs dialog. Default unset = NotBillable."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate entry (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -311,6 +312,28 @@ export function registerTimeTrackingTools(
         // dialog, qb_time_track_list with billableOnly) unambiguous.
         data.IsBillable = args.billable;
         data.BillableStatus = args.billable ? "Billable" : "NotBillable";
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("TimeTracking", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          const persistedDuration = entity?.Duration ? String(entity.Duration) : null;
+          const hours = persistedDuration !== null ? parseDurationToHours(persistedDuration) : null;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { timeTracking: { ...entity, hours } } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TimeTrackingAddRq dry-run failed" });
+        }
       }
 
       try {

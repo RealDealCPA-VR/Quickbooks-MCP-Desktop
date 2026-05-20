@@ -118,6 +118,7 @@ export function registerEstimateTools(
       lines: z.array(estimateLineSchema).optional()
         .describe("Estimate line items"),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate estimate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -161,6 +162,26 @@ export function registerEstimateTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("Estimate", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { estimate: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "EstimateAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("Estimate", data, args.idempotencyKey)
@@ -195,6 +216,7 @@ export function registerEstimateTools(
       isAccepted: z.boolean().optional().describe("Mark the estimate accepted/rejected. Set true when an estimate has been converted to an invoice manually; qb_estimate_convert_to_invoice flips this automatically."),
       lines: z.array(estimateLineModSchema).optional()
         .describe("Replacement line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -230,6 +252,26 @@ export function registerEstimateTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("Estimate", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { estimate: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "EstimateModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("Estimate", data);
         return {
@@ -246,12 +288,33 @@ export function registerEstimateTools(
 
   server.tool(
     "qb_estimate_delete",
-    "Delete an estimate/quote from QuickBooks Desktop. Estimates aren't posted to AR so there's no balance to reverse — this is purely a record removal. WARNING: Irreversible.",
+    "Delete an estimate/quote from QuickBooks Desktop. Estimates aren't posted to AR so there's no balance to reverse — this is purely a record removal. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the estimate to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("Estimate", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (Estimate) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("Estimate", txnId);
         return {

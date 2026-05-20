@@ -101,6 +101,7 @@ export function registerTransferTools(
       memo: z.string().optional().describe("Memo on the transfer"),
       className: z.string().optional().describe("Class full name (optional, for class tracking)"),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate transfer (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -173,6 +174,26 @@ export function registerTransferTools(
       data.Amount = args.amount;
       if (args.memo) data.Memo = args.memo;
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("Transfer", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { transfer: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TransferAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("Transfer", data, args.idempotencyKey)
@@ -207,6 +228,7 @@ export function registerTransferTools(
       txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New transfer date (YYYY-MM-DD)"),
       memo: z.string().optional().describe("New memo"),
       className: z.string().optional().describe("New class full name"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -231,6 +253,26 @@ export function registerTransferTools(
       if (args.amount !== undefined) data.Amount = args.amount;
       if (args.memo) data.Memo = args.memo;
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("Transfer", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { transfer: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TransferModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("Transfer", data);
         return {
@@ -247,12 +289,33 @@ export function registerTransferTools(
 
   server.tool(
     "qb_transfer_delete",
-    "Delete a Transfer from QuickBooks Desktop. WARNING: Irreversible. Both sides of the posting are reversed atomically.",
+    "Delete a Transfer from QuickBooks Desktop. WARNING: Irreversible. Both sides of the posting are reversed atomically. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the transfer to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("Transfer", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (Transfer) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("Transfer", txnId);
         return {

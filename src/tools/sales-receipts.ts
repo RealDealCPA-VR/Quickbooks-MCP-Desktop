@@ -122,6 +122,7 @@ export function registerSalesReceiptTools(
       lines: z.array(salesReceiptLineSchema).optional()
         .describe("Sales receipt line items"),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate sales receipt (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -171,6 +172,26 @@ export function registerSalesReceiptTools(
           if (line.amount !== undefined) lineData.Amount = line.amount;
           return lineData;
         });
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("SalesReceipt", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { salesReceipt: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "SalesReceiptAddRq dry-run failed" });
+        }
       }
 
       try {
@@ -471,6 +492,7 @@ export function registerSalesReceiptTools(
       depositToAccountListId: z.string().optional().describe("New deposit account ListID"),
       lines: z.array(salesReceiptLineModSchema).optional()
         .describe("Replacement line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -511,6 +533,26 @@ export function registerSalesReceiptTools(
           if (line.amount !== undefined) lineData.Amount = line.amount;
           return lineData;
         });
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("SalesReceipt", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { salesReceipt: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "SalesReceiptModRq dry-run failed" });
+        }
       }
 
       try {
@@ -671,12 +713,33 @@ export function registerSalesReceiptTools(
 
   server.tool(
     "qb_sales_receipt_delete",
-    "Delete a sales receipt from QuickBooks Desktop. Sales receipts are cash sales — there's no AR balance to reverse, but the original deposit posting against depositToAccountRef is rolled back implicitly by the delete. WARNING: Irreversible.",
+    "Delete a sales receipt from QuickBooks Desktop. Sales receipts are cash sales — there's no AR balance to reverse, but the original deposit posting against depositToAccountRef is rolled back implicitly by the delete. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the sales receipt to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("SalesReceipt", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (SalesReceipt) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("SalesReceipt", txnId);
         return {

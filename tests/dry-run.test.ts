@@ -672,3 +672,124 @@ describe("updateClearedStatusDryRun", () => {
     expect(reQuery?.ClearedStatus).toBe(beforeStatus);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Layer 7 — #64a rollout coverage gaps the V1 pilot tools didn't pin.
+//
+// The V1 pilot covered list-entity ADD (customer_add), transaction-entity
+// ADD (invoice_create), and transaction-entity DELETE (invoice_delete).
+// The rollout to ~50 more tools touches 3 patterns the pilot tools didn't:
+//   (a) list-entity MODIFY via the tool surface
+//   (b) list-entity DELETE via the tool surface
+//   (c) transaction-entity MODIFY via the tool surface
+//   (d) cleared_status_update via the tool surface (special primitive)
+//
+// One tool per pattern is sufficient — every other rolled-out tool uses an
+// identical transformation shape, so the same coverage applies by induction.
+// (The manager-layer primitives themselves are already pinned in Layers 1-5.)
+// ---------------------------------------------------------------------------
+
+import { registerAccountTools } from "../src/tools/accounts.js";
+import { registerBillTools } from "../src/tools/bills.js";
+import { registerReconciliationTools } from "../src/tools/reconciliation.js";
+
+describe("#64a rollout — list-entity update / delete / transaction-update / cleared_status_update", () => {
+  it("qb_account_update with dryRun returns preview; account NOT modified", async () => {
+    const session = freshSession();
+    await session.openSession();
+    registerAccountTools(fakeServer as never, () => session);
+
+    const acct = await session.addEntity("Account", { Name: "DryRunAcctMod", AccountType: "Expense" });
+    const before = acct.Description ?? null;
+
+    const result = await handlers.get("qb_account_update")!({
+      listId: acct.ListID,
+      editSequence: acct.EditSequence,
+      description: "Dry-run mod description — should NOT persist",
+      dryRun: true,
+    });
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(true);
+    expect(payload.dryRun).toBe(true);
+    expect(payload.committed).toBe(false);
+    expect(payload.wouldSucceed).toBe(true);
+
+    const reQuery = (await session.queryEntity("Account", { ListID: acct.ListID }))[0] as Record<string, unknown>;
+    expect(reQuery.Description ?? null).toBe(before);
+  });
+
+  it("qb_account_delete with dryRun previews removal; account still present", async () => {
+    const session = freshSession();
+    await session.openSession();
+    registerAccountTools(fakeServer as never, () => session);
+
+    const acct = await session.addEntity("Account", { Name: "DryRunAcctDel", AccountType: "Expense" });
+
+    const result = await handlers.get("qb_account_delete")!({
+      listId: acct.ListID,
+      dryRun: true,
+    });
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(true);
+    expect(payload.dryRun).toBe(true);
+    expect(payload.wouldSucceed).toBe(true);
+
+    const found = (await session.queryEntity("Account", { ListID: acct.ListID }))[0];
+    expect(found).toBeDefined();
+  });
+
+  it("qb_bill_update with dryRun previews; bill memo NOT modified", async () => {
+    const session = freshSession();
+    await session.openSession();
+    registerBillTools(fakeServer as never, () => session);
+
+    const vendor = await session.addEntity("Vendor", { Name: "BillUpdDryRun Vendor" });
+    const bill = await session.addEntity("Bill", {
+      VendorRef: { ListID: vendor.ListID },
+      ExpenseLineAdd: [{ AccountRef: { FullName: "Office Expense" }, Amount: 100 }],
+    });
+    const beforeMemo = bill.Memo ?? null;
+
+    const result = await handlers.get("qb_bill_update")!({
+      txnId: bill.TxnID,
+      editSequence: bill.EditSequence,
+      memo: "Dry-run memo — should NOT persist",
+      dryRun: true,
+    });
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(true);
+    expect(payload.dryRun).toBe(true);
+    expect(payload.wouldSucceed).toBe(true);
+
+    const reQuery = (await session.queryEntity("Bill", { TxnID: bill.TxnID }))[0] as Record<string, unknown>;
+    expect(reQuery.Memo ?? null).toBe(beforeMemo);
+  });
+
+  it("qb_cleared_status_update with dryRun previews; ClearedStatus NOT modified", async () => {
+    const session = freshSession();
+    await session.openSession();
+    registerReconciliationTools(fakeServer as never, () => session);
+
+    // Seed sim has Checks. Use the first one.
+    const checks = await session.queryEntity("Check", {});
+    if (checks.length === 0) return;
+    const check = checks[0] as Record<string, unknown>;
+    const beforeStatus = check.ClearedStatus ?? null;
+
+    const result = await handlers.get("qb_cleared_status_update")!({
+      txnId: String(check.TxnID),
+      clearedStatus: "Cleared",
+      dryRun: true,
+    });
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(true);
+    expect(payload.dryRun).toBe(true);
+    expect(payload.committed).toBe(false);
+    expect(payload.wouldSucceed).toBe(true);
+
+    const reQuery = (await session.queryEntity("Check", {})).find(
+      (c) => (c as { TxnID: string }).TxnID === check.TxnID,
+    ) as Record<string, unknown> | undefined;
+    expect(reQuery?.ClearedStatus ?? null).toBe(beforeStatus);
+  });
+});

@@ -169,6 +169,7 @@ export function registerDepositTools(
       memo: z.string().optional().describe("Memo on the deposit (printed at top of deposit slip)"),
       lines: z.array(depositLineSchema).min(1).describe("Deposit lines — each names an AccountRef + Amount, optionally an EntityRef + PaymentMethodRef + CheckNumber. At least one line required."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate deposit (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -195,6 +196,26 @@ export function registerDepositTools(
       if (args.txnDate) data.TxnDate = args.txnDate;
       if (args.memo) data.Memo = args.memo;
       data.DepositLineAdd = args.lines.map(buildDepositLineAdd);
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("Deposit", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deposit: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "DepositAddRq dry-run failed" });
+        }
+      }
 
       try {
         const { entity: result, replayed } = args.idempotencyKey
@@ -228,6 +249,7 @@ export function registerDepositTools(
       memo: z.string().optional().describe("New memo"),
       lines: z.array(depositLineModSchema).optional()
         .describe("Replacement deposit-line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -268,6 +290,26 @@ export function registerDepositTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("Deposit", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deposit: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "DepositModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("Deposit", data);
         return {
@@ -284,12 +326,33 @@ export function registerDepositTools(
 
   server.tool(
     "qb_deposit_delete",
-    "Delete a deposit from QuickBooks Desktop. WARNING: Irreversible. If the deposit included payment lines that closed AR invoices (PaymentTxnLineID), real QB un-deposits those funds back to Undeposited Funds — sim does not currently model that path.",
+    "Delete a deposit from QuickBooks Desktop. WARNING: Irreversible. If the deposit included payment lines that closed AR invoices (PaymentTxnLineID), real QB un-deposits those funds back to Undeposited Funds — sim does not currently model that path. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the deposit to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("Deposit", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (Deposit) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("Deposit", txnId);
         return {

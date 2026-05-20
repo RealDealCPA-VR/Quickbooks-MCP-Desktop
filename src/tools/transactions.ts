@@ -50,13 +50,36 @@ const VENDOR_SIDE_TYPES = [
   "PurchaseOrder",
 ] as const;
 
+// Txn types with no AR/AP entity binding — only searchable when no
+// customer/vendor scope is supplied. JournalEntry's per-line EntityRef
+// is not modeled in sim's EntityFilter chain (same call as #72); the
+// rest genuinely have no entity scope (Deposit/Transfer/InventoryAdjustment/
+// SalesTaxPaymentCheck don't bind to a single customer or vendor).
+const UNSCOPED_TXN_TYPES = [
+  "JournalEntry",
+  "Deposit",
+  "Transfer",
+  "InventoryAdjustment",
+  "SalesTaxPaymentCheck",
+] as const;
+
 type TxnType =
   | (typeof CUSTOMER_SIDE_TYPES)[number]
   | (typeof VENDOR_SIDE_TYPES)[number];
 
+type MemoSearchTxnType =
+  | TxnType
+  | (typeof UNSCOPED_TXN_TYPES)[number];
+
 const ALL_TXN_TYPES = [
   ...CUSTOMER_SIDE_TYPES,
   ...VENDOR_SIDE_TYPES,
+] as const;
+
+const ALL_MEMO_SEARCH_TYPES = [
+  ...CUSTOMER_SIDE_TYPES,
+  ...VENDOR_SIDE_TYPES,
+  ...UNSCOPED_TXN_TYPES,
 ] as const;
 
 // Defaults: AR-affecting types under customer scope (omits Estimate +
@@ -84,6 +107,125 @@ function isCustomerSide(t: TxnType): boolean {
 
 function isVendorSide(t: TxnType): boolean {
   return (VENDOR_SIDE_TYPES as readonly string[]).includes(t);
+}
+
+// -----------------------------------------------------------------------
+// Memo-search helpers (Phase 13 #63)
+// -----------------------------------------------------------------------
+
+// Per-type LineRet key. Each transaction stores lines under exactly one key.
+// We walk the row, find the matching key, then iterate each line's Memo/Desc.
+// Types absent from the map have no lines (StatementCharge — single-row
+// billing; ReceivePayment/BillPayment* — header-only with AppliedToTxn refs;
+// Transfer — no lines; SalesTaxPaymentCheck has SalesTaxPaymentCheckLineRet
+// but its lines reference tax items rather than carrying memo text).
+const LINE_RET_KEY_BY_TYPE: Partial<Record<MemoSearchTxnType, string>> = {
+  Invoice: "InvoiceLineRet",
+  SalesReceipt: "SalesReceiptLineRet",
+  CreditMemo: "CreditMemoLineRet",
+  Estimate: "EstimateLineRet",
+  SalesOrder: "SalesOrderLineRet",
+  PurchaseOrder: "PurchaseOrderLineRet",
+  JournalEntry: "JournalLineRet",
+  Deposit: "DepositLineRet",
+  InventoryAdjustment: "InventoryAdjustmentLineRet",
+  // Bill/Check/CreditCardCharge/CreditCardCredit carry TWO line kinds —
+  // ExpenseLineRet and ItemLineRet — handled specially via walkLinesForBill.
+};
+
+const BILL_LIKE_TYPES = new Set<MemoSearchTxnType>([
+  "Bill",
+  "Check",
+  "CreditCardCharge",
+  "CreditCardCredit",
+]);
+
+// Substring matcher honoring the caseSensitive flag.
+function matchesQuery(
+  value: unknown,
+  query: string,
+  caseSensitive: boolean,
+): boolean {
+  if (value === null || value === undefined) return false;
+  const text = String(value);
+  if (caseSensitive) return text.includes(query);
+  return text.toLowerCase().includes(query.toLowerCase());
+}
+
+// Walk a transaction's header + line memo fields, collecting where the
+// query matched. Returns null when no match found (caller drops the row).
+function collectMatchedFields(
+  txn: Record<string, unknown>,
+  txnType: MemoSearchTxnType,
+  query: string,
+  caseSensitive: boolean,
+  includeLineMemos: boolean,
+): string[] | null {
+  const matched: string[] = [];
+
+  if (matchesQuery(txn.Memo, query, caseSensitive)) {
+    matched.push("header.Memo");
+  }
+
+  if (!includeLineMemos) {
+    return matched.length > 0 ? matched : null;
+  }
+
+  // Bill/Check/CC* carry both ExpenseLineRet and ItemLineRet — walk both.
+  if (BILL_LIKE_TYPES.has(txnType)) {
+    const expenseLines = txn.ExpenseLineRet;
+    if (Array.isArray(expenseLines)) {
+      let i = 0;
+      for (const line of expenseLines) {
+        if (line && typeof line === "object") {
+          const l = line as Record<string, unknown>;
+          if (matchesQuery(l.Memo, query, caseSensitive)) {
+            matched.push(`ExpenseLineRet[${i}].Memo`);
+          }
+        }
+        i++;
+      }
+    }
+    const itemLines = txn.ItemLineRet;
+    if (Array.isArray(itemLines)) {
+      let i = 0;
+      for (const line of itemLines) {
+        if (line && typeof line === "object") {
+          const l = line as Record<string, unknown>;
+          if (matchesQuery(l.Memo, query, caseSensitive)) {
+            matched.push(`ItemLineRet[${i}].Memo`);
+          }
+          if (matchesQuery(l.Desc, query, caseSensitive)) {
+            matched.push(`ItemLineRet[${i}].Desc`);
+          }
+        }
+        i++;
+      }
+    }
+    return matched.length > 0 ? matched : null;
+  }
+
+  const lineKey = LINE_RET_KEY_BY_TYPE[txnType];
+  if (lineKey) {
+    const lines = txn[lineKey];
+    if (Array.isArray(lines)) {
+      let i = 0;
+      for (const line of lines) {
+        if (line && typeof line === "object") {
+          const l = line as Record<string, unknown>;
+          if (matchesQuery(l.Memo, query, caseSensitive)) {
+            matched.push(`${lineKey}[${i}].Memo`);
+          }
+          if (matchesQuery(l.Desc, query, caseSensitive)) {
+            matched.push(`${lineKey}[${i}].Desc`);
+          }
+        }
+        i++;
+      }
+    }
+  }
+
+  return matched.length > 0 ? matched : null;
 }
 
 export function registerTransactionTools(
@@ -564,6 +706,367 @@ export function registerTransactionTools(
             typeCounts,
             count: allTxns.length,
             transactions: allTxns,
+            ...(warnings.length > 0 ? { warnings } : {}),
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // qb_transaction_memo_search (Phase 13 #63)
+  //
+  // Cross-type memo substring search. QBXML has no server-side substring
+  // filter on Memo at any version (the *Filter primitives on each *QueryRq
+  // scope by TxnID / RefNumber / EntityRef / TxnDateRangeFilter — Memo is
+  // not in that set). The only way to find "every txn whose memo says
+  // 'Q4 retainer'" is to pull all txns in a bounded window and filter
+  // client-side.
+  //
+  // This tool fans out across memo-bearing transaction types (typed
+  // *QueryRq calls, same pattern as qb_transaction_list), then walks
+  // each row's header Memo + (by default) every line's Memo/Desc.
+  // Matches return the row plus a `matchedFields` array naming where
+  // the query hit so the caller can see header vs line context without
+  // re-scanning the payload.
+  //
+  // Bounding: at least one of {customer/vendor scope, fromDate, toDate}
+  // is required. Without a bound this would scan the entire books on
+  // every call — same guardrail as qb_transaction_list.
+  //
+  // Scope: customer scope narrows to customer-side types; vendor scope
+  // narrows to vendor-side; no scope opens the search to all memo-bearing
+  // types including JournalEntry / Deposit / Transfer / InventoryAdjustment
+  // / SalesTaxPaymentCheck.
+  //
+  // Wire cost: pulls every matching txn in the window (up to maxPerType
+  // per type) then filters in-process. A six-month window across the
+  // default type set is 5 round trips on customer scope, 5 on vendor
+  // scope, 17 with no scope. Narrow with `types` when the caller knows
+  // which kind of transaction the memo lives on.
+  // -----------------------------------------------------------------------
+  server.tool(
+    "qb_transaction_memo_search",
+    "Search transactions by memo substring. QBXML has no server-side memo substring filter — this tool pulls every transaction in the supplied date/scope window (one round trip per included type) and filters by Memo content in-process. Each matched row carries a `matchedFields` array naming where the query hit (e.g. ['header.Memo', 'InvoiceLineRet[2].Desc']). Pass `query` (required, substring), bound with either customer/vendor scope OR a date range (at least one required). Defaults: case-insensitive, line memos included. Wire cost note: defaults search across 5+ types per direction; narrow with `types` when you know which kind of transaction the memo lives on. Under customer scope, only customer-side types are accepted; under vendor scope, only vendor-side; with no scope, unscoped types (JournalEntry, Deposit, Transfer, InventoryAdjustment, SalesTaxPaymentCheck) are also included by default.",
+    {
+      query: z.string().min(1)
+        .describe("The memo substring to search for. Required."),
+      caseSensitive: z.boolean().optional()
+        .describe("When true, match is case-sensitive. Default false."),
+      types: z.array(z.enum(ALL_MEMO_SEARCH_TYPES)).min(1).optional()
+        .describe(`Subset of memo-bearing transaction types to search. Customer-side: ${CUSTOMER_SIDE_TYPES.join(', ')}. Vendor-side: ${VENDOR_SIDE_TYPES.join(', ')}. Unscoped (only available when no customer/vendor scope is supplied): ${UNSCOPED_TXN_TYPES.join(', ')}. Defaults depend on scope direction: customer-side defaults under customer scope, vendor-side defaults under vendor scope, all 17 types under no scope.`),
+      fromDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("Start of the TxnDateRangeFilter window (YYYY-MM-DD, inclusive). At least one of {customer/vendor scope, fromDate, toDate} is required."),
+      toDate: z.string().regex(ISO_DATE_RE).optional()
+        .describe("End of the TxnDateRangeFilter window (YYYY-MM-DD, inclusive)."),
+      customerName: z.string().optional()
+        .describe("Customer FullName for customer-side scope. Mutually exclusive with vendor scope."),
+      customerListId: z.string().optional()
+        .describe("Customer ListID for customer-side scope. Alternative to customerName."),
+      vendorName: z.string().optional()
+        .describe("Vendor FullName for vendor-side scope. Mutually exclusive with customer scope."),
+      vendorListId: z.string().optional()
+        .describe("Vendor ListID for vendor-side scope. Alternative to vendorName."),
+      includeLineMemos: z.boolean().optional()
+        .describe("When true (default), also searches every line's Memo and Desc fields. When false, only the header Memo is checked — significantly less data over the wire (no IncludeLineItems threading) and faster post-filter."),
+      maxPerType: z.number().int().positive().optional()
+        .describe("Cap per underlying typed query. Default 500 (QB's per-batch cap). Hitting the cap on any type surfaces a warning — narrow fromDate/toDate or types when this fires."),
+    },
+    async (args) => {
+      const session = getSession();
+
+      // ---------- VALIDATION ----------
+      const hasCustomer = !!(args.customerName || args.customerListId);
+      const hasVendor = !!(args.vendorName || args.vendorListId);
+
+      if (hasCustomer && hasVendor) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 3120,
+              statusMessage:
+                "Customer scope and vendor scope are mutually exclusive — pass either customerName/customerListId OR vendorName/vendorListId, not both",
+              humanReadable: qbStatusCodeMessage(3120),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      if (args.customerName && args.customerListId) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 3120,
+              statusMessage: "Pass either customerName or customerListId, not both",
+              humanReadable: qbStatusCodeMessage(3120),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      if (args.vendorName && args.vendorListId) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 3120,
+              statusMessage: "Pass either vendorName or vendorListId, not both",
+              humanReadable: qbStatusCodeMessage(3120),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      if (!hasCustomer && !hasVendor && !args.fromDate && !args.toDate) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: false,
+              statusCode: 3120,
+              statusMessage:
+                "At least one of customerName / customerListId / vendorName / vendorListId / fromDate / toDate is required to bound the search",
+              humanReadable: qbStatusCodeMessage(3120),
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      // Resolve default types from scope direction, then validate any
+      // user-supplied types against the scope.
+      let effectiveTypes: MemoSearchTxnType[];
+      if (args.types && args.types.length > 0) {
+        effectiveTypes = args.types as MemoSearchTxnType[];
+        if (hasCustomer) {
+          const bad = effectiveTypes.filter(
+            (t) => !(CUSTOMER_SIDE_TYPES as readonly string[]).includes(t),
+          );
+          if (bad.length > 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 3120,
+                  statusMessage: `Type(s) ${bad.join(", ")} are incompatible with customer scope. Customer-side types: ${CUSTOMER_SIDE_TYPES.join(", ")}.`,
+                  humanReadable: qbStatusCodeMessage(3120),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        } else if (hasVendor) {
+          const bad = effectiveTypes.filter(
+            (t) => !(VENDOR_SIDE_TYPES as readonly string[]).includes(t),
+          );
+          if (bad.length > 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: false,
+                  statusCode: 3120,
+                  statusMessage: `Type(s) ${bad.join(", ")} are incompatible with vendor scope. Vendor-side types: ${VENDOR_SIDE_TYPES.join(", ")}.`,
+                  humanReadable: qbStatusCodeMessage(3120),
+                }),
+              }],
+              isError: true,
+            };
+          }
+        }
+      } else if (hasCustomer) {
+        effectiveTypes = [...CUSTOMER_SIDE_TYPES];
+      } else if (hasVendor) {
+        effectiveTypes = [...VENDOR_SIDE_TYPES];
+      } else {
+        effectiveTypes = [...ALL_MEMO_SEARCH_TYPES];
+      }
+
+      const maxPerType = args.maxPerType ?? 500;
+      const includeLineMemos = args.includeLineMemos !== false;
+
+      // ---------- ENTITY RESOLUTION ----------
+      // Canonicalize ListID → FullName for the EntityFilter, mirroring
+      // qb_transaction_list. Sim's match-by-ListID path doesn't always hit
+      // refs added via addEntity without a hydrated ListID; FullName is
+      // robust across sim and equivalent in live QB.
+      let entityName: string | null = null;
+      let entityListId: string | null = null;
+      if (hasCustomer) {
+        const allCustomers = await session.queryEntity("Customer", {});
+        let target = allCustomers as Array<Record<string, unknown>>;
+        if (args.customerListId) {
+          target = target.filter(
+            (c) => String(c.ListID ?? "") === args.customerListId,
+          );
+        } else if (args.customerName) {
+          target = target.filter(
+            (c) => String(c.FullName ?? c.Name ?? "") === args.customerName,
+          );
+        }
+        if (target.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                statusCode: 500,
+                statusMessage: args.customerListId
+                  ? `Customer with ListID '${args.customerListId}' not found`
+                  : `Customer with FullName '${args.customerName}' not found`,
+                humanReadable: qbStatusCodeMessage(500),
+              }),
+            }],
+            isError: true,
+          };
+        }
+        entityName = String(target[0].FullName ?? target[0].Name ?? "");
+        if (target[0].ListID) entityListId = String(target[0].ListID);
+      } else if (hasVendor) {
+        const allVendors = await session.queryEntity("Vendor", {});
+        let target = allVendors as Array<Record<string, unknown>>;
+        if (args.vendorListId) {
+          target = target.filter(
+            (v) => String(v.ListID ?? "") === args.vendorListId,
+          );
+        } else if (args.vendorName) {
+          target = target.filter(
+            (v) => String(v.FullName ?? v.Name ?? "") === args.vendorName,
+          );
+        }
+        if (target.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                statusCode: 500,
+                statusMessage: args.vendorListId
+                  ? `Vendor with ListID '${args.vendorListId}' not found`
+                  : `Vendor with FullName '${args.vendorName}' not found`,
+                humanReadable: qbStatusCodeMessage(500),
+              }),
+            }],
+            isError: true,
+          };
+        }
+        entityName = String(target[0].FullName ?? target[0].Name ?? "");
+        if (target[0].ListID) entityListId = String(target[0].ListID);
+      }
+
+      // ---------- BUILD SHARED FILTERS ----------
+      const sharedFilters: Record<string, unknown> = { MaxReturned: maxPerType };
+      if (args.fromDate || args.toDate) {
+        sharedFilters.TxnDateRangeFilter = {
+          FromTxnDate: args.fromDate,
+          ToTxnDate: args.toDate,
+        };
+      }
+      if (includeLineMemos) {
+        sharedFilters.IncludeLineItems = true;
+      }
+
+      // EntityFilter only applies to types that actually accept it. Unscoped
+      // types (JE/Deposit/Transfer/InvAdj/SalesTaxPaymentCheck) get the
+      // shared filter set MINUS EntityFilter — but they're already excluded
+      // from effectiveTypes when scope is supplied, so a shared EntityFilter
+      // on the scoped subset is safe.
+      if (entityName) {
+        sharedFilters.EntityFilter = { FullName: entityName };
+      }
+
+      // ---------- FANOUT + IN-PROCESS FILTER ----------
+      const warnings: string[] = [];
+      const typeCounts: Record<string, number> = {};
+      const scannedCounts: Record<string, number> = {};
+      const matchedTxns: Array<Record<string, unknown>> = [];
+
+      try {
+        const queryPromises = effectiveTypes.map(async (txnType) => {
+          // Unscoped types get a copy of sharedFilters without EntityFilter
+          // (it's not in their schema). When scope is supplied, these types
+          // aren't in effectiveTypes, so this branch only fires for the
+          // no-scope case where EntityFilter was never added.
+          const filtersForType = sharedFilters;
+          const results = await session.queryEntity(txnType, filtersForType);
+          return { txnType, results };
+        });
+        const results = await Promise.all(queryPromises);
+
+        for (const { txnType, results: rows } of results) {
+          scannedCounts[txnType] = rows.length;
+          if (rows.length >= maxPerType) {
+            warnings.push(
+              `${txnType} hit maxPerType cap (${maxPerType}) — narrow fromDate/toDate or raise maxPerType for full results`,
+            );
+          }
+          let typeMatched = 0;
+          for (const row of rows) {
+            const matchedFields = collectMatchedFields(
+              row,
+              txnType,
+              args.query,
+              args.caseSensitive === true,
+              includeLineMemos,
+            );
+            if (matchedFields !== null) {
+              matchedTxns.push({ TxnType: txnType, ...row, matchedFields });
+              typeMatched++;
+            }
+          }
+          typeCounts[txnType] = typeMatched;
+        }
+      } catch (err) {
+        return formatToolError(err, { fallbackMessage: "qb_transaction_memo_search failed" });
+      }
+
+      // Chronological sort with TimeCreated tiebreaker (matches #72).
+      matchedTxns.sort((a, b) => {
+        const ad = String(a.TxnDate ?? "");
+        const bd = String(b.TxnDate ?? "");
+        if (ad !== bd) return ad < bd ? -1 : 1;
+        const at = String(a.TimeCreated ?? "");
+        const bt = String(b.TimeCreated ?? "");
+        return at < bt ? -1 : at > bt ? 1 : 0;
+      });
+
+      const scope: Record<string, unknown> = {};
+      if (hasCustomer) {
+        scope.direction = "customer";
+        if (entityName) scope.customerName = entityName;
+        if (entityListId) scope.customerListId = entityListId;
+      } else if (hasVendor) {
+        scope.direction = "vendor";
+        if (entityName) scope.vendorName = entityName;
+        if (entityListId) scope.vendorListId = entityListId;
+      } else {
+        scope.direction = "all";
+      }
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            query: args.query,
+            caseSensitive: args.caseSensitive === true,
+            includeLineMemos,
+            scope,
+            fromDate: args.fromDate ?? null,
+            toDate: args.toDate ?? null,
+            types: effectiveTypes,
+            typeCounts,
+            scannedCounts,
+            count: matchedTxns.length,
+            transactions: matchedTxns,
             ...(warnings.length > 0 ? { warnings } : {}),
           }, null, 2),
         }],

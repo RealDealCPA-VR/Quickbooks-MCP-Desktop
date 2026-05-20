@@ -171,6 +171,7 @@ export function registerSalesOrderTools(
       lines: z.array(salesOrderLineSchema).min(1)
         .describe("Sales-order line items. At least one required."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate sales order (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -215,6 +216,26 @@ export function registerSalesOrderTools(
         return lineData;
       });
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("SalesOrder", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { salesOrder: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "SalesOrderAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("SalesOrder", data, args.idempotencyKey)
@@ -252,6 +273,7 @@ export function registerSalesOrderTools(
         .describe("Mark/unmark the sales order as manually closed (true closes the order, false reopens it)."),
       lines: z.array(salesOrderLineModSchema).optional()
         .describe("Replacement line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -289,6 +311,26 @@ export function registerSalesOrderTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("SalesOrder", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { salesOrder: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "SalesOrderModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("SalesOrder", data);
         return {
@@ -305,12 +347,33 @@ export function registerSalesOrderTools(
 
   server.tool(
     "qb_sales_order_delete",
-    "Delete a sales order from QuickBooks Desktop. Sales orders aren't posted to AR so there's no balance to reverse — this is purely a record removal. Deleting a SO that has already been (partially) invoiced does NOT touch the invoices it spawned; those remain. WARNING: Irreversible.",
+    "Delete a sales order from QuickBooks Desktop. Sales orders aren't posted to AR so there's no balance to reverse — this is purely a record removal. Deleting a SO that has already been (partially) invoiced does NOT touch the invoices it spawned; those remain. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the sales order to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("SalesOrder", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (SalesOrder) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("SalesOrder", txnId);
         return {

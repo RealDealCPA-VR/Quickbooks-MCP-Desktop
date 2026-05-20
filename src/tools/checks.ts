@@ -235,6 +235,7 @@ export function registerCheckTools(
       itemLines: z.array(itemLineSchema).optional()
         .describe("Item lines — each posts (quantity * cost) to the item's linked expense account."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate check (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -290,6 +291,26 @@ export function registerCheckTools(
         data.ItemLineAdd = args.itemLines!.map(buildItemLineAdd);
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("Check", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { check: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "CheckAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("Check", data, args.idempotencyKey)
@@ -328,6 +349,7 @@ export function registerCheckTools(
         .describe("Replacement expense-line set. Existing lines whose TxnLineID is not listed will be dropped."),
       itemLines: z.array(itemLineModSchema).optional()
         .describe("Replacement item-line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -397,6 +419,26 @@ export function registerCheckTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("Check", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { check: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "CheckModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("Check", data);
         return {
@@ -413,12 +455,33 @@ export function registerCheckTools(
 
   server.tool(
     "qb_check_delete",
-    "Delete a check from QuickBooks Desktop. WARNING: Irreversible. To void instead, use qb_check_update with amount=0 and a 'VOID' memo (matches QB Desktop's Edit → Void Check behavior).",
+    "Delete a check from QuickBooks Desktop. WARNING: Irreversible. To void instead, use qb_check_update with amount=0 and a 'VOID' memo (matches QB Desktop's Edit → Void Check behavior). Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the check to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("Check", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (Check) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("Check", txnId);
         return {

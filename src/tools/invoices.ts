@@ -164,7 +164,7 @@ export function registerInvoiceTools(
 ): void {
   server.tool(
     "qb_invoice_list",
-    "List or search invoices in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. When paginate is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface InvoiceLineRet (the per-line breakdown — item, qty, rate, amount, TxnLineID). Set includeCustomFields:true to surface DataExtRet (custom-field) values per invoice. Set includeCustomerContact:true to attach a customerContact sub-object (Email / Phone / AltPhone / Fax / Contact / AltContact / CompanyName / FirstName / MiddleName / LastName / JobTitle) to every invoice — one extra CustomerQueryRq call regardless of result size; replaces the per-customer qb_customer_list lookup the collection-email workflow used to require.",
+    "List or search invoices in QuickBooks Desktop. Set paginate:true to use iterator-based pagination — first call returns iteratorID + iteratorRemainingCount; pass iteratorID back on subsequent calls until iteratorRemainingCount === 0. Set autoExhaust:true (Phase 16 #73) to fully exhaust the iterator server-side and return the merged result in one call — caps at maxBatches (default 20 = ~10k rows). When paginate or autoExhaust is enabled, maxReturned defaults to 500 (QB's per-batch cap) if unset. By default each row carries header totals only; pass includeLineItems:true to also surface InvoiceLineRet (the per-line breakdown — item, qty, rate, amount, TxnLineID). Set includeCustomFields:true to surface DataExtRet (custom-field) values per invoice. Set includeCustomerContact:true to attach a customerContact sub-object (Email / Phone / AltPhone / Fax / Contact / AltContact / CompanyName / FirstName / MiddleName / LastName / JobTitle) to every invoice — under paginate the enrichment runs per-batch; under autoExhaust the enrichment fires ONCE at the end over the dedup'd ListIDs of the merged result (single follow-up CustomerQueryRq regardless of batch count).",
     {
       customerName: z.string().optional().describe("Filter by customer name"),
       customerListId: z.string().optional().describe("Filter by customer ListID"),
@@ -177,20 +177,32 @@ export function registerInvoiceTools(
       includeLineItems: z.boolean().optional().describe("When true, each invoice row carries its InvoiceLineRet array (item, qty, rate, amount, TxnLineID per line). Default false — header totals only, matching real QB's *QueryRq default behavior."),
       includeCustomFields: z.boolean().optional().describe("Include DataExtRet (custom-field values) on every returned invoice. Pass customFieldOwnerId for non-default namespaces."),
       customFieldOwnerId: z.string().optional().describe("OwnerID namespace to scope DataExtRet to. Default '0' (standard company-defined fields). Only meaningful when includeCustomFields:true."),
-      includeCustomerContact: z.boolean().optional().describe("When true, attach a customerContact sub-object (Email / Phone / AltPhone / Fax / Contact / AltContact / CompanyName / FirstName / MiddleName / LastName / JobTitle — present fields only) to every returned invoice. Triggers a follow-up CustomerQueryRq scoped to the unique CustomerRef.ListIDs in the result (one extra wire call, not one per invoice). If the join fails, invoices still return without contact fields and the response carries a `warning`. Useful for collection-email workflows that previously required a per-customer qb_customer_list lookup."),
-      maxReturned: z.number().optional().describe("Maximum results. Defaults to 500 when paginate is enabled (QB's per-batch cap); otherwise QB-driven."),
-      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset."),
-      iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate."),
+      includeCustomerContact: z.boolean().optional().describe("When true, attach a customerContact sub-object (Email / Phone / AltPhone / Fax / Contact / AltContact / CompanyName / FirstName / MiddleName / LastName / JobTitle — present fields only) to every returned invoice. Triggers a follow-up CustomerQueryRq scoped to the unique CustomerRef.ListIDs in the result (one extra wire call, not one per invoice). Under autoExhaust the enrichment runs ONCE at the end over the merged result's dedup'd ListIDs — N invoice batches still cost only 1 contact wire call. If the join fails, invoices still return without contact fields and the response carries a `warning`."),
+      maxReturned: z.number().optional().describe("Maximum results per wire batch. Defaults to 500 when paginate or autoExhaust is enabled (QB's per-batch cap); otherwise QB-driven."),
+      paginate: z.boolean().optional().describe("Enable iterator-based pagination (real QB caps each *QueryRq response at ~500 rows). Response surfaces iteratorRemainingCount + iteratorID. Auto-defaults maxReturned to 500 if unset. Mutually exclusive with autoExhaust."),
+      iteratorID: z.string().optional().describe("Continue an existing iterator by passing the iteratorID from a prior paginated response. Implies paginate. Mutually exclusive with autoExhaust (autoExhaust always starts a fresh iterator)."),
+      autoExhaust: z.boolean().optional().describe("Phase 16 #73: server-side iterator exhaustion. Loops queryEntityPaginated until iteratorRemainingCount === 0 (or maxBatches cap) and returns the merged result as ONE response — collapses N tool round trips for a large dump into 1. Hard-capped by maxBatches (default 20 = ~10k rows). Cap-hit returns the partial result + final iteratorID for caller-driven resumption. Mutually exclusive with paginate / iteratorID. includeCustomerContact enrichment runs ONCE at the end over the merged result's dedup'd ListIDs."),
+      maxBatches: z.number().int().positive().optional().describe("Safety cap on autoExhaust batch count (default 20). Each batch is one wire round trip to QuickBooks Desktop (~500 rows per batch). Only meaningful when autoExhaust:true."),
     },
     async (args) => {
       const session = getSession();
+
+      // Phase 16 #73 — autoExhaust mutex (see customers.ts pilot).
+      if (args.autoExhaust && (args.paginate || args.iteratorID)) {
+        return formatToolError(
+          new Error("autoExhaust is mutually exclusive with paginate / iteratorID — autoExhaust starts a fresh iterator server-side and runs it to completion"),
+          { fallbackMessage: "Invalid arguments" }
+        );
+      }
+
       const filters: Record<string, unknown> = {};
 
       // Pagination requires MaxReturned — QB rejects iterator requests without it
       // ("There is a missing element: MaxReturned"). Default to 500 (QB's
-      // effective per-batch cap) when paginate is on but no value was supplied.
+      // effective per-batch cap) when paginate or autoExhaust is on but no
+      // value was supplied.
       const effectiveMaxReturned =
-        args.maxReturned ?? (args.paginate || args.iteratorID ? 500 : undefined);
+        args.maxReturned ?? (args.paginate || args.iteratorID || args.autoExhaust ? 500 : undefined);
 
       // InvoiceQueryRq schema-required child order (see DECISIONS.md
       // 2026-05-09): TxnID/RefNumber selectors → MaxReturned →
@@ -222,6 +234,61 @@ export function registerInvoiceTools(
       }
 
       try {
+        if (args.autoExhaust) {
+          // Phase 16 #73 — loop queryEntityPaginated until exhausted OR
+          // maxBatches cap. Each iteration is one wire round trip to QB.
+          // includeCustomerContact enrichment runs ONCE at the end over the
+          // dedup'd ListIDs of the merged result (vs. paginate where the
+          // enrichment runs per-batch). Same load-bearing optimization the
+          // single-call path has.
+          const cap = args.maxBatches ?? 20;
+          const accumulated: Record<string, unknown>[] = [];
+          let nextIteratorID: string | undefined;
+          let batches = 0;
+          let remaining = Infinity;
+          let capHit = false;
+          while (remaining > 0) {
+            if (batches >= cap) {
+              capHit = true;
+              break;
+            }
+            const batch = await session.queryEntityPaginated("Invoice", filters, {
+              iterator: batches === 0 ? "Start" : "Continue",
+              iteratorID: nextIteratorID,
+            });
+            accumulated.push(...batch.entities);
+            batches += 1;
+            remaining = batch.iteratorRemainingCount ?? 0;
+            nextIteratorID = batch.iteratorID;
+          }
+          const contactEnrichment = args.includeCustomerContact
+            ? await enrichInvoicesWithCustomerContact(session, accumulated)
+            : {};
+          const warnings: string[] = [];
+          if (capHit) {
+            warnings.push(
+              `autoExhaust cap hit after ${batches} batches (~${accumulated.length} rows accumulated). Increase maxBatches or resume via iteratorID. NOTE: iteratorID resumption only works against live QB — simulation does not maintain cross-call iterator state.`
+            );
+          }
+          if (contactEnrichment.warning) {
+            warnings.push(contactEnrichment.warning);
+          }
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                count: accumulated.length,
+                invoices: accumulated,
+                batchesExhausted: batches,
+                ...(capHit && nextIteratorID
+                  ? { iteratorID: nextIteratorID, iteratorRemainingCount: remaining }
+                  : {}),
+                ...(warnings.length ? { warnings } : {}),
+              }, null, 2),
+            }],
+          };
+        }
+
         if (args.paginate || args.iteratorID) {
           const result = await session.queryEntityPaginated("Invoice", filters, {
             iterator: args.iteratorID ? "Continue" : "Start",
@@ -626,7 +693,7 @@ export function registerInvoiceTools(
 
   server.tool(
     "qb_invoice_update",
-    "Update an existing invoice in QuickBooks Desktop. Pass txnId + editSequence (from a prior qb_invoice_list) plus any header fields and/or a replacement `lines` array. When `lines` is provided it REPLACES the invoice's existing line set wholesale — list every line you want the invoice to keep. A line with a txnLineID matching an existing line preserves that TxnLineID and merges any fields you pass over the existing values; a line without txnLineID (or with '-1') is added as new. Subtotal / BalanceRemaining / IsPaid recompute automatically; AppliedAmount is preserved (paid portions don't disappear when lines change). If a line mod drops Subtotal below AppliedAmount, BalanceRemaining goes negative — that's the over-applied state and matches real QB. Customer balance moves by the change in BalanceRemaining (not Subtotal).",
+    "Update an existing invoice in QuickBooks Desktop. Pass txnId + editSequence (from a prior qb_invoice_list) plus any header fields and/or a replacement `lines` array. When `lines` is provided it REPLACES the invoice's existing line set wholesale — list every line you want the invoice to keep. A line with a txnLineID matching an existing line preserves that TxnLineID and merges any fields you pass over the existing values; a line without txnLineID (or with '-1') is added as new. Subtotal / BalanceRemaining / IsPaid recompute automatically; AppliedAmount is preserved (paid portions don't disappear when lines change). If a line mod drops Subtotal below AppliedAmount, BalanceRemaining goes negative — that's the over-applied state and matches real QB. Customer balance moves by the change in BalanceRemaining (not Subtotal). Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the invoice to update"),
       editSequence: z.string().describe("EditSequence from a prior query — must match the stored value or the mod is rejected with statusCode 3170"),
@@ -638,6 +705,7 @@ export function registerInvoiceTools(
       memo: z.string().optional().describe("New memo"),
       lines: z.array(invoiceLineModSchema).optional()
         .describe("Replacement line set. Existing lines whose TxnLineID is not listed will be dropped."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -671,6 +739,26 @@ export function registerInvoiceTools(
           if (line.amount !== undefined) lineData.Amount = line.amount;
           return lineData;
         });
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("Invoice", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { invoice: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "InvoiceModRq dry-run failed" });
+        }
       }
 
       try {

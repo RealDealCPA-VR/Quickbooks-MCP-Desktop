@@ -24,14 +24,15 @@ export function registerListTools(
 ): void {
   server.tool(
     "qb_class_list",
-    "List Classes (department / location / cost-center labels) defined in QuickBooks Desktop. Used to discover valid Class names for invoice / bill / journal-entry line classification.",
+    "List Classes (department / location / cost-center labels) defined in QuickBooks Desktop. Used to discover valid Class names for invoice / bill / journal-entry line classification. Caching (Phase 16 #74): unfiltered calls (no nameFilter, listId) hit a 5-minute lookup cache by default — response carries fromCache:true on hit. Pass useCache:false to force fresh; call qb_cache_invalidate({entity:'Class'}) to clear after an out-of-band edit.",
     {
       nameFilter: z.string().optional().describe("Filter classes by name (Contains match)"),
       activeOnly: z.boolean().optional().describe("Only return active classes (default: true)"),
       maxReturned: z.number().optional().describe("Maximum results"),
       listId: z.string().optional().describe("Fetch a specific class by ListID"),
+      useCache: z.boolean().optional().describe("Phase 16 #74: read/write through the 5-minute MCP-side lookup cache for unfiltered calls. Default true. Any filter arg (nameFilter, listId) bypasses cache. Pass false to force a fresh wire fetch."),
     },
-    async ({ nameFilter, activeOnly, maxReturned, listId }) => {
+    async ({ nameFilter, activeOnly, maxReturned, listId, useCache }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -42,8 +43,29 @@ export function registerListTools(
       if (activeOnly !== false) filters.ActiveStatus = "ActiveOnly";
       if (nameFilter) filters.NameFilter = { MatchCriterion: "Contains", Name: nameFilter };
 
+      // Phase 16 #74 — lookup cache eligibility (see accounts.ts).
+      const isUnfilteredCall =
+        !nameFilter &&
+        !listId &&
+        activeOnly !== false;
+      const cacheEnabled = useCache !== false && isUnfilteredCall;
+      if (cacheEnabled) {
+        const cached = session.getLookupCache().get("Class");
+        if (cached) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ count: cached.length, classes: cached, fromCache: true }, null, 2),
+            }],
+          };
+        }
+      }
+
       try {
         const classes = await session.queryEntity("Class", filters);
+        if (cacheEnabled) {
+          session.getLookupCache().set("Class", classes);
+        }
         return {
           content: [{
             type: "text" as const,
@@ -58,7 +80,7 @@ export function registerListTools(
 
   server.tool(
     "qb_terms_list",
-    "List payment Terms (Net 15, Net 30, 2% 10 Net 30, etc.) defined in QuickBooks Desktop. Used to discover valid Terms names for invoice / bill creation. QB splits Terms into two underlying types — StandardTerms (e.g. \"Net 30\" — fixed days from invoice date) and DateDrivenTerms (e.g. \"Due on 15th\" — fixed calendar day). Default fans across both stores and merges; pass `termsType` to scope.",
+    "List payment Terms (Net 15, Net 30, 2% 10 Net 30, etc.) defined in QuickBooks Desktop. Used to discover valid Terms names for invoice / bill creation. QB splits Terms into two underlying types — StandardTerms (e.g. \"Net 30\" — fixed days from invoice date) and DateDrivenTerms (e.g. \"Due on 15th\" — fixed calendar day). Default fans across both stores and merges; pass `termsType` to scope. Caching (Phase 16 #74): unfiltered calls (no nameFilter, listId) hit a 5-minute lookup cache by default — keyed per subtype (StandardTerms + DateDrivenTerms cached independently). Pass useCache:false to force fresh; call qb_cache_invalidate({entity:'Terms'}) to clear both subtypes after an out-of-band edit.",
     {
       nameFilter: z.string().optional().describe("Filter terms by name (Contains match)"),
       activeOnly: z.boolean().optional().describe("Only return active terms (default: true)"),
@@ -66,8 +88,9 @@ export function registerListTools(
         .describe("Filter by terms type. Omit to query both StandardTerms + DateDrivenTerms and merge."),
       maxReturned: z.number().optional().describe("Maximum results (applied per-store when fanning out)"),
       listId: z.string().optional().describe("Fetch specific terms by ListID"),
+      useCache: z.boolean().optional().describe("Phase 16 #74: read/write through the 5-minute MCP-side lookup cache for unfiltered calls. Default true. Cache is keyed per subtype (StandardTerms + DateDrivenTerms cached independently). Any filter arg (nameFilter, listId) bypasses cache. termsType is part of the cache key (not a bypass)."),
     },
-    async ({ nameFilter, activeOnly, termsType, maxReturned, listId }) => {
+    async ({ nameFilter, activeOnly, termsType, maxReturned, listId, useCache }) => {
       const session = getSession();
       const filters: Record<string, unknown> = {};
 
@@ -85,10 +108,38 @@ export function registerListTools(
             ? ["DateDrivenTerms"]
             : ["StandardTerms", "DateDrivenTerms"];
 
+      // Phase 16 #74 — lookup cache eligibility. termsType is part of the
+      // cache key; nameFilter/listId bypass; activeOnly:false bypasses.
+      const isUnfilteredCall =
+        !nameFilter &&
+        !listId &&
+        activeOnly !== false;
+      const cacheEnabled = useCache !== false && isUnfilteredCall;
+      if (cacheEnabled) {
+        const cache = session.getLookupCache();
+        const subtypeCaches = types.map((t) => cache.get(t));
+        if (subtypeCaches.every((c) => c !== null)) {
+          // Re-emit the TermsType tag on every row — write-back caches the
+          // raw wire result; the tag is a tool-layer enrichment.
+          const tagged = subtypeCaches.flatMap((entries, idx) =>
+            (entries as Record<string, unknown>[]).map((e) => ({ ...e, TermsType: types[idx] }))
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ count: tagged.length, terms: tagged, fromCache: true }, null, 2),
+            }],
+          };
+        }
+      }
+
       try {
         const results = await Promise.all(
           types.map(async (t) => {
             const entries = await session.queryEntity(t, filters);
+            if (cacheEnabled) {
+              session.getLookupCache().set(t, entries);
+            }
             return entries.map((e) => ({ ...e, TermsType: t }));
           })
         );

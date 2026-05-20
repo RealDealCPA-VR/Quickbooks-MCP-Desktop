@@ -45,6 +45,7 @@ import type {
 } from "../types/qbxml.js";
 import type { ComDispatchObject } from "winax";
 import { SimulationStore } from "./simulation-store.js";
+import { QBLookupCache } from "./lookup-cache.js";
 import { getQbxmlLogger } from "../util/qbxml-logger.js";
 
 // ---------------------------------------------------------------------------
@@ -518,6 +519,20 @@ export class QBSessionManager {
   private hostInfoCache: HostInfo | null = null;
 
   /**
+   * Lookup cache (Phase 16 #74). Holds the most-recent unfiltered
+   * "give me everything" call for the five stable-list domains (Account,
+   * Customer, Item*, Terms*, Class) so repeated unfiltered list calls
+   * collapse N wire round trips to one.
+   *
+   * Scoped per-companyFile via `companyFileChanged` — `switchCompanyFile`
+   * propagates the new path so book A's lookups never leak into book B.
+   *
+   * TTL-guarded (5 minutes default). Operators can force-flush via
+   * `qb_cache_invalidate` for the "I just added a customer in QB UI" path.
+   */
+  private readonly lookupCache: QBLookupCache;
+
+  /**
    * Cap on the per-companyFile idempotency cache. Sized for a long-running
    * agent session (typical agent runs post < 100 mutations); 1000 leaves
    * generous headroom without unbounded memory growth. FIFO eviction is
@@ -572,6 +587,7 @@ export class QBSessionManager {
     this.config = config;
     this.simulationMode = resolveSimulationMode(process.env, process.platform);
     this.store = new SimulationStore();
+    this.lookupCache = new QBLookupCache(config.companyFile);
 
     if (this.simulationMode) {
       console.error(
@@ -795,7 +811,23 @@ export class QBSessionManager {
     // recent instability on a freshly-opened file).
     this.transientRetryTimestamps = [];
     this.totalTransientRetries = 0;
+    // Lookup cache (Phase 16 #74) — the chart of accounts / customer list /
+    // item list / terms list / class list is wholly different between books.
+    // Any cached entry from the prior file is meaningless against the new
+    // one. companyFileChanged clears the cache + records the new path.
+    this.lookupCache.companyFileChanged(companyFile);
     return this.openSession();
+  }
+
+  /**
+   * Public accessor for the per-session lookup cache (Phase 16 #74).
+   * Tools that opt into caching (`qb_account_list` / `qb_customer_list` /
+   * `qb_item_list` / `qb_terms_list` / `qb_class_list`) read and write
+   * through this surface. `qb_cache_invalidate` calls `invalidate()` on
+   * it directly. Tests use the accessor to assert hit/miss state.
+   */
+  getLookupCache(): QBLookupCache {
+    return this.lookupCache;
   }
 
   /**
@@ -2089,6 +2121,53 @@ export class QBSessionManager {
   ): Promise<Record<string, unknown>> {
     const xml = buildCustomDetailReportRequest(
       params,
+      this.config.qbxmlVersion
+    );
+    const response = await this.sendRequest(xml);
+    return extractCustomDetailReportData(response, "CustomDetailReportQueryRs");
+  }
+
+  /**
+   * Run a CustomDetailReportQueryRq with CustomDetailReportType=AuditTrail
+   * (Phase 14 #66 — qb_audit_log). Convenience wrapper over runCustomDetailReport
+   * that hardcodes the report type and pins the canonical column set. Returns
+   * the extracted ReportRet in {Columns, Rows} shape; tool layer maps rows to
+   * the structured audit-entry contract.
+   *
+   * QBXML's AuditTrail report has no TxnIDFilter at the wire level — txnId
+   * scoping must be done by the tool layer post-fetch. Date range is the only
+   * server-side filter; pass a wide window (e.g. last 2 years) when the caller
+   * wants every audit entry for a specific transaction.
+   *
+   * Enterprise-only on the wire; the tool layer is responsible for the edition
+   * probe (HostInfo.isEnterprise) — this primitive proceeds even on Pro /
+   * Premier and lets QB surface the 9003-equivalent statusCode itself.
+   *
+   * NOTE: IncludeColumn names here are inferred from QB Desktop's Audit Trail
+   * report UI labels — exact wire names await live verification against an
+   * Enterprise QB install. If live QB returns statusCode -1 (parse error) or
+   * a column-mismatch, the fix is to adjust the IncludeColumn set without
+   * touching the tool-layer row mapping (which reads from Columns by Title).
+   */
+  async runAuditTrailReport(
+    params: { fromDate?: string; toDate?: string } = {}
+  ): Promise<Record<string, unknown>> {
+    const xml = buildCustomDetailReportRequest(
+      {
+        reportType: "AuditTrail",
+        fromDate: params.fromDate,
+        toDate: params.toDate,
+        includeColumns: [
+          "User",
+          "TimeModified",
+          "ModifyType",
+          "ChangedField",
+          "OldValue",
+          "NewValue",
+          "TxnID",
+          "TxnType",
+        ],
+      },
       this.config.qbxmlVersion
     );
     const response = await this.sendRequest(xml);

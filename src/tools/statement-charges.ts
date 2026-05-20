@@ -117,6 +117,7 @@ export function registerStatementChargeTools(
       refNumber: z.string().optional().describe("Reference number"),
       className: z.string().optional().describe("Class full name (for class-tracking)"),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate charge (response carries idempotentReplay:true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -202,6 +203,26 @@ export function registerStatementChargeTools(
       if (args.className) data.ClassRef = { FullName: args.className };
       if (args.amount !== undefined) data.Amount = args.amount;
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("StatementCharge", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { statementCharge: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "StatementChargeAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("StatementCharge", data, args.idempotencyKey)
@@ -240,6 +261,7 @@ export function registerStatementChargeTools(
       dueDate: z.string().regex(ISO_DATE_RE).optional().describe("New due date (YYYY-MM-DD)"),
       refNumber: z.string().optional().describe("New reference number"),
       className: z.string().optional().describe("New class full name"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -267,6 +289,26 @@ export function registerStatementChargeTools(
       if (args.className) data.ClassRef = { FullName: args.className };
       if (args.amount !== undefined) data.Amount = args.amount;
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("StatementCharge", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { statementCharge: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "StatementChargeModRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.modifyEntity("StatementCharge", data);
         return {
@@ -283,12 +325,33 @@ export function registerStatementChargeTools(
 
   server.tool(
     "qb_statement_charge_delete",
-    "Delete a statement charge from QuickBooks Desktop. Customer.Balance reverses by -Amount. WARNING: Irreversible.",
+    "Delete a statement charge from QuickBooks Desktop. Customer.Balance reverses by -Amount. WARNING: Irreversible. Pass `dryRun: true` to preview without committing.",
     {
       txnId: z.string().describe("TxnID of the statement charge to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("StatementCharge", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (StatementCharge) dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("StatementCharge", txnId);
         return {

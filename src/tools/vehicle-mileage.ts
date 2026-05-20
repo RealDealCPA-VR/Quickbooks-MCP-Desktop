@@ -201,6 +201,7 @@ export function registerVehicleMileageTools(
       notes: z.string().optional().describe("Free-form notes / trip description (printed on mileage reports + the Time/Costs dialog)"),
       billable: z.boolean().optional().describe("When true, sets BillableStatus='Billable' (Time/Costs dialog can carry this onto a future invoice); false sets 'NotBillable'; unset leaves the field absent (QB's default)."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate trip (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -283,6 +284,26 @@ export function registerVehicleMileageTools(
       if (args.notes) data.Notes = args.notes;
       if (args.billable !== undefined) {
         data.BillableStatus = args.billable ? "Billable" : "NotBillable";
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("VehicleMileage", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { vehicleMileage: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "VehicleMileageAddRq dry-run failed" });
+        }
       }
 
       try {

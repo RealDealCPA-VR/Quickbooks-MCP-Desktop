@@ -71,6 +71,7 @@ export function registerAttachmentTools(
       showAsImage: z.boolean().optional().describe("When true, QB displays the attachment inline (image/PDF preview). When false (default), displays as a clickable icon. Set true for image attachments where the operator wants to see thumbnails in the txn detail view."),
       attachmentType: z.string().optional().describe("Optional AttachmentType enum (Normal | ...). Defaults to 'Normal' which fits PDFs / images / documents. Other values are SDK-version-dependent — most operators don't need to set this."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original Attachable without creating a duplicate (response carries idempotentReplay: true). Same key + different payload returns 9002."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -126,6 +127,26 @@ export function registerAttachmentTools(
       if (args.note) data.Note = args.note;
       if (args.attachmentType) data.AttachmentType = args.attachmentType;
       if (args.showAsImage !== undefined) data.ShowAsImage = args.showAsImage;
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("Attachable", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { attachment: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "AttachableAddRq dry-run failed" });
+        }
+      }
 
       try {
         const { entity: result, replayed } = args.idempotencyKey
@@ -215,12 +236,34 @@ export function registerAttachmentTools(
   // -----------------------------------------------------------------------
   server.tool(
     "qb_attachment_delete",
-    "Delete an attachment by its own ListID. Wraps ListDelRq with ListDelType='Attachable'. The file in QB's Attached Documents folder is also removed by real QB (sim mode just removes the metadata record). Use qb_attachment_list to find the attachableListId before deleting. Read-only sessions reject with statusCode 9001. Unknown attachableListId returns statusCode 500.",
+    "Delete an attachment by its own ListID. Wraps ListDelRq with ListDelType='Attachable'. The file in QB's Attached Documents folder is also removed by real QB (sim mode just removes the metadata record). Use qb_attachment_list to find the attachableListId before deleting. Read-only sessions reject with statusCode 9001. Unknown attachableListId returns statusCode 500. Pass `dryRun: true` to preview without committing.",
     {
       attachableListId: z.string().min(1).describe("ListID of the Attachable record to delete (the ID returned from qb_attachment_add or qb_attachment_list)."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_invoice_delete's dryRun docs for the full composition matrix."),
     },
-    async ({ attachableListId }) => {
+    async ({ attachableListId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("Attachable", attachableListId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                attachableListId,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "AttachableDelRq dry-run failed" });
+        }
+      }
+
       try {
         const result = await session.deleteEntity("Attachable", attachableListId);
         return {

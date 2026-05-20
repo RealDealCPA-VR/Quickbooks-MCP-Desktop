@@ -355,6 +355,7 @@ export function registerSalesTaxTools(
         .describe("Per-tax-item allocation lines. At least one required. Each line names a SalesTaxItem + the dollar amount of liability paid down."),
       idempotencyKey: z.string().min(1).optional()
         .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original payment check without creating a duplicate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -417,6 +418,26 @@ export function registerSalesTaxTools(
         if (line.memo) lineData.Memo = line.memo;
         return lineData;
       });
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("SalesTaxPaymentCheck", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { salesTaxPayment: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "SalesTaxPaymentCheckAddRq dry-run failed" });
+        }
+      }
 
       try {
         const { entity: result, replayed } = args.idempotencyKey

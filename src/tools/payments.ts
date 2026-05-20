@@ -39,6 +39,7 @@ export function registerPaymentTools(
       appliedTo: z.array(appliedToSchema).optional()
         .describe("Optional invoice applications. Each entry closes out part or all of an invoice's BalanceRemaining. sum(appliedTo.amount) must be <= totalAmount; the difference becomes UnusedPayment (a customer credit)."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate payment (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -107,6 +108,26 @@ export function registerPaymentTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("ReceivePayment", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { payment: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "ReceivePaymentAddRq dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("ReceivePayment", data, args.idempotencyKey)
@@ -142,6 +163,7 @@ export function registerPaymentTools(
       refNumber: z.string().optional().describe("New reference/check number"),
       txnDate: z.string().regex(ISO_DATE_RE).optional().describe("New payment date (YYYY-MM-DD)"),
       paymentMethodName: z.string().optional().describe("New payment method"),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -171,6 +193,26 @@ export function registerPaymentTools(
         }
         return lineData;
       });
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.modifyEntityDryRun("ReceivePayment", data);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { payment: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "ReceivePaymentModRq dry-run failed" });
+        }
+      }
 
       try {
         const result = await session.modifyEntity("ReceivePayment", data);
