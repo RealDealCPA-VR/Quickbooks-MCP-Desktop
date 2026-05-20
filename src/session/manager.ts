@@ -35,6 +35,7 @@ import {
   extractCustomDetailReportData,
   extractGeneralDetailReportData,
   flattenEntityArray,
+  QBXMLResponseError,
 } from "../qbxml/parser.js";
 import type {
   QBConnectionConfig,
@@ -372,6 +373,75 @@ export function isTransientLiveError(err: unknown): boolean {
  */
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Dry-run primitives (Phase 14 #64)
+// ---------------------------------------------------------------------------
+
+/**
+ * Human-readable disclaimer attached to live-mode dry-run results. Explains
+ * why `previewSupported: false` in live mode — the sim store doesn't mirror
+ * real QuickBooks data so an entity-after preview would be against a fresh
+ * seed, not the open books. The Zod payload validation and envelope build
+ * are still useful (they catch the structural class of bug before the wire
+ * call) but the operator should know not to expect a `wouldSucceed` signal.
+ *
+ * Constant rather than inline so all five live-mode return sites share one
+ * source of truth and changes to wording flow through automatically.
+ */
+const DRY_RUN_LIVE_NOTE =
+  "Live preview unavailable: the simulation store does not mirror real QuickBooks " +
+  "data, so an entity-after preview would be against a fresh seed rather than the " +
+  "open books. The QBXML envelope was built and the Zod payload validation passed; " +
+  "switch to simulation mode (set QB_SIMULATION=true) to exercise the structural " +
+  "preview.";
+
+/**
+ * Result shape returned by every single-entity dry-run primitive
+ * (`addEntityDryRun` / `modifyEntityDryRun` / `deleteEntityDryRun` /
+ * `updateClearedStatusDryRun`). See the section comment above the methods
+ * inside `QBSessionManager` for the field-by-field semantics.
+ */
+export interface DryRunResult {
+  committed: false;
+  mode: "simulation" | "live";
+  previewSupported: boolean;
+  qbxmlEnvelope: string;
+  wouldSucceed?: boolean;
+  entity?: Record<string, unknown>;
+  statusCode?: number;
+  statusMessage?: string;
+  wouldReplay?: boolean;
+  note?: string;
+}
+
+/**
+ * Batch dry-run shape — same as `DryRunResult` but `entity` is replaced by
+ * the positionally-aligned `results` array (the same per-entry status shape
+ * `executeBatchAdd` returns). `wouldSucceed` is true only when every entry
+ * would post cleanly, matching the real-call caching rule.
+ */
+export interface DryRunBatchResult {
+  committed: false;
+  mode: "simulation" | "live";
+  previewSupported: boolean;
+  qbxmlEnvelope: string;
+  wouldSucceed?: boolean;
+  results?: Array<
+    | { requestID: string; status: "posted"; entity: Record<string, unknown> }
+    | {
+        requestID: string;
+        status: "failed";
+        statusCode: number;
+        statusMessage: string;
+      }
+    | { requestID: string; status: "skipped" }
+  >;
+  statusCode?: number;
+  statusMessage?: string;
+  wouldReplay?: boolean;
+  note?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1145,23 @@ export class QBSessionManager {
     data: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
     this.assertWritable(`addEntity(${entityType})`);
+    return this.addEntityCore(entityType, data);
+  }
+
+  /**
+   * Private add primitive without the read-only gate. Public `addEntity` calls
+   * this after `assertWritable`; `addEntityDryRun` calls it without the gate
+   * so a read-only session can still preview a would-be mutation (Phase 14
+   * #64 — dry-run ALLOW × read-only composition, see DECISIONS.md).
+   *
+   * No other gate or transform — just build / send / extract. The dry-run
+   * wrapper captures the sim store before this runs and restores after,
+   * making the call observationally side-effect-free.
+   */
+  private async addEntityCore(
+    entityType: string,
+    data: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
     const xml = buildAddRequest(entityType, data, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
     const respData = extractResponseData(response, `${entityType}AddRs`);
@@ -1185,6 +1272,17 @@ export class QBSessionManager {
     data: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
     this.assertWritable(`modifyEntity(${entityType})`);
+    return this.modifyEntityCore(entityType, data);
+  }
+
+  /**
+   * Private modify primitive without the read-only gate. Symmetric to
+   * `addEntityCore` — see that comment. Used by `modifyEntityDryRun`.
+   */
+  private async modifyEntityCore(
+    entityType: string,
+    data: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
     const xml = buildModRequest(entityType, data, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
     const respData = extractResponseData(response, `${entityType}ModRs`);
@@ -1233,7 +1331,35 @@ export class QBSessionManager {
   > {
     if (entries.length === 0) return [];
     this.assertWritable(`executeBatchAdd(${entityType}, n=${entries.length})`);
+    return this.executeBatchAddCore(entityType, entries);
+  }
 
+  /**
+   * Private batch-add primitive without the read-only gate. Symmetric to
+   * `addEntityCore` — see that comment. Used by `executeBatchAddDryRun`.
+   *
+   * Caller is responsible for the empty-entries early-return and the
+   * `assertWritable` gate; this method takes them as preconditions.
+   */
+  private async executeBatchAddCore(
+    entityType: string,
+    entries: Record<string, unknown>[]
+  ): Promise<
+    Array<
+      | {
+          requestID: string;
+          status: "posted";
+          entity: Record<string, unknown>;
+        }
+      | {
+          requestID: string;
+          status: "failed";
+          statusCode: number;
+          statusMessage: string;
+        }
+      | { requestID: string; status: "skipped" }
+    >
+  > {
     const rqType = `${entityType}AddRq`;
     const rsType = `${entityType}AddRs`;
     const retName = `${entityType}Ret`;
@@ -1412,6 +1538,20 @@ export class QBSessionManager {
     this.assertWritable(
       `updateClearedStatus(${params.txnId}${params.txnLineId ? `:${params.txnLineId}` : ""})`
     );
+    return this.updateClearedStatusCore(params);
+  }
+
+  /**
+   * Private cleared-status primitive without the read-only gate. Symmetric to
+   * `addEntityCore` — see that comment. Used by `updateClearedStatusDryRun`.
+   */
+  private async updateClearedStatusCore(
+    params: {
+      txnId: string;
+      clearedStatus: "Cleared" | "NotCleared" | "Pending";
+      txnLineId?: string;
+    }
+  ): Promise<Record<string, unknown>> {
     const xml = buildClearedStatusModRequest(params, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
     const data = extractResponseData(response, "ClearedStatusModRs");
@@ -1432,6 +1572,17 @@ export class QBSessionManager {
     listIdOrTxnId: string
   ): Promise<Record<string, unknown>> {
     this.assertWritable(`deleteEntity(${entityType})`);
+    return this.deleteEntityCore(entityType, listIdOrTxnId);
+  }
+
+  /**
+   * Private delete primitive without the read-only gate. Symmetric to
+   * `addEntityCore` — see that comment. Used by `deleteEntityDryRun`.
+   */
+  private async deleteEntityCore(
+    entityType: string,
+    listIdOrTxnId: string
+  ): Promise<Record<string, unknown>> {
     const xml = buildDeleteRequest(entityType, listIdOrTxnId, this.config.qbxmlVersion);
     const response = await this.sendRequest(xml);
     // Kept in sync with buildDeleteRequest's isTransaction list in
@@ -1462,6 +1613,383 @@ export class QBSessionManager {
     const rsType = isTransaction ? "TxnDelRs" : "ListDelRs";
     const data = extractResponseData(response, rsType);
     return Array.isArray(data) ? data[0] ?? {} : data;
+  }
+
+  // -------------------------------------------------------------------------
+  // Dry-run primitives (Phase 14 #64)
+  // -------------------------------------------------------------------------
+  //
+  // Composition decisions (DECISIONS.md 2026-05-20 entry for Phase 14 #64):
+  //
+  //   1. Read-only × dry-run = ALLOW. Dry-run is observationally a read; an
+  //      audit-mode operator can preview what a write would do without
+  //      changing the read-only contract. The dry-run primitives below do
+  //      NOT call `assertWritable` — they delegate to the private `*Core`
+  //      methods which skip the gate.
+  //
+  //   2. Idempotency × dry-run = PEEK, never write to cache. Same-key +
+  //      same-fingerprint reports `wouldReplay: true` with the cached
+  //      result; same-key + different-fingerprint reports `wouldSucceed:
+  //      false, statusCode: 9002`. Dry-run results are NEVER persisted to
+  //      the idempotency cache (the dry-run itself isn't a successful
+  //      create — it's a preview of what a create WOULD do).
+  //
+  //   3. Live mode preview = option (b): envelope + payload validation
+  //      only, no entity-after preview. The sim store doesn't mirror live
+  //      QuickBooks data, so a sim-oracle preview against a fresh seed
+  //      would be misleading. Live dry-run returns `previewSupported:
+  //      false` with the built QBXML envelope and a human-readable note.
+  //
+  // Implementation:
+  //   - Sim mode: snapshot the store → run the operation via the private
+  //     `*Core` method (no read-only gate) → restore the snapshot in a
+  //     `finally` block so the rollback runs even when the previewed
+  //     operation throws. Failures from `extractResponseData` (sim store
+  //     rejected the request — e.g. 3120 unknown parent, 3170 stale
+  //     EditSequence) are caught and surfaced as `wouldSucceed: false`
+  //     with the carried statusCode/statusMessage.
+  //   - Live mode: build the envelope and return it; do NOT hit the wire.
+  //
+  // The `qbxmlEnvelope` field is populated in BOTH modes — useful for the
+  // agent to inspect the exact XML that would be sent, regardless of
+  // whether the sim oracle ran.
+
+  /**
+   * Result shape returned by every single-entity dry-run primitive
+   * (`addEntityDryRun` / `modifyEntityDryRun` / `deleteEntityDryRun` /
+   * `updateClearedStatusDryRun`). See section comment above for the design
+   * decisions that drive this shape.
+   *
+   * Field semantics:
+   *   - `committed: false` — invariant. A dry-run never commits.
+   *   - `mode` — which session mode this preview was produced under.
+   *   - `previewSupported` — true in sim mode (entity-after preview ran),
+   *     false in live mode (envelope only, no preview oracle).
+   *   - `qbxmlEnvelope` — the built QBXML request string. Populated in both
+   *     modes so the agent can inspect what would be sent.
+   *   - `wouldSucceed` — sim mode: true if the preview ran cleanly through
+   *     the sim store, false if the sim store rejected. Live mode: absent.
+   *   - `entity` — sim mode + wouldSucceed:true OR wouldReplay:true: the
+   *     entity-after-mutation (the *Ret block from the sim response, or the
+   *     cached idempotent result for replay). Absent in live mode and on
+   *     the failure / no-preview branches.
+   *   - `statusCode` / `statusMessage` — sim mode + wouldSucceed:false:
+   *     carried from the sim-store rejection or the idempotency conflict.
+   *   - `wouldReplay` — present and `true` when the idempotency PEEK hit
+   *     with a same-fingerprint cached result. The real call would short-
+   *     circuit and return that cached result; the dry-run reports this so
+   *     the agent knows.
+   *   - `note` — human-readable disclaimer. Set in live mode to explain
+   *     why previewSupported:false.
+   */
+  // (interface declared at file scope below the class — see exports)
+
+  /**
+   * Dry-run preview of `addEntity` (Phase 14 #64). Returns what would
+   * happen if `addEntity` (or `addEntityIdempotent` when `idempotencyKey`
+   * is supplied) were called, without committing anything.
+   *
+   * Behavior matrix:
+   *   - Sim mode, no key: snapshot → addEntityCore → restore. Returns
+   *     `{wouldSucceed: true, entity}` or `{wouldSucceed: false,
+   *     statusCode, statusMessage}` depending on whether the sim store
+   *     accepted.
+   *   - Sim mode, key + miss: same as no-key path. The cache is NOT
+   *     populated (dry-run never writes to the idempotency cache).
+   *   - Sim mode, key + hit + same fingerprint: returns the cached entity
+   *     with `wouldReplay: true` (no sim call). The REAL call would short-
+   *     circuit on the same hit.
+   *   - Sim mode, key + hit + different fingerprint: returns
+   *     `{wouldSucceed: false, statusCode: 9002, statusMessage}`. Matches
+   *     what the real `addEntityIdempotent` would throw — surfaced as a
+   *     structured result rather than a throw so dry-run failures are
+   *     uniform.
+   *   - Live mode: envelope build only, `previewSupported: false`. The
+   *     idempotency PEEK still runs (the cache is per-process), so live
+   *     dry-run CAN report wouldReplay / 9002 conflict without wire I/O.
+   *
+   * Does NOT call assertWritable — a read-only session can dry-run-add
+   * fine. See Decision 1 in the section comment above.
+   */
+  async addEntityDryRun(
+    entityType: string,
+    data: Record<string, unknown>,
+    idempotencyKey?: string,
+  ): Promise<DryRunResult> {
+    const xml = buildAddRequest(entityType, data, this.config.qbxmlVersion);
+
+    if (idempotencyKey) {
+      const cached = this.idempotencyCache.get(idempotencyKey);
+      if (cached) {
+        const fingerprint = fingerprintPayload(entityType, data);
+        if (
+          cached.entityType === entityType &&
+          cached.payloadFingerprint === fingerprint
+        ) {
+          return this.makeDryRunResult({
+            qbxmlEnvelope: xml,
+            wouldSucceed: true,
+            wouldReplay: true,
+            entity: cached.result as Record<string, unknown>,
+          });
+        }
+        return this.makeDryRunResult({
+          qbxmlEnvelope: xml,
+          wouldSucceed: false,
+          statusCode: 9002,
+          statusMessage:
+            `Idempotency key conflict: '${idempotencyKey}' was previously used for a ` +
+            `${cached.entityType} create with a different request payload. Use a fresh key ` +
+            `for new requests, or replay with the exact original payload to retrieve ` +
+            `the cached result.`,
+        });
+      }
+    }
+
+    if (!this.simulationMode) {
+      return this.makeDryRunResult({ qbxmlEnvelope: xml });
+    }
+
+    return this.previewInSim(xml, () => this.addEntityCore(entityType, data));
+  }
+
+  /**
+   * Dry-run preview of `modifyEntity`. Same shape as `addEntityDryRun` but
+   * no idempotency parameter — modify is not cached. See `addEntityDryRun`
+   * for the design rationale.
+   */
+  async modifyEntityDryRun(
+    entityType: string,
+    data: Record<string, unknown>,
+  ): Promise<DryRunResult> {
+    const xml = buildModRequest(entityType, data, this.config.qbxmlVersion);
+
+    if (!this.simulationMode) {
+      return this.makeDryRunResult({ qbxmlEnvelope: xml });
+    }
+
+    return this.previewInSim(xml, () => this.modifyEntityCore(entityType, data));
+  }
+
+  /**
+   * Dry-run preview of `deleteEntity`. The sim preview returns the *DelRs
+   * block (TxnID/ListID echo, TimeDeleted, etc.) on wouldSucceed:true.
+   */
+  async deleteEntityDryRun(
+    entityType: string,
+    listIdOrTxnId: string,
+  ): Promise<DryRunResult> {
+    const xml = buildDeleteRequest(entityType, listIdOrTxnId, this.config.qbxmlVersion);
+
+    if (!this.simulationMode) {
+      return this.makeDryRunResult({ qbxmlEnvelope: xml });
+    }
+
+    return this.previewInSim(xml, () =>
+      this.deleteEntityCore(entityType, listIdOrTxnId),
+    );
+  }
+
+  /**
+   * Dry-run preview of `updateClearedStatus`. No idempotency — same as the
+   * real call (cleared-status is naturally idempotent so the cache isn't
+   * applied at the real-call level either).
+   */
+  async updateClearedStatusDryRun(
+    params: {
+      txnId: string;
+      clearedStatus: "Cleared" | "NotCleared" | "Pending";
+      txnLineId?: string;
+    },
+  ): Promise<DryRunResult> {
+    const xml = buildClearedStatusModRequest(params, this.config.qbxmlVersion);
+
+    if (!this.simulationMode) {
+      return this.makeDryRunResult({ qbxmlEnvelope: xml });
+    }
+
+    return this.previewInSim(xml, () => this.updateClearedStatusCore(params));
+  }
+
+  /**
+   * Dry-run preview of `executeBatchAdd`. Returns a DryRunBatchResult — the
+   * single-entity shape with `entity` swapped for `results` (the
+   * positionally-aligned per-entry outcome array). Idempotency PEEK uses
+   * the `Batch:{entityType}` cache key namespace, mirroring
+   * `executeBatchAddIdempotent`.
+   *
+   * wouldSucceed semantics: sim preview reports true only if EVERY entry
+   * would post cleanly (no failed/skipped slots). This matches the real
+   * `executeBatchAddIdempotent` caching rule (only fully-successful batches
+   * are cached) so a dry-run with `wouldSucceed: true` accurately predicts
+   * the real call would cache.
+   */
+  async executeBatchAddDryRun(
+    entityType: string,
+    entries: Record<string, unknown>[],
+    idempotencyKey?: string,
+  ): Promise<DryRunBatchResult> {
+    if (entries.length === 0) {
+      return {
+        committed: false,
+        mode: this.simulationMode ? "simulation" : "live",
+        previewSupported: this.simulationMode,
+        qbxmlEnvelope: "",
+        wouldSucceed: true,
+        results: [],
+        ...(this.simulationMode ? {} : { note: DRY_RUN_LIVE_NOTE }),
+      };
+    }
+
+    const rqType = `${entityType}AddRq`;
+    const addKey = `${entityType}Add`;
+    const requests = entries.map((data, i) => ({
+      type: rqType,
+      requestID: String(i + 1),
+      body: { [addKey]: data },
+    }));
+    const xml = buildQBXMLRequest({
+      version: this.config.qbxmlVersion ?? "16.0",
+      requests,
+    });
+
+    if (idempotencyKey) {
+      const cacheEntityType = `Batch:${entityType}`;
+      const cached = this.idempotencyCache.get(idempotencyKey);
+      if (cached) {
+        const fingerprint = fingerprintPayload(cacheEntityType, entries);
+        if (
+          cached.entityType === cacheEntityType &&
+          cached.payloadFingerprint === fingerprint
+        ) {
+          return {
+            committed: false,
+            mode: this.simulationMode ? "simulation" : "live",
+            previewSupported: this.simulationMode,
+            qbxmlEnvelope: xml,
+            wouldSucceed: true,
+            wouldReplay: true,
+            results: cached.result as Awaited<
+              ReturnType<QBSessionManager["executeBatchAdd"]>
+            >,
+            ...(this.simulationMode ? {} : { note: DRY_RUN_LIVE_NOTE }),
+          };
+        }
+        return {
+          committed: false,
+          mode: this.simulationMode ? "simulation" : "live",
+          previewSupported: this.simulationMode,
+          qbxmlEnvelope: xml,
+          wouldSucceed: false,
+          statusCode: 9002,
+          statusMessage:
+            `Idempotency key conflict: '${idempotencyKey}' was previously used for a ` +
+            `${cached.entityType} create with a different request payload. Use a fresh key ` +
+            `for new requests, or replay with the exact original payload to retrieve ` +
+            `the cached result.`,
+          ...(this.simulationMode ? {} : { note: DRY_RUN_LIVE_NOTE }),
+        };
+      }
+    }
+
+    if (!this.simulationMode) {
+      return {
+        committed: false,
+        mode: "live",
+        previewSupported: false,
+        qbxmlEnvelope: xml,
+        note: DRY_RUN_LIVE_NOTE,
+      };
+    }
+
+    const snap = this.store.snapshot();
+    try {
+      const results = await this.executeBatchAddCore(entityType, entries);
+      const wouldSucceed = results.every((r) => r.status === "posted");
+      return {
+        committed: false,
+        mode: "simulation",
+        previewSupported: true,
+        qbxmlEnvelope: xml,
+        wouldSucceed,
+        results,
+      };
+    } catch (err) {
+      if (err instanceof QBXMLResponseError) {
+        return {
+          committed: false,
+          mode: "simulation",
+          previewSupported: true,
+          qbxmlEnvelope: xml,
+          wouldSucceed: false,
+          statusCode: err.statusCode,
+          statusMessage: err.message,
+        };
+      }
+      throw err;
+    } finally {
+      this.store.restore(snap);
+    }
+  }
+
+  /**
+   * Internal: run a sim-mode preview (snapshot → operation → restore) for
+   * the single-entity dry-run primitives. Centralizes the snapshot/restore
+   * try/finally + the QBXMLResponseError classification so the public
+   * dry-run methods stay tight.
+   */
+  private async previewInSim(
+    qbxmlEnvelope: string,
+    operation: () => Promise<Record<string, unknown>>,
+  ): Promise<DryRunResult> {
+    const snap = this.store.snapshot();
+    try {
+      const entity = await operation();
+      return {
+        committed: false,
+        mode: "simulation",
+        previewSupported: true,
+        qbxmlEnvelope,
+        wouldSucceed: true,
+        entity,
+      };
+    } catch (err) {
+      if (err instanceof QBXMLResponseError) {
+        return {
+          committed: false,
+          mode: "simulation",
+          previewSupported: true,
+          qbxmlEnvelope,
+          wouldSucceed: false,
+          statusCode: err.statusCode,
+          statusMessage: err.message,
+        };
+      }
+      // Non-QBXML errors (build failures, programmer errors) indicate a
+      // bug, not a "your call would fail" outcome. Re-throw so the tool's
+      // catch block surfaces them via formatToolError.
+      throw err;
+    } finally {
+      this.store.restore(snap);
+    }
+  }
+
+  /**
+   * Internal: shape a DryRunResult for the live-mode (envelope-only) path
+   * and the idempotency PEEK paths. Always sets `committed: false` and
+   * fills in `mode` / `previewSupported` / `note` from the current
+   * simulation flag.
+   */
+  private makeDryRunResult(
+    partial: Omit<DryRunResult, "committed" | "mode" | "previewSupported" | "note">,
+  ): DryRunResult {
+    return {
+      committed: false,
+      mode: this.simulationMode ? "simulation" : "live",
+      previewSupported: this.simulationMode,
+      ...(this.simulationMode ? {} : { note: DRY_RUN_LIVE_NOTE }),
+      ...partial,
+    };
   }
 
   // -------------------------------------------------------------------------

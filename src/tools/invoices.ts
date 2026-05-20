@@ -270,7 +270,7 @@ export function registerInvoiceTools(
 
   server.tool(
     "qb_invoice_create",
-    "Create a new invoice in QuickBooks Desktop.",
+    "Create a new invoice in QuickBooks Desktop. Pass `dryRun: true` to preview what would happen without committing (sim mode returns the entity-after-mutation including derived Subtotal and customer balance side effects; live mode returns the built QBXML envelope only).",
     {
       customerName: z.string().optional().describe("Customer full name"),
       customerListId: z.string().optional().describe("Customer ListID"),
@@ -281,6 +281,7 @@ export function registerInvoiceTools(
       lines: z.array(invoiceLineSchema).optional()
         .describe("Invoice line items"),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate invoice (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview what this call WOULD do without committing. Sim mode: returns the entity-after-mutation (including computed Subtotal and Customer.Balance side effects) plus the built QBXML envelope; the sim store is rolled back so no observable side effect remains. Live mode: returns the built QBXML envelope + a `note` explaining that entity-after preview isn't available against real QB data (previewSupported: false). Composes with idempotencyKey and readOnly mode — see qb_customer_add's dryRun docs for the full composition matrix. Dry-run never writes to the idempotency cache."),
     },
     async (args) => {
       const session = getSession();
@@ -325,6 +326,26 @@ export function registerInvoiceTools(
           if (line.amount !== undefined) lineData.Amount = line.amount;
           return lineData;
         });
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun("Invoice", data, args.idempotencyKey);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { invoice: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "InvoiceAddRq dry-run failed" });
+        }
       }
 
       try {
@@ -668,12 +689,32 @@ export function registerInvoiceTools(
 
   server.tool(
     "qb_invoice_delete",
-    "Delete an invoice from QuickBooks Desktop. WARNING: Irreversible.",
+    "Delete an invoice from QuickBooks Desktop. WARNING: Irreversible. Pass `dryRun: true` to preview the deletion (sim mode confirms the txn would be removed and reports Customer.Balance reversal effects; live mode returns the built QBXML envelope only).",
     {
       txnId: z.string().describe("TxnID of the invoice to delete"),
+      dryRun: z.boolean().optional().describe("If true, preview the deletion without committing. Sim mode: returns the *DelRs confirmation block (the TxnID echo, TxnDelType, TimeDeleted) plus the built QBXML envelope; the sim store is rolled back, so the source invoice and any Customer.Balance side effects are unchanged after the call. Live mode: returns the built QBXML envelope + a `note` (previewSupported: false). Composes with readOnly — dry-run is observationally a read, so a read-only session can dry-run-delete fine."),
     },
-    async ({ txnId }) => {
+    async ({ txnId, dryRun }) => {
       const session = getSession();
+      if (dryRun) {
+        try {
+          const preview = await session.deleteEntityDryRun("Invoice", txnId);
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { deleted: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "TxnDelRq (Invoice) dry-run failed" });
+        }
+      }
       try {
         const result = await session.deleteEntity("Invoice", txnId);
         return {

@@ -51,6 +51,54 @@ export class SimulationStore {
   }
 
   // -----------------------------------------------------------------------
+  // Snapshot / restore (Phase 14 #64 — dry-run mode)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Capture the full mutable state of the store for later restoration. Used
+   * by the manager's dry-run primitives (`addEntityDryRun` / `modifyEntityDryRun`
+   * / `deleteEntityDryRun` / `executeBatchAddDryRun` / `updateClearedStatusDryRun`)
+   * to preview a mutation against the sim store and then roll back, leaving
+   * no observable side effect.
+   *
+   * Deep-clones BOTH the nested Maps and the StoredEntity objects they hold
+   * (entities are mutated in-place by handleAdd/handleMod — e.g. Customer.Balance
+   * is incremented on Invoice add, line *Ret blocks are appended on transaction
+   * add). A shallow Map clone would leak those mutations through restore.
+   *
+   * Map iteration order is insertion order, so the clone preserves seed
+   * iteration which several tests pin against. `structuredClone` handles
+   * nested arrays / dates / nulls / nested objects without needing per-entity
+   * shape knowledge.
+   */
+  snapshot(): { stores: Map<string, EntityStore>; idCounter: number } {
+    const clonedStores = new Map<string, EntityStore>();
+    for (const [entityType, store] of this.stores) {
+      const clonedStore: EntityStore = new Map();
+      for (const [id, entity] of store) {
+        clonedStore.set(id, structuredClone(entity));
+      }
+      clonedStores.set(entityType, clonedStore);
+    }
+    return { stores: clonedStores, idCounter: this.idCounter };
+  }
+
+  /**
+   * Restore a previously-captured snapshot, discarding any mutations made
+   * since. Used by the dry-run primitives in `try/finally` so the rollback
+   * runs even when the previewed operation throws (e.g. doomed-entity case
+   * where handleAdd returns a non-zero statusCode and addEntityCore throws
+   * via extractResponseData).
+   *
+   * Swaps both fields atomically. The snapshot is consumed (not re-cloned) —
+   * callers should not retain the snapshot after restore.
+   */
+  restore(snap: { stores: Map<string, EntityStore>; idCounter: number }): void {
+    this.stores = snap.stores;
+    this.idCounter = snap.idCounter;
+  }
+
+  // -----------------------------------------------------------------------
   // Request processing
   // -----------------------------------------------------------------------
 
@@ -2861,6 +2909,36 @@ export class SimulationStore {
       entity.FullName = String(addData.Name);
     }
 
+    // Phase 13 #62 — Customer hierarchy. Real QB derives a sub-customer's
+    // FullName as `Parent:Child` and stamps Sublevel = parent.Sublevel + 1.
+    // Sim mirrors: resolve ParentRef.ListID against the Customer store,
+    // override FullName, hydrate ParentRef.FullName from the parent, and
+    // set Sublevel from the parent chain. Top-level customers (no ParentRef)
+    // get Sublevel 0. Unknown parent ListID rejects with 3120 BEFORE persist.
+    if (entityType === "Customer") {
+      const parentRef = entity.ParentRef as Record<string, unknown> | undefined;
+      if (parentRef && parentRef.ListID) {
+        const parentListId = String(parentRef.ListID);
+        const parent = store.get(parentListId);
+        if (!parent) {
+          return {
+            type: rsType,
+            statusCode: 3120,
+            statusSeverity: "Error",
+            statusMessage: `Object "${parentListId}" specified in the request cannot be found. QuickBooks error message: Invalid argument.  The specified record does not exist in the list.`,
+            data: {},
+          };
+        }
+        const parentFullName = String(parent.FullName ?? parent.Name ?? "");
+        const childName = String(addData.Name ?? "");
+        entity.FullName = `${parentFullName}:${childName}`;
+        entity.Sublevel = Number(parent.Sublevel ?? 0) + 1;
+        entity.ParentRef = { ListID: parentListId, FullName: parentFullName };
+      } else {
+        entity.Sublevel = 0;
+      }
+    }
+
     // Bank-affecting txns get an explicit NotCleared default on creation
     // (matches real QB — every new check / deposit / transfer / CC charge
     // starts uncleared and flips to Cleared via the reconciliation flow).
@@ -5341,6 +5419,7 @@ export class SimulationStore {
         Name: "Acme Corporation",
         FullName: "Acme Corporation",
         IsActive: true,
+        Sublevel: 0,
         CompanyName: "Acme Corporation",
         FirstName: "John",
         LastName: "Smith",
@@ -5382,6 +5461,7 @@ export class SimulationStore {
         Name: "Global Industries",
         FullName: "Global Industries",
         IsActive: true,
+        Sublevel: 0,
         CompanyName: "Global Industries LLC",
         FirstName: "Jane",
         LastName: "Doe",
@@ -5405,6 +5485,7 @@ export class SimulationStore {
         Name: "TechStart Solutions",
         FullName: "TechStart Solutions",
         IsActive: true,
+        Sublevel: 0,
         CompanyName: "TechStart Solutions Inc",
         FirstName: "Alex",
         LastName: "Johnson",
@@ -5414,6 +5495,81 @@ export class SimulationStore {
         TotalBalance: 3200.00,
         EditSequence: now,
         TimeCreated: "2024-03-10T11:00:00",
+        TimeModified: now,
+      },
+      // Phase 13 #62 — Sub-customers (jobs) of Acme Corporation. Common
+      // CPA-firm pattern: each engagement (audit / tax / quarterly review)
+      // gets its own job under the umbrella client so time + reimbursable
+      // expense + invoices can be scoped per engagement while the parent
+      // holds the consolidated AR. Jobs carry Balance: 0 — AR rolls up to
+      // the parent in this seed. ParentRef.FullName is the parent's full
+      // name; FullName is `Parent:Child` syntax (matches real QB).
+      {
+        ListID: "80000001-1234567891",
+        Name: "2024 Audit",
+        FullName: "Acme Corporation:2024 Audit",
+        IsActive: true,
+        Sublevel: 1,
+        ParentRef: {
+          ListID: "80000001-1234567890",
+          FullName: "Acme Corporation",
+        },
+        Balance: 0,
+        TotalBalance: 0,
+        EditSequence: now,
+        TimeCreated: "2024-01-15T09:15:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "80000001-1234567892",
+        Name: "2024 Tax Prep",
+        FullName: "Acme Corporation:2024 Tax Prep",
+        IsActive: true,
+        Sublevel: 1,
+        ParentRef: {
+          ListID: "80000001-1234567890",
+          FullName: "Acme Corporation",
+        },
+        Balance: 0,
+        TotalBalance: 0,
+        EditSequence: now,
+        TimeCreated: "2024-01-15T09:20:00",
+        TimeModified: now,
+      },
+      {
+        ListID: "80000001-1234567893",
+        Name: "Q3 Review",
+        FullName: "Acme Corporation:Q3 Review",
+        IsActive: true,
+        Sublevel: 1,
+        ParentRef: {
+          ListID: "80000001-1234567890",
+          FullName: "Acme Corporation",
+        },
+        Balance: 0,
+        TotalBalance: 0,
+        EditSequence: now,
+        TimeCreated: "2024-07-01T09:00:00",
+        TimeModified: now,
+      },
+      // One sub-sub-customer under the audit engagement — exercises the
+      // recursive descendant walk in qb_customer_jobs and the multi-level
+      // Sublevel chain (audit at 1 → fieldwork at 2). Real engagements
+      // often split into planning / fieldwork / wrap-up phases.
+      {
+        ListID: "80000001-1234567894",
+        Name: "Fieldwork Phase 1",
+        FullName: "Acme Corporation:2024 Audit:Fieldwork Phase 1",
+        IsActive: true,
+        Sublevel: 2,
+        ParentRef: {
+          ListID: "80000001-1234567891",
+          FullName: "Acme Corporation:2024 Audit",
+        },
+        Balance: 0,
+        TotalBalance: 0,
+        EditSequence: now,
+        TimeCreated: "2024-01-20T09:00:00",
         TimeModified: now,
       },
     ];

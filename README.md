@@ -9,13 +9,14 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
 
-## Tools (146 total)
+## Tools (147 total)
 
 ### Customers
 | Tool | Description |
 |------|-------------|
-| `qb_customer_list` | List/search customers with filters |
-| `qb_customer_add` | Create a new customer |
+| `qb_customer_list` | List/search customers with filters. `parentListID` / `jobOnly` POST-FILTERS surface sub-customer hierarchy (matches past the first batch may be missed under `paginate`). |
+| `qb_customer_jobs` | List the sub-customers (jobs) of a given parent. Pre-flight parent resolution via `parentListId` \| `parentName` (mutually exclusive). `recursive: true` walks descendants by FullName-prefix match. Returns parent context + jobs sorted by Sublevel then FullName. |
+| `qb_customer_add` | Create a new customer. Pass `parentListId` to create a SUB-CUSTOMER (job) — sim derives `FullName = Parent:Child` and `Sublevel = parent.Sublevel + 1`. Supports `dryRun: true` (Phase 14 #64) — previews the would-be customer without committing. |
 | `qb_customer_update` | Update customer details |
 | `qb_customer_delete` | Delete a customer |
 
@@ -48,10 +49,10 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 | Tool | Description |
 |------|-------------|
 | `qb_invoice_list` | List/search invoices with date/status filters. Pass `includeLineItems: true` for per-line breakdown, `includeCustomFields: true` for `DataExtRet`, `includeCustomerContact: true` to attach a `customerContact` sub-object (Email / Phone / CompanyName / FirstName / LastName / etc.) to every invoice via a single follow-up `CustomerQueryRq` — replaces the per-customer `qb_customer_list` lookup the collection-email workflow used to require. |
-| `qb_invoice_create` | Create an invoice with line items |
+| `qb_invoice_create` | Create an invoice with line items. Supports `dryRun: true` (Phase 14 #64) — previews the entity-after-mutation (incl. computed Subtotal and Customer.Balance side effects) without committing. |
 | `qb_invoice_batch_create` | Post 1–100 invoices atomically in one envelope (`onError=stopOnError`). Each entry follows the `qb_invoice_create` shape. Upfront customer-ref validation rejects the whole batch before any wire I/O on a missing `customerName`/`customerListId`; mid-wire failures trigger compensating delete of any prior-posted invoices in REVERSE post order (Customer.Balance reverses via the underlying `handleTxnDel`). Per-entry status: `posted` / `rolled-back` / `orphaned` (rollback delete itself failed — clean up via `qb_invoice_delete` with the surfaced TxnID) / `failed` / `skipped`. Use for monthly retainer billing, recurring subscription invoicing, end-of-month time-and-materials runs. Optional `idempotencyKey` fingerprints the whole entries list. |
 | `qb_invoice_update` | Modify an existing invoice. Pass `txnId` + `editSequence` plus any header fields and/or replacement `lines: [{txnLineID?, itemName?, itemListId?, description?, quantity?, rate?, amount?}]`. Header-only mods leave existing lines untouched. Customer balance adjusts by `newBalanceRemaining - oldBalanceRemaining` (or full reverse-then-apply if `customerName` / `customerListId` re-points the invoice). |
-| `qb_invoice_delete` | Delete an invoice |
+| `qb_invoice_delete` | Delete an invoice. Supports `dryRun: true` (Phase 14 #64) — previews the deletion (the *DelRs confirmation block) without committing; the source invoice remains in place after a dry-run call. |
 | `qb_invoice_duplicate` | Duplicate an existing invoice. Pass `sourceTxnId`; the tool reads the source's `CustomerRef` + lines (and optional `ClassRef` / `TermsRef` / `SalesRepRef` / `PORefNumber`) and submits a fresh `InvoiceAddRq` with that payload. Defaults: `TxnDate` → today, `DueDate` / `RefNumber` → unset (avoids ref-number collisions on monthly retainer flows), `Memo` → `"Duplicate of <source ref or TxnID>"`. Operator overrides win: `txnDate`, `dueDate`, `refNumber`, `memo`, `customerName` / `customerListId` (retarget at a different customer). Workflow stand-in for QB Desktop's memorized-template "Use" command (which the QBXML SDK doesn't expose). |
 | `qb_invoice_write_off` | Close an open invoice in one atomic call without collecting payment. Pass `txnId` + `writeOffAccount` (e.g. "Bad Debt"); the tool reads the source invoice and submits a $0 `ReceivePayment` whose `AppliedToTxnAdd` carries `DiscountAmount` = the invoice's full `BalanceRemaining` (or `amount` for a partial) posting to the named P&L account. The invoice's `BalanceRemaining` drops, `IsPaid` flips on full write-off, and the customer's open AR drops by the written-off amount. Same mechanism as QB Desktop's "Discounts and Credits" dialog on the Receive Payments form, but single-call. Optional `txnDate`, `refNumber`, `memo`, `depositToAccountName` flow through to the underlying `ReceivePayment`. |
 
@@ -446,7 +447,7 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 └─────────────┘                    │                      │
                                     │  ┌────────────────┐  │
                                     │  │ Tool Registry   │  │     QBXML
-                                    │  │ (146 tools)     │──│──────────────┐
+                                    │  │ (147 tools)     │──│──────────────┐
                                     │  └────────────────┘  │              │
                                     │  ┌────────────────┐  │    ┌─────────▼─────────┐
                                     │  │ QBXML Builder   │  │    │ QuickBooks Desktop │
