@@ -2,12 +2,25 @@
 
 A **Model Context Protocol (MCP)** server that provides comprehensive tools for managing client books in QuickBooks Desktop via the QBXML SDK.
 
+> **AI agents connecting to this server: read [SKILL.md](SKILL.md) first.** It's a runtime-agnostic usage guide covering the patterns (idempotency, dry-run, read-only sessions, caching, pagination, status codes) that an agent needs to operate safely. The in-server `instructions` block surfaces per-tool detail; SKILL.md surfaces the cross-cutting patterns. Drop it into Claude, GPT, opencode, Cursor, or any other MCP-capable agent runtime.
+
 ## Overview
 
 This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, translating tool calls into QBXML messages — the standard XML-based protocol for QuickBooks Desktop SDK communication. It supports two operating modes:
 
 - **Live mode** — Communicates with a real QuickBooks Desktop instance via the QBXMLRP2 request processor (requires Windows + QuickBooks Desktop installed)
 - **Simulation mode** — In-memory mock data store for development, testing, and non-Windows environments (default)
+
+## Documentation map
+
+| File | Audience | What it covers |
+|------|----------|----------------|
+| [SKILL.md](SKILL.md) | **AI agents using the server** | Runtime-agnostic usage patterns, critical conventions (idempotency, dry-run, read-only, caching, pagination), status code table, common workflows |
+| [README.md](README.md) (this file) | Humans setting it up | Full tool table, install + build, MCP host configuration, mode resolution |
+| [CLAUDE.md](CLAUDE.md) | AI coding agents extending the server | Project operating system — session lifecycle, handoff protocol, governance rules |
+| [HANDOFF.md](HANDOFF.md) | The next coding session | Short-term continuity — what just shipped, what to verify, what's next |
+| [DECISIONS.md](DECISIONS.md) | Anyone touching load-bearing patterns | Architectural decision log with rationale |
+| [REQUIREMENTS.md](REQUIREMENTS.md) | Product-level reasoning | What the server must do for the operator |
 
 ## Tools (150 total)
 
