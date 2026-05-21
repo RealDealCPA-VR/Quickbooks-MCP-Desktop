@@ -445,6 +445,62 @@ export interface DryRunBatchResult {
   note?: string;
 }
 
+/**
+ * Spec for a single operation inside a composite dry-run (Phase 14 #64b).
+ * Tool layer builds these from the same payload it'd use for the real-call
+ * path; the manager owns the snapshot/restore + ordering semantics.
+ */
+export type CompositeOpSpec =
+  | { kind: "add"; entityType: string; data: Record<string, unknown> }
+  | { kind: "modify"; entityType: string; data: Record<string, unknown> }
+  | { kind: "delete"; entityType: string; listIdOrTxnId: string };
+
+/**
+ * Per-op outcome inside a `DryRunCompositeResult`. Positionally aligned with
+ * the input `specs` array.
+ *
+ * Status semantics:
+ *   - `succeeded` — sim oracle ran cleanly. `entity` carries the *Ret block.
+ *   - `failed`   — sim oracle rejected. `statusCode` + `statusMessage`
+ *                  carried from the QBXMLResponseError.
+ *   - `skipped`  — earlier op in the chain failed; this op never ran. Or
+ *                  live mode (no preview oracle).
+ */
+export interface CompositeOpResult {
+  kind: "add" | "modify" | "delete";
+  entityType: string;
+  qbxmlEnvelope: string;
+  status: "succeeded" | "failed" | "skipped";
+  entity?: Record<string, unknown>;
+  statusCode?: number;
+  statusMessage?: string;
+}
+
+/**
+ * Result shape returned by `compositePreviewDryRun` — the multi-op dry-run
+ * primitive for 2+ envelope composites (Phase 14 #64b). Distinct from
+ * `DryRunResult` (single envelope) and `DryRunBatchResult` (one envelope,
+ * many requests inside).
+ *
+ * Semantics:
+ *   - `wouldSucceed` — true only when EVERY op succeeded. Skip on live mode.
+ *   - `results` — positionally aligned with the input `specs` array. On the
+ *     first failure, that op carries `status: "failed"` + status info; all
+ *     subsequent ops carry `status: "skipped"` (matches the halt-on-first-
+ *     failure semantics of real-call composites like
+ *     `qb_estimate_convert_to_invoice`).
+ *   - `previewSupported` — false in live mode (envelopes built, no oracle).
+ *   - `note` — live-mode disclaimer (same wording as single-op dry-run).
+ */
+export interface DryRunCompositeResult {
+  committed: false;
+  mode: "simulation" | "live";
+  previewSupported: boolean;
+  wouldSucceed?: boolean;
+  results: CompositeOpResult[];
+  note?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Session manager
 // ---------------------------------------------------------------------------
@@ -2022,6 +2078,120 @@ export class QBSessionManager {
       ...(this.simulationMode ? {} : { note: DRY_RUN_LIVE_NOTE }),
       ...partial,
     };
+  }
+
+  /**
+   * Composite multi-op dry-run primitive (Phase 14 #64b). Used by the
+   * convert tools (`qb_estimate_convert_to_invoice`,
+   * `qb_sales_order_convert_to_invoice`) whose real-call path emits two
+   * separate envelopes — an AddRq plus a ModRq that flips the source
+   * IsAccepted / IsManuallyClosed flag.
+   *
+   * Behavior:
+   *   - Sim mode: snapshot ONCE → run each spec's `*Core` method in order
+   *     against the shared snapshot context → restore on finally. On the
+   *     first QBXMLResponseError, mark that op `failed` and mark every
+   *     subsequent op `skipped` (mirrors halt-on-first-failure semantics of
+   *     the real convert tools). `wouldSucceed` = every op succeeded.
+   *   - Live mode: build every envelope, return them all with
+   *     `status: "skipped"` and `previewSupported: false`. No wire I/O.
+   *
+   * Idempotency PEEK is intentionally NOT folded in here — the convert
+   * tools' real-call path only applies idempotency to the AddRq half (the
+   * ModRq half is unconditionally skipped on replay). Tool layer is the
+   * right place to do that PEEK + replay routing because the policy is
+   * per-tool.
+   *
+   * Read-only sessions ALLOW composite dry-run (same matrix as the single-
+   * op primitives — read-only × dry-run is observationally a read).
+   */
+  async compositePreviewDryRun(
+    specs: CompositeOpSpec[],
+  ): Promise<DryRunCompositeResult> {
+    const envelopes = specs.map((spec) => {
+      if (spec.kind === "add") {
+        return buildAddRequest(spec.entityType, spec.data, this.config.qbxmlVersion);
+      }
+      if (spec.kind === "modify") {
+        return buildModRequest(spec.entityType, spec.data, this.config.qbxmlVersion);
+      }
+      return buildDeleteRequest(spec.entityType, spec.listIdOrTxnId, this.config.qbxmlVersion);
+    });
+
+    if (!this.simulationMode) {
+      return {
+        committed: false,
+        mode: "live",
+        previewSupported: false,
+        results: specs.map((spec, i) => ({
+          kind: spec.kind,
+          entityType: spec.entityType,
+          qbxmlEnvelope: envelopes[i],
+          status: "skipped",
+        })),
+        note: DRY_RUN_LIVE_NOTE,
+      };
+    }
+
+    const results: CompositeOpResult[] = [];
+    const snap = this.store.snapshot();
+    let halted = false;
+    try {
+      for (let i = 0; i < specs.length; i++) {
+        const spec = specs[i];
+        const envelope = envelopes[i];
+        if (halted) {
+          results.push({
+            kind: spec.kind,
+            entityType: spec.entityType,
+            qbxmlEnvelope: envelope,
+            status: "skipped",
+          });
+          continue;
+        }
+        try {
+          let entity: Record<string, unknown>;
+          if (spec.kind === "add") {
+            entity = await this.addEntityCore(spec.entityType, spec.data);
+          } else if (spec.kind === "modify") {
+            entity = await this.modifyEntityCore(spec.entityType, spec.data);
+          } else {
+            entity = await this.deleteEntityCore(spec.entityType, spec.listIdOrTxnId);
+          }
+          results.push({
+            kind: spec.kind,
+            entityType: spec.entityType,
+            qbxmlEnvelope: envelope,
+            status: "succeeded",
+            entity,
+          });
+        } catch (err) {
+          if (err instanceof QBXMLResponseError) {
+            results.push({
+              kind: spec.kind,
+              entityType: spec.entityType,
+              qbxmlEnvelope: envelope,
+              status: "failed",
+              statusCode: err.statusCode,
+              statusMessage: err.message,
+            });
+            halted = true;
+          } else {
+            throw err;
+          }
+        }
+      }
+      const wouldSucceed = results.every((r) => r.status === "succeeded");
+      return {
+        committed: false,
+        mode: "simulation",
+        previewSupported: true,
+        wouldSucceed,
+        results,
+      };
+    } finally {
+      this.store.restore(snap);
+    }
   }
 
   // -------------------------------------------------------------------------

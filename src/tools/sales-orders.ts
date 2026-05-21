@@ -404,6 +404,7 @@ export function registerSalesOrderTools(
       invoiceMemo: z.string().optional()
         .describe("Memo for the new invoice. Default: 'Converted from sales order <ref>'."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original invoice without creating a duplicate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open. Note: only the InvoiceAdd half of this tool is keyed; the IsManuallyClosed flip on the source order is not (a replay returns the original invoice without re-attempting the flip)."),
+      dryRun: z.boolean().optional().describe("If true, preview the convert without committing. Both envelopes (InvoiceAdd + SalesOrderMod) are built and previewed in sequence inside ONE shared sim-store snapshot — operator sees the entity-after for the new invoice AND the would-be-closed source order. Live mode builds both envelopes (no wire I/O); previewSupported:false. LIMITATION: dry-run does NOT preview idempotent replay — the InvoiceAdd half is always previewed as a fresh call regardless of idempotencyKey (real-call replay routing happens on the live path only)."),
     },
     async (args) => {
       const session = getSession();
@@ -496,6 +497,58 @@ export function registerSalesOrderTools(
           if (line.ClassRef) lineData.ClassRef = line.ClassRef;
           return lineData;
         });
+      }
+
+      if (args.dryRun) {
+        const specs: import("../session/manager.js").CompositeOpSpec[] = [
+          { kind: "add", entityType: "Invoice", data: invoiceData },
+        ];
+        if (args.markClosed !== false) {
+          const soModData: Record<string, unknown> = {
+            TxnID: args.salesOrderTxnId,
+            IsManuallyClosed: true,
+          };
+          if (salesOrder.EditSequence !== undefined) {
+            soModData.EditSequence = salesOrder.EditSequence;
+          }
+          specs.push({ kind: "modify", entityType: "SalesOrder", data: soModData });
+        }
+        try {
+          const preview = await session.compositePreviewDryRun(specs);
+          const addResult = preview.results[0];
+          const modResult = preview.results[1];
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                committed: preview.committed,
+                mode: preview.mode,
+                previewSupported: preview.previewSupported,
+                ...(preview.wouldSucceed !== undefined ? { wouldSucceed: preview.wouldSucceed } : {}),
+                ...(preview.note ? { note: preview.note } : {}),
+                qbxmlEnvelopes: preview.results.map((r) => r.qbxmlEnvelope),
+                invoiceAdd: {
+                  status: addResult.status,
+                  ...(addResult.entity ? { invoice: addResult.entity } : {}),
+                  ...(addResult.statusCode !== undefined ? { statusCode: addResult.statusCode } : {}),
+                  ...(addResult.statusMessage ? { statusMessage: addResult.statusMessage } : {}),
+                },
+                salesOrderMod: modResult
+                  ? {
+                    status: modResult.status,
+                    ...(modResult.entity ? { salesOrder: modResult.entity } : {}),
+                    ...(modResult.statusCode !== undefined ? { statusCode: modResult.statusCode } : {}),
+                    ...(modResult.statusMessage ? { statusMessage: modResult.statusMessage } : {}),
+                  }
+                  : { status: "skipped", reason: "markClosed: false" },
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "Convert-sales-order-to-invoice dry-run failed" });
+        }
       }
 
       let invoice: Record<string, unknown>;

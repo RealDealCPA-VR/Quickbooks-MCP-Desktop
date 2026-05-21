@@ -345,6 +345,7 @@ export function registerEstimateTools(
       invoiceMemo: z.string().optional()
         .describe("Memo for the new invoice. Default: 'Converted from estimate <ref>'."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original invoice without creating a duplicate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open. Note: only the InvoiceAdd half of this tool is keyed; the IsAccepted flip on the source estimate is not (a replay returns the original invoice without re-attempting the flip)."),
+      dryRun: z.boolean().optional().describe("If true, preview the convert without committing. Both envelopes (InvoiceAdd + EstimateMod) are built and previewed in sequence inside ONE shared sim-store snapshot — operator sees the entity-after for the new invoice AND the would-be-marked source estimate. Live mode builds both envelopes (no wire I/O); previewSupported:false. LIMITATION: dry-run does NOT preview idempotent replay — the InvoiceAdd half is always previewed as a fresh call regardless of idempotencyKey (real-call replay routing happens on the live path only). To verify what a replay would do, run the real call once and inspect the response."),
     },
     async (args) => {
       const session = getSession();
@@ -439,6 +440,58 @@ export function registerEstimateTools(
           if (line.ClassRef) lineData.ClassRef = line.ClassRef;
           return lineData;
         });
+      }
+
+      if (args.dryRun) {
+        const specs: import("../session/manager.js").CompositeOpSpec[] = [
+          { kind: "add", entityType: "Invoice", data: invoiceData },
+        ];
+        if (args.markAccepted !== false) {
+          const estimateModData: Record<string, unknown> = {
+            TxnID: args.estimateTxnId,
+            IsAccepted: true,
+          };
+          if (estimate.EditSequence !== undefined) {
+            estimateModData.EditSequence = estimate.EditSequence;
+          }
+          specs.push({ kind: "modify", entityType: "Estimate", data: estimateModData });
+        }
+        try {
+          const preview = await session.compositePreviewDryRun(specs);
+          const addResult = preview.results[0];
+          const modResult = preview.results[1];
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                committed: preview.committed,
+                mode: preview.mode,
+                previewSupported: preview.previewSupported,
+                ...(preview.wouldSucceed !== undefined ? { wouldSucceed: preview.wouldSucceed } : {}),
+                ...(preview.note ? { note: preview.note } : {}),
+                qbxmlEnvelopes: preview.results.map((r) => r.qbxmlEnvelope),
+                invoiceAdd: {
+                  status: addResult.status,
+                  ...(addResult.entity ? { invoice: addResult.entity } : {}),
+                  ...(addResult.statusCode !== undefined ? { statusCode: addResult.statusCode } : {}),
+                  ...(addResult.statusMessage ? { statusMessage: addResult.statusMessage } : {}),
+                },
+                estimateMod: modResult
+                  ? {
+                    status: modResult.status,
+                    ...(modResult.entity ? { estimate: modResult.entity } : {}),
+                    ...(modResult.statusCode !== undefined ? { statusCode: modResult.statusCode } : {}),
+                    ...(modResult.statusMessage ? { statusMessage: modResult.statusMessage } : {}),
+                  }
+                  : { status: "skipped", reason: "markAccepted: false" },
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "Convert-estimate-to-invoice dry-run failed" });
+        }
       }
 
       let invoice: Record<string, unknown>;

@@ -247,6 +247,7 @@ export function registerSalesReceiptTools(
         .max(100)
         .describe("Array of sales receipts to post atomically (1–100). Each entry needs customerName or customerListId."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key for the WHOLE BATCH. Retrying with the same key + identical receipts list returns the original batch outcome without re-running the wire envelope (response carries idempotentReplay: true). Reordering, adding, or removing entries makes the request a different request — that returns statusCode 9002 (use a fresh key). Cache is per company file and clears on qb_company_open. CAVEAT: only fully-successful batches are cached. The upfront customer-ref validation gate runs before the idempotency check (entries missing a customer ref are rejected and not cached regardless of key); partial-failure batches are also not cached — fresh retry is the correct recovery (rollback already cleaned up the originally-posted receipts; orphans, if any, are surfaced to the operator on the failing call)."),
+      dryRun: z.boolean().optional().describe("If true, preview the batch without committing. See qb_invoice_batch_create's dryRun docs for the full composition matrix. The compensating-rollback path is NOT previewed — if the sim oracle reports any `failed` slot, the real call would auto-delete every earlier `posted` slot before that index."),
     },
     async (args) => {
       // Upfront customer-ref validation — same pattern as qb_invoice_batch_create.
@@ -313,6 +314,28 @@ export function registerSalesReceiptTools(
         }
         return data;
       });
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.executeBatchAddDryRun(
+            "SalesReceipt",
+            dataList,
+            args.idempotencyKey,
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...preview,
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "Batch SalesReceiptAddRq dry-run failed" });
+        }
+      }
 
       let results;
       let batchReplayed = false;
@@ -594,6 +617,7 @@ export function registerSalesReceiptTools(
         .describe("Override the deposit account (e.g. 'Undeposited Funds', 'Operating Checking'). Default: source receipt's DepositToAccountRef (carried when present)."),
       idempotencyKey: z.string().min(1).optional()
         .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview the duplicate sales receipt without committing. Pre-flight (source read) runs as normal; the SalesReceiptAdd half is previewed via addEntityDryRun against a snapshot that rolls back. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -688,6 +712,31 @@ export function registerSalesReceiptTools(
           if (line.ClassRef) lineData.ClassRef = line.ClassRef;
           return lineData;
         });
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun(
+            "SalesReceipt",
+            receiptData,
+            args.idempotencyKey,
+          );
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                sourceTxnId: args.sourceTxnId,
+                ...(entity ? { salesReceipt: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "SalesReceiptAddRq (duplicate) dry-run failed" });
+        }
       }
 
       try {

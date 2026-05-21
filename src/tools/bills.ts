@@ -538,6 +538,7 @@ export function registerBillTools(
         .describe("Retarget the duplicate at a different vendor by ListID. Default: source bill's VendorRef."),
       idempotencyKey: z.string().min(1).optional()
         .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview the duplicate bill without committing. Pre-flight (source read) runs as normal; the BillAdd half is previewed via addEntityDryRun against a snapshot that rolls back. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -640,6 +641,31 @@ export function registerBillTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun(
+            "Bill",
+            billData,
+            args.idempotencyKey,
+          );
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                sourceTxnId: args.sourceTxnId,
+                ...(entity ? { bill: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "BillAddRq (duplicate) dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("Bill", billData, args.idempotencyKey)
@@ -684,6 +710,7 @@ export function registerBillTools(
       apAccountName: z.string().optional()
         .describe("Accounts Payable account full name (defaults to the operator's standard AP account)"),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original result without creating a duplicate bill payment (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview the bill payment without committing. Sim mode runs the BillPaymentCheck/CC AddRq against a snapshot and surfaces the previewed payment plus the bill-side AmountDue reductions; the snapshot rolls back so no observable side effect remains. Unknown bill TxnIDs in applyTo surface as a sim oracle 3120 failure on the dry-run. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -738,6 +765,30 @@ export function registerBillTools(
         args.paymentMethod === "check"
           ? "BillPaymentCheck"
           : "BillPaymentCreditCard";
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun(
+            entityType,
+            data,
+            args.idempotencyKey,
+          );
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                ...(entity ? { billPayment: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: `${entityType}AddRq dry-run failed` });
+        }
+      }
 
       try {
         const { entity: result, replayed } = args.idempotencyKey

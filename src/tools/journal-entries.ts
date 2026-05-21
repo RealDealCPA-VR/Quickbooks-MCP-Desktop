@@ -224,6 +224,7 @@ export function registerJournalEntryTools(
         .max(100)
         .describe("Array of journal entries to post atomically (1–100). Each entry's debits must equal credits to the cent."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key for the WHOLE BATCH. Retrying with the same key + identical entries list returns the original batch outcome without re-running the wire envelope (response carries idempotentReplay: true). Reordering, adding, or removing entries makes the request a different request — that returns statusCode 9002 (use a fresh key). Cache is per company file and clears on qb_company_open. CAVEAT: only fully-successful batches are cached. The upfront balance-validation gate runs before the idempotency check (unbalanced batches are rejected and not cached regardless of key); partial-failure batches are also not cached — fresh retry is the correct recovery (rollback already cleaned up the originally-posted entries; orphans, if any, are surfaced to the operator on the failing call)."),
+      dryRun: z.boolean().optional().describe("If true, preview the batch without committing. See qb_invoice_batch_create's dryRun docs for the full composition matrix. Balance validation still runs upfront on dry-run (an unbalanced entry never reaches the preview). The compensating-rollback path is NOT previewed — if the sim oracle reports any `failed` slot, the real call would auto-delete every earlier `posted` slot before that index."),
     },
     async (args) => {
       // Upfront per-entry balance validation. Bailing here keeps the envelope
@@ -269,6 +270,28 @@ export function registerJournalEntryTools(
         data.JournalCreditLineAdd = e.credits.map(buildJELineAdd);
         return data;
       });
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.executeBatchAddDryRun(
+            "JournalEntry",
+            dataList,
+            args.idempotencyKey,
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...preview,
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "Batch JournalEntryAddRq dry-run failed" });
+        }
+      }
 
       let results;
       let batchReplayed = false;
@@ -519,6 +542,7 @@ export function registerJournalEntryTools(
         .describe("Override the adjusting-entry flag. Default: source JE's IsAdjustment value (carried)."),
       idempotencyKey: z.string().min(1).optional()
         .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview the duplicate journal entry without committing. Pre-flight (source read) runs as normal; the JournalEntryAdd half is previewed via addEntityDryRun against a snapshot that rolls back. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -597,6 +621,31 @@ export function registerJournalEntryTools(
           : [];
       if (sourceCredits.length > 0) {
         jeData.JournalCreditLineAdd = sourceCredits.map(mapLineRet);
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun(
+            "JournalEntry",
+            jeData,
+            args.idempotencyKey,
+          );
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                sourceTxnId: args.sourceTxnId,
+                ...(entity ? { journalEntry: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "JournalEntryAddRq (duplicate) dry-run failed" });
+        }
       }
 
       try {

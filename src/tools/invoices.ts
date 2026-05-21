@@ -465,6 +465,7 @@ export function registerInvoiceTools(
         .max(100)
         .describe("Array of invoices to post atomically (1–100). Each entry needs customerName or customerListId."),
       idempotencyKey: z.string().min(1).optional().describe("Optional client-supplied idempotency key for the WHOLE BATCH. Retrying with the same key + identical invoices list returns the original batch outcome without re-running the wire envelope (response carries idempotentReplay: true). Reordering, adding, or removing entries makes the request a different request — that returns statusCode 9002 (use a fresh key). Cache is per company file and clears on qb_company_open. CAVEAT: only fully-successful batches are cached. The upfront customer-ref validation gate runs before the idempotency check (entries missing a customer ref are rejected and not cached regardless of key); partial-failure batches are also not cached — fresh retry is the correct recovery (rollback already cleaned up the originally-posted invoices; orphans, if any, are surfaced to the operator on the failing call)."),
+      dryRun: z.boolean().optional().describe("If true, preview the batch without committing. Sim mode: every entry runs through the sim oracle against a snapshot; the response carries `wouldSucceed` + per-entry results (`posted` / `failed` / `skipped`) and the snapshot rolls back so no observable side effect remains. Live mode: builds the QBXML envelope but does NOT hit the wire (previewSupported: false). The compensating-rollback path is NOT previewed — if the sim oracle reports any `failed` slot, the real call would auto-delete every earlier `posted` slot before that index. See qb_customer_add's dryRun docs for the full composition matrix (read-only ALLOW, idempotency PEEK)."),
     },
     async (args) => {
       // Upfront customer-ref validation. Bailing here keeps the envelope off
@@ -528,6 +529,28 @@ export function registerInvoiceTools(
         }
         return data;
       });
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.executeBatchAddDryRun(
+            "Invoice",
+            dataList,
+            args.idempotencyKey,
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...preview,
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "Batch InvoiceAddRq dry-run failed" });
+        }
+      }
 
       let results;
       let batchReplayed = false;
@@ -846,6 +869,7 @@ export function registerInvoiceTools(
         .describe("Retarget the duplicate at a different customer by ListID. Default: source invoice's CustomerRef."),
       idempotencyKey: z.string().min(1).optional()
         .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original duplicate without creating a second one (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview the duplicate invoice without committing. Pre-flight (source read) runs as normal; the InvoiceAdd half is previewed via addEntityDryRun against a snapshot that rolls back. See qb_customer_add's dryRun docs for the full composition matrix."),
     },
     async (args) => {
       const session = getSession();
@@ -952,6 +976,31 @@ export function registerInvoiceTools(
         });
       }
 
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun(
+            "Invoice",
+            invoiceData,
+            args.idempotencyKey,
+          );
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                sourceTxnId: args.sourceTxnId,
+                ...(entity ? { invoice: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "InvoiceAddRq (duplicate) dry-run failed" });
+        }
+      }
+
       try {
         const { entity: result, replayed } = args.idempotencyKey
           ? await session.addEntityIdempotent("Invoice", invoiceData, args.idempotencyKey)
@@ -1002,6 +1051,7 @@ export function registerInvoiceTools(
         .describe("Optional 'Deposit To' account on the underlying ReceivePayment. The write-off itself posts to writeOffAccount; this field exists because real QB requires every ReceivePayment to name a deposit account even when TotalAmount is 0. Defaults to your QB file's configured Undeposited Funds / default deposit account."),
       idempotencyKey: z.string().min(1).optional()
         .describe("Optional client-supplied idempotency key. Retrying with the same key + same payload returns the original write-off without creating a duplicate (response carries idempotentReplay: true). Same key + different payload returns statusCode 9002. Cache is per company file and clears on qb_company_open."),
+      dryRun: z.boolean().optional().describe("If true, preview the write-off without committing. Pre-flight (source-read + balance gate) runs as normal; the underlying ReceivePaymentAdd half is previewed via addEntityDryRun. Sim mode returns the previewed payment + the source-invoice diff that would result. Live mode returns the QBXML envelope without wire I/O. See qb_customer_add's dryRun docs for the full composition matrix (read-only ALLOW, idempotency PEEK)."),
     },
     async (args) => {
       const session = getSession();
@@ -1131,6 +1181,36 @@ export function registerInvoiceTools(
       if (args.refNumber) data.RefNumber = args.refNumber;
       if (args.depositToAccountName) {
         data.DepositToAccountRef = { FullName: args.depositToAccountName };
+      }
+
+      if (args.dryRun) {
+        try {
+          const preview = await session.addEntityDryRun(
+            "ReceivePayment",
+            data,
+            args.idempotencyKey,
+          );
+          const { entity, ...rest } = preview;
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                dryRun: true,
+                ...rest,
+                sourceTxnId: args.txnId,
+                writeOff: {
+                  amount: writeOffAmount,
+                  account: args.writeOffAccount,
+                  memo,
+                },
+                ...(entity ? { payment: entity } : {}),
+              }, null, 2),
+            }],
+          };
+        } catch (err) {
+          return formatToolError(err, { fallbackMessage: "ReceivePaymentAdd (write-off) dry-run failed" });
+        }
       }
 
       try {

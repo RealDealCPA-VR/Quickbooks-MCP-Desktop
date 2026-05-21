@@ -117,7 +117,8 @@
       "PowerShell(\"\" | & node \"c:/Users/VR/Projects/Quickbooks MCP Desktop/dist/index.js\"; \"EXIT=$LASTEXITCODE\")",
       "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $out)",
       "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $out | Select-String -Pattern \"Mode:|Company file:|stdio|tools\" | ForEach-Object { $_.ToString\\(\\) })",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 6; \"ExitCode: $LASTEXITCODE\")"
     ]
   }
 }
