@@ -118,7 +118,11 @@
       "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $out)",
       "PowerShell($out = \"\" | & node \"c:\\\\Users\\\\VR\\\\Projects\\\\Quickbooks MCP Desktop\\\\dist\\\\index.js\" 2>&1; \"EXIT=$LASTEXITCODE\"; $out | Select-String -Pattern \"Mode:|Company file:|stdio|tools\" | ForEach-Object { $_.ToString\\(\\) })",
       "Bash(echo \"exit=$?\")",
-      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 6; \"ExitCode: $LASTEXITCODE\")"
+      "PowerShell(\"\" | & node dist/index.js 2>&1 | Select-Object -First 6; \"ExitCode: $LASTEXITCODE\")",
+      "PowerShell(\"---EXITCODE---\")",
+      "PowerShell($LASTEXITCODE)",
+      "PowerShell(node dist/cli/doctor.js)",
+      "PowerShell($content = Get-Content \"README.md\" -Raw; \"Total lines: $\\(\\(Get-Content README.md\\).Count\\)\"; \"5-minute install anchors check:\"; [regex]::Matches\\($content, '#5-minute-install|#environment-variables|#mode-resolution-matrix|#4-windows--live-mode-swap-the-env-block'\\).Count; \"Section headers present:\"; \\([regex]::Matches\\($content, '^## 5-minute install|^### 1\\\\. Prerequisites|^### 2\\\\. Pick|^### 3\\\\. Wire|^### 4\\\\. Windows|^### 5\\\\. Environment|^### 6\\\\. Smoke', 'Multiline'\\)\\).Value)"
     ]
   }
 }

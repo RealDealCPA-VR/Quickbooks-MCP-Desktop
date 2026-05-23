@@ -1,61 +1,59 @@
 # Handoff State
 
-_Last updated: 2026-05-22. **No code changes this session — pure hygiene + planning.** todo.md compressed ~13× (80K tokens → ~6K) with all 90 closed items + headlines preserved. **New Phase 19 — Delivery and ease of use** scoped with 6 unchecked items (#87–92) covering npm packaging, MCP host install templates, auto-launch QB Desktop on `qb_company_open`, and CLI doctor command. Tests still **1647** (+0). Tool count still **150**._
+_Last updated: 2026-05-23. **#89 closed.** Phase 19 remaining: #88, #90, #91, #92. Tests still **1647** (61 files, +0 — pure docs change). Tool count still **150**. After three forward-motion sessions in a row (#87 mech + #91 stub + this one), the operator-facing onboarding path is now self-serve: an MCP-host user can copy one block and have a working server in five minutes. Live-publish (#88) is the next mechanical step; #89 unblocks "here is the install command" copy in #88's release notes._
 
 ## Last Session Summary
 
-- **todo.md aggressively truncated.** Every closed item's 50–300 word `_(Closed YYYY-MM-DD. ...)_` annotation was compressed to a single short sentence (date + key file pointer + counts where load-bearing + pointer to DECISIONS.md when applicable). Headlines kept verbatim so the "what was this item" question remains answerable from the file alone. Deep play-by-play implementation context lives where it always did: DECISIONS.md (dated entries), HANDOFF.md (last session), and inline source comments. The file went from 167 lines / ~432KB / 80K tokens (over the Read tool's 25K limit, required paging) to 173 lines / ~25KB / ~6K tokens (loads in one Read).
-- **Recovered two items missed during the rewrite** — #85 (`qb_closing_date_get` + `_set` informational stub, **9005** synthetic statusCode) and #86 (MCP prompts via `prompts/workflows.ts`), both closed 2026-05-12. Phase 19 numbering shifted from 85–90 to **87–92** to avoid collision.
-- **New Phase 19 — Delivery and ease of use** scoped with 6 items, ordered cost-to-value:
-  - **#87** Add `bin` entry + `prepare` script to `package.json` (one-line unlock for #88).
-  - **#88** Publish to npm — **decision needed**: scoped (`@valentino/quickbooks-desktop-mcp`) vs unscoped, public vs private.
-  - **#89** "5-minute install" README section with config-block templates per MCP host (Claude Desktop / Cursor / opencode / Windsurf / generic) + full env-var matrix.
-  - **#90** Auto-launch QB Desktop on `qb_company_open({ launchIfClosed: true })` — the multi-client question's missing piece. Spawn `qbw32.exe` with the `.qbw` path, poll for QBXMLRP2 attach success, then retry `BeginSession`. Open design questions documented inline: executable-path detection, behavior when QB has a different file open, multi-user lock state.
-  - **#91** `quickbooks-desktop-mcp doctor` CLI — env-probe with ✓/✗ remediation hints (Node version, platform, QB Desktop installed, QBXMLRP2 COM registration, env vars, winax rebuild status).
-  - **#92** (Low) Windows installer via `pkg`/`oclif` — non-CLI accountant reach; gated on signing-cert cost.
+- **Closed #89.** Added new `## 5-minute install` section ([README.md](README.md) lines 25–145) directly after the Documentation map. Six subsections: prereqs, install paths (npm / GitHub / local-clone), 5 host blocks (Claude Desktop, Cursor, opencode, Windsurf, generic stdio), live-mode env swap, env-var quick-ref table, smoke test. All host blocks use `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop` so they work today on git-deps (#87 wired the `bin` entry + `prepare` script that makes this possible); the npm path lists `npx -y quickbooks-desktop-mcp` for when #88 publishes.
+- **Slimmed the old Setup section's host blocks.** The opencode + Claude Desktop config blocks under `## Setup` (lines 666–684) collapsed to a pointer at the new section, keeping just the local-clone-with-absolute-path variant for developer-mode setup. No duplicated env-var docs.
+- **Anchor-link gotcha fixed mid-edit.** GitHub-flavored markdown strips `+` and em-dashes from headings, then collapses adjacent spaces into double-hyphens. First-draft heading "### 4. Windows + live mode — swap the env block" would have generated anchor `#4-windows--live-mode--swap-the-env-block` (two double-hyphens). Renamed to "### 4. Live mode (Windows)" → clean anchor `#4-live-mode-windows`. Both `[§4](...)` cross-references (in the new §3 and in the trimmed Setup pointer) updated.
+- **Verification clean.** `npm run build` exit 0. `npm test` → 61 files / 1647 tests passed (unchanged — pure docs change). README grew 595 → 727 lines (+132). All 6 new subsection headers present; 5 internal anchor links wired.
 
 ## Verify Before Continuing
 
-- [ ] `npm run build` → exit 0 (no code touched this session — should still pass).
+- [ ] `npm run build` → exit 0.
 - [ ] `npm test` → `Test Files 61 passed | Tests 1647 passed`.
-- [ ] `"" | & node dist/index.js` → exit 0, `Mode: simulation` banner printed.
-- [ ] Skim the new [todo.md](todo.md) — confirm every phase header and item number you remember is still present. Headlines preserved verbatim from the old file; close-notes intentionally compressed.
-- [ ] (Optional) Verify the count: `git show HEAD:todo.md | grep -c "^- \[x\]"` should return 90; current `todo.md` should also return 90 closed + 6 unchecked.
+- [ ] [README.md](README.md) — `## 5-minute install` section is present near the top (right after the Documentation map table, before `## Tools (150 total)`); six subsections rendered: Prerequisites, Pick an install path, Wire up your MCP host, Live mode (Windows), Environment variable quick reference, Smoke test.
+- [ ] [README.md](README.md) — the old `### Configure as MCP server (opencode.jsonc)` + `### Configure for Claude Desktop` blocks under `## Setup` are gone; replaced by a brief pointer + local-clone variant.
+- [ ] Skim [todo.md](todo.md) — confirm #89 now `[x]`; Phase 19 remaining items are #88, #90, #91, #92 (4 unchecked).
 - [ ] **(Windows + QB) carried** — all live spot-checks from prior handoffs (#74 cache layer, #73 autoExhaust, #64a + #64b dry-run, #63 / #66 / #61–65, plus the 18-item legacy bucket).
+- [ ] **(npm-publish prep, defer to #88)** — when implementing #88, add a `files` field to [package.json](package.json) restricting the tarball to `["dist", "README.md", "LICENSE"]` (and create LICENSE if missing). Without this the publish would ship `node_modules`, `src/`, `tests/`, and `.env` if present.
 
 ## Next Task
 
-**Pick one of these Phase 19 items:**
+**Operator should pick from remaining Phase 19 items. Four left.**
 
-- [ ] **#87.** Add `bin` entry to package.json so users can `npx quickbooks-desktop-mcp` once published. One-line change: `"bin": { "quickbooks-desktop-mcp": "dist/index.js" }`. Also add a `prepare` script that runs `npm run build` so consumers installing as a git dep get a built `dist/`. Pre-req for #88.
+- [ ] **#88.** Publish to npm. Still blocks on: public unscoped `quickbooks-desktop-mcp` vs scoped `@valentino/quickbooks-desktop-mcp` (public or private). When implementing, also add a `files: ["dist", "README.md", "LICENSE"]` field so the tarball is clean. Configure GitHub Actions for `npm publish` on tag. Confirm name availability with `npm view quickbooks-desktop-mcp` before publishing. **Once published, do a one-line README sweep:** change `github:RealDealCPA-VR/Quickbooks-MCP-Desktop` → `quickbooks-desktop-mcp` (or the scoped name) in every code block under `## 5-minute install` (5 host blocks + the smoke-test `doctor` invocation = 6 places). The §2 install-path table already lists both forms so that row stays.
 
-- [ ] **#88.** Publish to npm. Decide scope (`@valentino/quickbooks-desktop-mcp` vs unscoped `quickbooks-desktop-mcp`); verify name availability; configure GitHub Actions for `npm publish` on tag. Enables MCP host config blocks like `"command": "npx", "args": ["-y", "quickbooks-desktop-mcp"]` rather than requiring `git clone` + `npm install` + absolute path to `dist/index.js`. **Decision needed: public or private package?**
+- [ ] **#90.** Auto-launch QB Desktop on `qb_company_open`. Meatier feature, 4 design questions still open: (a) exe-path detection (registry vs `QB_DESKTOP_EXE` vs fallback chain); (b) conflicting-file behavior (UI automation to close vs fail clearly); (c) multi-user lock surfacing; (d) sim no-op confirmation.
 
-- [ ] **#90.** Auto-launch QB Desktop on `qb_company_open` — extend the tool with `launchIfClosed: boolean` (default false; explicit opt-in). When true: if the wire layer reports the target file isn't open, spawn QB Desktop with the `.qbw` as a process arg, poll for QBXMLRP2 attach success (up to ~30s with exponential backoff), then retry `BeginSession`. Closes the operator's "ask about a different client's books" loop end-to-end. **Design questions** (must answer before implementing): (a) executable-path detection — registry lookup vs `QB_DESKTOP_EXE` env override vs fallback chain; (b) behavior when QB Desktop already has a DIFFERENT file open (QB serializes — close current via UI automation? fail clearly?); (c) multi-user QB lock state surfacing; (d) sim mode = no-op.
+- [ ] **#91.** Flesh out the doctor probes. Stub file already exists at [src/cli/doctor.ts](src/cli/doctor.ts). Add the 7 probes listed in the stub's comment block; exit 0 if all green, 1 if any fail, 2 if a probe couldn't run. Each `✗` needs a one-line remediation hint. **Note:** the §6 smoke test in the new install section references the doctor command — once #91 lands, the parenthetical "currently a stub that exits 2" callout in [README.md](README.md) §6 should be removed.
 
-Operator suggested ordering in last exchange: **#87 + #88 paired** as the cheap unlock, OR **#90 standalone** since that's the meatier feature behind the multi-book question. Operator deferred the choice — pick whichever fits the available session time.
+- [ ] **#92.** Windows installer. Low priority; signing cert ($200-400/yr) is the gating decision.
 
 ## Context Notes
 
-- **No code changed this session.** The build / test / sim-banner verification chain from the prior handoff still holds. If `npm run build` fails today, something OTHER than this session broke it — investigate accordingly.
+- **GitHub-anchor algorithm gotcha.** Lowercase + strip punctuation (keeps word chars / spaces / hyphens) + replace spaces with hyphens. `+`, `.`, and em-dashes (`—`) all get stripped to nothing — but their surrounding spaces remain, collapsing into multi-hyphens. "### 4. Windows + live mode — swap the env block" → `#4-windows--live-mode--swap-the-env-block` (two double-hyphens). When adding new internal anchor targets, prefer punctuation-free headings or test the generated anchor before linking.
 
-- **todo.md is no longer the source of truth for "why was this built."** It became too verbose. The new file is a navigable INDEX of what shipped + a planning surface for what hasn't. Deep context lives in:
-  - [DECISIONS.md](DECISIONS.md) — dated entries pinning load-bearing design tradeoffs (read-only gate composition, idempotency cache scope, dry-run live-mode strategy, etc.). Don't repeat decisions; reference the entry by date.
+- **`npx -y github:OWNER/REPO` is load-bearing for the install section.** #87 wired the `bin` + `prepare: npm run build` script in `package.json`. When npm/git installs the package from a GitHub URL it runs `prepare`, which builds `dist/`, and then resolves the `bin` entry matching the package name (`quickbooks-desktop-mcp` → `dist/index.js`). The second bin (`quickbooks-desktop-mcp-doctor`) is invoked by name as a second arg: `npx -y github:... quickbooks-desktop-mcp-doctor`. Confirmed: this is the form used in the §6 smoke test.
+
+- **GitHub repo URL is `https://github.com/RealDealCPA-VR/Quickbooks-MCP-Desktop`.** Used in the §2 install-path table and every §3 host block. Confirmed via `git remote -v`. If the repo moves or is renamed under a different org for #88 / publish, sweep these 7 places ([README.md](README.md) §2 + §3 × 5 + §6 smoke test).
+
+- **§4 (live-mode env swap) is deliberately one shared block, not five copies.** Operators read the host blocks in §3, find theirs, then jump to §4 to swap the env. This keeps the section to one page and avoids 5× duplication of the same Windows path. If operators get confused, the alternative is to inline live + sim variants per host (would 2× the section's length).
+
+- **Two consecutive no-code sessions broken, then THREE forward-motion sessions in a row.** 2026-05-23 morning: #87 (bin + stub). 2026-05-23 midday: this one (#89). Next session has 4 Phase 19 items left. Two are pure-mechanical (#89 just shipped is one analog), two need product decisions (#88 publish-scope, #90 4 open design questions). If operator stalls again, **#91 (doctor probes)** is the no-decision-required forward-motion option since the stub's comment block already enumerates exactly what to build.
+
+- **todo.md is an INDEX, not a source of truth** for "why was this built." Deep context lives in:
+  - [DECISIONS.md](DECISIONS.md) — dated entries pinning load-bearing design tradeoffs.
   - [HANDOFF.md](HANDOFF.md) — short-term session continuity (this file).
-  - Inline source comments — implementation detail. Tool descriptions carry per-tool quirks and limitations.
+  - Inline source comments + tool descriptions — per-tool quirks and limitations.
   - [tests/](tests/) — behavioral pin for every load-bearing invariant.
 
-- **Two items recovered during cleanup** — #85 (`qb_closing_date_*`) and #86 (MCP prompts) were missed on the first pass. Both closed 2026-05-12 and verified to exist via `git show HEAD:todo.md | grep ^- \\[x\\]`. The Phase 19 items consequently start at **#87, not #85** — important for any new item numbering. Always grep the file for the next free number before adding a new item.
+- **Phase 19 numbering starts at #87** (not #85). Items #85 `qb_closing_date_*` and #86 MCP prompts were recovered during the 2026-05-22 cleanup and closed 2026-05-12. Always grep for the next free number before adding a new item.
 
-- **Phase 19 #88 (npm publish) blocks on a product decision** that hasn't been made: is this server going to be public (anyone can `npx quickbooks-desktop-mcp`) or private (operator-only)? Both are technically straightforward; the cost is the choice. **Ask the operator before doing #88.** #87 ships independently of that decision — `bin` works for local installs too.
-
-- **Phase 19 #90 (auto-launch) is the multi-book story.** The current architecture already supports multi-book switching via `qb_company_open` + `switchCompanyFile` — the new wrinkle is just covering the case where the operator asks about a book QuickBooks Desktop doesn't currently have loaded. QBXMLRP2 cannot OPEN a `.qbw` (load-bearing constraint pinned in DECISIONS.md and every prior HANDOFF). The auto-launch path bypasses that by spawning QB Desktop with the file as a CLI argument.
-
-- **Phase 19 #91 (doctor CLI) ships alongside #87.** If you wire `bin` for #87, add `doctor` as a sibling entry now to avoid touching `package.json` twice: `"bin": { "quickbooks-desktop-mcp": "dist/index.js", "quickbooks-desktop-mcp-doctor": "dist/cli/doctor.js" }` (file doesn't exist yet — create when implementing).
-
-- **Carried gotchas** (unchanged from prior handoff):
-  - QBXMLRP2 cannot OPEN a `.qbw` — only attach to one QB Desktop has already loaded. **#90 directly addresses this.**
-  - Live verification requires `C:\nvm4w\nodejs\node.exe` v20.20.2 (system PATH v22 breaks winax).
+- **Carried gotchas** (unchanged from prior handoffs):
+  - QBXMLRP2 cannot OPEN a `.qbw` — only attach to one QB Desktop has already loaded. **#90 directly addresses this.** _(Now documented in the new README §1 prereqs so operators discover this before failing.)_
+  - Live verification requires `C:\nvm4w\nodejs\node.exe` v20.20.2 (system PATH v22 breaks winax). _(Now documented in the new README §1 prereqs.)_
   - `winax` is in `optionalDependencies` — non-Windows installs skip it cleanly.
   - statusCodes: 9001 read-only, 9002 idempotency conflict, 9003 edition, 9004 payroll, 9005 SDK-no-write, 9006 reserved-but-zero-emit.
   - `*Core` private methods are the chokepoint for dry-run + read-only gating — any new mutation primitive should split add/modify/delete into `*Core` + public wrapper (DECISIONS.md V1).

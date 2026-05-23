@@ -22,6 +22,148 @@ This MCP server acts as a bridge between AI agents/LLMs and QuickBooks Desktop, 
 | [DECISIONS.md](DECISIONS.md) | Anyone touching load-bearing patterns | Architectural decision log with rationale |
 | [REQUIREMENTS.md](REQUIREMENTS.md) | Product-level reasoning | What the server must do for the operator |
 
+## 5-minute install
+
+The server runs in **simulation mode** by default (in-memory mock books — works on macOS, Linux, and Windows without QB Desktop). Switch to **live mode** by setting `QB_LIVE=1` + `QB_COMPANY_FILE` on Windows with QuickBooks Desktop already running. Pick a host, paste a block, restart it.
+
+### 1. Prerequisites
+
+- **Node.js 20.x.** `winax` (the optional Windows COM binding for live mode) does not compile on Node 22+. Pin via [nvm](https://github.com/nvm-sh/nvm) (`nvm install 20 && nvm use 20`) or [nvm-windows](https://github.com/coreybutler/nvm-windows). Non-Windows + sim-only users can run any Node ≥ 18, but 20.x is the supported baseline.
+- **(Live mode only)** Windows 10/11 + QuickBooks Desktop installed, with the target `.qbw` company file already **open in QB Desktop before you start the MCP server**. QBXMLRP2 cannot open a file — it can only attach to one QB Desktop has loaded. (Tracked as #90: auto-launch on `qb_company_open`.)
+- **(Live mode only)** First run: QB Desktop pops an authorization dialog for "MCP QuickBooks Manager." Pick **"Yes, always allow access, even when QuickBooks is not running."**
+
+### 2. Pick an install path
+
+| Path | Command | When |
+|------|---------|------|
+| **npm** (post-publish — #88) | `npx -y quickbooks-desktop-mcp` | Easiest. Use once the package is published to npm. |
+| **GitHub** (works today) | `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop` | No publish required. The package's `prepare` script auto-runs `npm run build` during install. |
+| **Local clone** (developer) | `git clone … && npm install` | If you'll modify the source. Point your host config at the absolute path to `dist/index.js`. |
+
+### 3. Wire up your MCP host
+
+Pick **one** block, paste into the named config file, restart the host. Every block below defaults to **simulation mode** so non-Windows users get a working server immediately. For live mode, swap the `env` block per [§4](#4-live-mode-windows).
+
+#### Claude Desktop
+
+File: `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
+
+```json
+{
+  "mcpServers": {
+    "quickbooks-desktop": {
+      "command": "npx",
+      "args": ["-y", "github:RealDealCPA-VR/Quickbooks-MCP-Desktop"],
+      "env": {
+        "QB_SIMULATION": "true",
+        "QB_APP_NAME": "MCP QuickBooks Manager"
+      }
+    }
+  }
+}
+```
+
+#### Cursor
+
+File: project `.cursor/mcp.json` or global `~/.cursor/mcp.json`.
+
+```json
+{
+  "mcpServers": {
+    "quickbooks-desktop": {
+      "command": "npx",
+      "args": ["-y", "github:RealDealCPA-VR/Quickbooks-MCP-Desktop"],
+      "env": { "QB_SIMULATION": "true" }
+    }
+  }
+}
+```
+
+#### opencode
+
+File: project `opencode.jsonc` or global `~/.config/opencode/opencode.jsonc`.
+
+```jsonc
+{
+  "mcpServers": {
+    "quickbooks-desktop": {
+      "command": "npx",
+      "args": ["-y", "github:RealDealCPA-VR/Quickbooks-MCP-Desktop"],
+      "env": { "QB_SIMULATION": "true" }
+    }
+  }
+}
+```
+
+#### Windsurf
+
+File: `~/.codeium/windsurf/mcp_config.json`.
+
+```json
+{
+  "mcpServers": {
+    "quickbooks-desktop": {
+      "command": "npx",
+      "args": ["-y", "github:RealDealCPA-VR/Quickbooks-MCP-Desktop"],
+      "env": { "QB_SIMULATION": "true" }
+    }
+  }
+}
+```
+
+#### Generic MCP host (stdio transport)
+
+Any client that speaks MCP over stdio:
+
+```
+command: npx
+args:    ["-y", "github:RealDealCPA-VR/Quickbooks-MCP-Desktop"]
+env:
+  QB_SIMULATION: "true"
+```
+
+### 4. Live mode (Windows)
+
+To run against a real QB Desktop instance, replace the `env` object in any of the host blocks above with:
+
+```json
+"env": {
+  "QB_LIVE": "1",
+  "QB_COMPANY_FILE": "C:\\Users\\Public\\Documents\\Intuit\\QuickBooks\\Sample Company.qbw",
+  "QB_COMPANY_ROOT": "C:\\Users\\Public\\Documents\\Intuit\\QuickBooks",
+  "QB_APP_NAME": "MCP QuickBooks Manager"
+}
+```
+
+Note the **double-escaped backslashes** in JSON paths. `QB_COMPANY_ROOT` is the directory `qb_company_list` scans for additional `.qbw` files so the agent can switch books via `qb_company_open`; omit it to fall back to `dirname($QB_COMPANY_FILE)`. Open the target `.qbw` in QB Desktop first or the session will fail to attach.
+
+### 5. Environment variable quick reference
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `QB_SIMULATION` | `"true"` forces simulation (any platform); `"false"` forces live (errors if the platform can't). | unset (Windows defaults to sim unless `QB_LIVE=1`; non-Windows always sim) |
+| `QB_LIVE` | `"1"` enables live mode on Windows when `QB_SIMULATION` is unset. | unset |
+| `QB_COMPANY_FILE` | Path to the active `.qbw` company file. Required for live mode. | sample path |
+| `QB_COMPANY_ROOT` | Directory `qb_company_list` scans for switchable `.qbw` files. | `dirname($QB_COMPANY_FILE)` |
+| `QB_APP_NAME` | App identity shown in QB Desktop's authorization dialog. | `MCP QuickBooks Manager` |
+| `QB_APP_ID` | Application ID (optional — required only by some QB Desktop variants). | unset |
+| `QB_DEBUG_QBXML` | `"1"` mirrors every QBXML envelope + raw response to a per-day log file. Sensitive fields (`VendorTaxIdent`, `SSN`, `BankAccountNumber`, `CreditCardNumber`) are redacted. | unset |
+| `QB_DEBUG_LOG_PATH` | Directory the debug log writes to (file is always `qbxml-YYYYMMDD.log`). | `./logs` |
+
+See the [full Environment Variables table](#environment-variables) below for additional vars (`QB_QBXML_VERSION`, `QB_CONNECTION_MODE`) and the [Mode resolution matrix](#mode-resolution-matrix) for every (platform × env-var) combination.
+
+### 6. Smoke test
+
+Restart your MCP host. The server should register **150 tools**. From the host:
+
+- `qb_session_status` — returns the current `mode` (`sim` / `live`) and cached `hostInfo`.
+- In sim: `qb_customer_list` — returns the seed customers.
+- In live: `qb_company_info` — returns the open company's name + fiscal-year settings.
+
+If startup fails, run `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop quickbooks-desktop-mcp-doctor` for diagnostics _(probes coming in #91 — currently a stub that exits 2 with a not-yet-implemented message)_.
+
+---
+
 ## Tools (150 total)
 
 ### Customers
@@ -505,13 +647,18 @@ node scripts/verify-item23-env-matrix.mjs   # standalone — env-var/platform ma
 
 The Vitest suite imports from `src/` (verifies the source). The five `scripts/verify-*.mjs` harnesses import from `dist/` (verify the built output). Both are kept and complementary — see [DECISIONS.md](DECISIONS.md) `2026-04-27 — Vitest`.
 
-### Configure as MCP server (opencode.jsonc)
-```jsonc
+### Configure as MCP server
+
+For ready-to-paste host blocks (Claude Desktop, Cursor, opencode, Windsurf, generic stdio) using `npx`, see the [5-minute install](#5-minute-install) section above.
+
+Local-clone variant — point any host config at the absolute path to `dist/index.js`:
+
+```json
 {
   "mcpServers": {
     "quickbooks-desktop": {
       "command": "node",
-      "args": ["quickbooks-mcp/dist/index.js"],
+      "args": ["/absolute/path/to/quickbooks-mcp/dist/index.js"],
       "env": {
         "QB_SIMULATION": "true",
         "QB_APP_NAME": "MCP QuickBooks Manager"
@@ -521,21 +668,7 @@ The Vitest suite imports from `src/` (verifies the source). The five `scripts/ve
 }
 ```
 
-### Configure for Claude Desktop (claude_desktop_config.json)
-```json
-{
-  "mcpServers": {
-    "quickbooks-desktop": {
-      "command": "node",
-      "args": ["/absolute/path/to/quickbooks-mcp/dist/index.js"],
-      "env": {
-        "QB_COMPANY_FILE": "C:\\Users\\Public\\Documents\\Intuit\\QuickBooks\\MyCompany.qbw",
-        "QB_LIVE": "1"
-      }
-    }
-  }
-}
-```
+Swap to live mode by replacing `QB_SIMULATION` with `QB_LIVE: "1"` and adding `QB_COMPANY_FILE` (see [§4](#4-live-mode-windows)).
 
 ## Environment Variables
 
