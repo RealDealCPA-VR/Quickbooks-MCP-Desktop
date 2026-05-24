@@ -29,6 +29,39 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-24 — Distribution model: private GitHub repo only, no npm publish (Phase 19 #88 closed NOT-PURSUED)
+
+**Chosen:** Distribute the MCP server exclusively via the private GitHub repo `github.com/RealDealCPA-VR/Quickbooks-MCP-Desktop`. Buyers are granted access by being added as repo collaborators and install via `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop` (`bin` + `prepare: npm run build` wiring from #87 makes this work today, no publish step). **No npm publish — ever — under the current monetization model.**
+
+**Why:** The operator wants to sell access to the server (one-time purchase, granted access to the running tool, not source-code sale). Two distribution candidates were evaluated:
+
+1. **Private GitHub repo only.** Free. Access controlled at the repo collaborator level; revocation is one click. The README install path (`npx -y github:OWNER/REPO`) was already wired by #87 and works without an npm-side step. Buyer experience: get added to the repo, run `gh auth login` (or have a configured GitHub token), paste the host config block, restart.
+2. **Private npm publish + private GitHub repo (both gated).** Requires npm Pro ($7/mo) since unscoped packages MUST be public on npm and only scoped private packages exist; the scoped name would be `@realdealcpa/quickbooks-desktop-mcp`. Buyer experience: get added on npm via `npm access grant` AND on GitHub (so they can still file issues). Higher per-buyer overhead, recurring cost, no functional benefit since the GitHub repo is already private.
+
+The first option dominates the second on every axis (cost, complexity, revocation ergonomics) given the current threat model. Publishing publicly to npm was rejected because it would give the product away for free.
+
+**Alternatives rejected:**
+- **Public npm publish (`quickbooks-desktop-mcp` unscoped, or `@realdealcpa/quickbooks-desktop-mcp` public-scoped).** Maximum reach, zero per-buyer admin work, but no paywall. Only viable if monetization moves to "free tool + paid support/consulting." Operator's stated model is "purchase = access," so public is off the table.
+- **Private npm + private GitHub (both gated).** $7/mo recurring with zero added gating — buyers already need GitHub access for support/issues. Adding npm-side access doubles the per-buyer admin step (add to repo + add to npm) without buying anything.
+- **License-key gating embedded in the server (any distribution).** Heavier engineering surface: license server, key validation at startup, key revocation flow, offline-grace handling. The repo-level gate accomplishes the same thing with $0 of new code. Defer unless the threat model changes (e.g. buyers re-distributing the source they were granted access to).
+- **Windows installer distribution (#92).** Not a substitute for npm — it's an additional distribution channel targeting non-CLI users. Decision here doesn't block #92; if pursued later, the installer would bundle a built `dist/` from the private repo, signed.
+
+**Tradeoffs / consequences:**
+- **The `github:RealDealCPA-VR/Quickbooks-MCP-Desktop` form is now the PERMANENT install path** in the README — not provisional. The 5 host blocks in §3, the §2 install-path table, and the §6 smoke-test invocation no longer need the "post-publish sweep" (changing `github:OWNER/REPO` → `quickbooks-desktop-mcp`) that the #88 handoff anticipated. README §2 dropped from 3 rows (npm + GitHub + local-clone) to 2 (GitHub + local-clone).
+- **Buyers need a configured GitHub auth** (`gh auth login` or `GITHUB_TOKEN` env var) to install from a private repo via `npx`. This is one extra step versus public npm but standard developer hygiene for anyone already using MCP hosts. Not currently documented in README §1 — flag if buyer feedback surfaces confusion.
+- **No `files:` field needed in package.json**, no LICENSE-for-npm needed, no GitHub Actions for `npm publish` needed, no `npm view` name-availability check. Several #88 prep items the handoff carried (e.g. `files: ["dist", "README.md", "LICENSE"]`) are dead and should not be added "just in case."
+- **Repo rename / org move would break every buyer's install** — if `github.com/RealDealCPA-VR/Quickbooks-MCP-Desktop` is ever moved or renamed, the 7 README locations need sweeping AND every buyer needs to update their host config. GitHub redirects help but only for HTTPS pulls, not `npx -y github:OWNER/REPO` (npm's github-fetch driver doesn't follow redirects). Document this in any rename PR.
+- **Revocation is straightforward.** Remove the GitHub collaborator. Their cached `node_modules/quickbooks-desktop-mcp` keeps working until they reinstall, but they can't fetch updates. If hard revocation matters, rotate the repo OR add a startup license check (deferred per above).
+- **No marketplace presence on npm.** The product won't show up in `npm search quickbooks` results. Acceptable — discovery happens via the operator's CPA-firm channels, not npm marketplace search.
+
+**Revisit when:**
+- Buyer volume exceeds ~50 — the per-buyer "add as collaborator" admin step starts becoming a job. At that point, consider either (a) a paid npm org with team-based access, or (b) license-key gating + public distribution.
+- A buyer re-shares the repo source. Repo-level gating doesn't prevent post-access redistribution; if this becomes an actual incident, move to license-key gating.
+- The MCP ecosystem standardizes on npm-published servers for host auto-discovery — at that point, a public-npm presence (even as a stub pointing at the private repo) might become valuable for SEO / discoverability.
+- The operator's monetization model changes (e.g. shifts to free tool + paid support, or SaaS) — re-evaluate from scratch.
+
+---
+
 ## 2026-05-21 — Phase 14 #64b composite-outlier dry-run V2 — bespoke for all 11 outliers; new `compositePreviewDryRun` primitive for 2-envelope composites; idempotent-replay preview deferred
 
 **Chosen:** Ship bespoke dry-run for all 11 composite outliers carried out of #64a. No tool emits the reserved `9006` "dry-run not supported" statusCode — every outlier has a workable preview shape using either an existing single-op primitive (`addEntityDryRun` / `executeBatchAddDryRun`) or the new multi-op primitive `compositePreviewDryRun`. Status code 9006 stays reserved for any future tool whose composition is genuinely unpreviewable (e.g. tools that depend on external side effects).

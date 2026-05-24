@@ -36,8 +36,7 @@ The server runs in **simulation mode** by default (in-memory mock books — work
 
 | Path | Command | When |
 |------|---------|------|
-| **npm** (post-publish — #88) | `npx -y quickbooks-desktop-mcp` | Easiest. Use once the package is published to npm. |
-| **GitHub** (works today) | `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop` | No publish required. The package's `prepare` script auto-runs `npm run build` during install. |
+| **GitHub** (primary) | `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop` | Standard install. Requires access to the private repo; the package's `prepare` script auto-runs `npm run build` during install. |
 | **Local clone** (developer) | `git clone … && npm install` | If you'll modify the source. Point your host config at the absolute path to `dist/index.js`. |
 
 ### 3. Wire up your MCP host
