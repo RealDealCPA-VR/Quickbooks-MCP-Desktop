@@ -4,11 +4,9 @@ _Last updated: 2026-05-24. **#88 closed NOT-PURSUED.** Phase 19 remaining: #90, 
 
 ## Last Session Summary
 
-- **Closed #88 NOT-PURSUED.** Operator decision: sell access to the private GitHub repo via collaborator grants; do not publish to npm. Public npm publish gives the product away free; private npm publish requires Pro ($7/mo) for a scoped private package and adds zero gating value since the GitHub repo is already private. The `github:RealDealCPA-VR/Quickbooks-MCP-Desktop` install form (wired by #87's `bin` + `prepare` script) is now permanent.
-- **DECISIONS.md** — new top entry `2026-05-24 — Distribution model` pins the choice with full rejected-alternatives, tradeoffs, and revisit triggers. Future sessions should not re-debate npm publishing.
-- **[README.md](README.md) §2 install-path table** — dropped the "npm (post-publish — #88)" row. Two rows now: GitHub (primary, with new "Requires access to the private repo" caveat) + Local clone (developer). The 5 host blocks in §3, the §4 live-mode block, the §6 smoke-test invocation are all unchanged — they already use the `github:` form. **No README sweep needed.**
-- **[todo.md](todo.md) #88** — checked `[x]` with the NOT-PURSUED rationale inline (mirrors how #45 SDK-BLOCKED was closed). Phase 19 remaining count drops from 4 to 3.
-- **Verification clean.** `npm run build` exit 0. `npm test` → 61 files / 1647 tests passed (unchanged — pure docs + governance change). README §2 row count went 3 → 2 rows.
+- **Closed #88 NOT-PURSUED.** Operator decision: distribute via private GitHub repo only — buyers added as collaborators, install via `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop`. Public npm publish gives the product away free; private npm publish needs Pro ($7/mo) for a scoped private package with zero added gating value. Closes #88 in [todo.md:165](todo.md#L165) with rationale inline (mirrors #45 SDK-BLOCKED style). Phase 19 remaining drops from 4 to 3 items. The `github:RealDealCPA-VR/...` install form is now **permanent**, not provisional — the previously planned 6-place post-publish README sweep is dead.
+- **Governance pinned + README aligned.** New top entry in [DECISIONS.md](DECISIONS.md) `2026-05-24 — Distribution model` with full rejected-alternatives, tradeoffs, and revisit triggers. [README.md:39](README.md#L39) §2 install-path table dropped from 3 rows to 2 (npm row removed); GitHub row now flags "Requires access to the private repo". The 5 host blocks in §3, §4 live-mode env block, and §6 smoke test were untouched — they already use the final `github:` form.
+- **Verification clean.** `npm run build` exit 0. `npm test` → 61 files / 1647 tests passed (unchanged — pure docs + governance change). Tool count still 150. Project memory saved at `project_distribution_model.md` so future sessions don't re-debate npm publishing.
 
 ## Verify Before Continuing
 
