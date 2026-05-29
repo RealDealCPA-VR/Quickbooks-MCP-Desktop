@@ -64,6 +64,25 @@ const TABLE: Record<number, string> = {
   // returns explicit UI navigation steps in its response. Reads of the
   // closing date work normally via qb_closing_date_get.
   9005: "Closing date cannot be set via the QuickBooks Desktop SDK. The qbXML schema has no write path for company preferences (PreferencesModRq does not exist at any version). Set the closing date manually in QB Desktop under Edit → Preferences → Accounting → Company Preferences → Set Date/Password. Read access via qb_closing_date_get is supported.",
+  // 9007 — synthetic, client-side. Issued by qb_company_open (Phase 19 #90)
+  // when `launchIfClosed: true` cannot auto-resolve the connection because
+  // QB Desktop is already running with a DIFFERENT company file open
+  // (QBXMLRP2 localQBD is one-file-per-process — there is no auto-swap),
+  // or the launch was attempted but never attached within the ~30s poll
+  // budget. Also raised when no QB Desktop executable can be located in
+  // the env → registry → known-paths chain. The remediation hint embedded
+  // in the thrown error names the currently-open file when QB surfaces it,
+  // so the agent can ask the operator to close it.
+  9007: "QuickBooks Desktop launch / attach failed. Either a different company file is already open (close it in QB Desktop, then retry), the launch attempt did not attach within the poll budget, or no QB Desktop executable could be located. Set QB_DESKTOP_EXE to override the executable path if QB is installed in a non-standard location.",
+  // 9008 — synthetic, client-side. Issued by qb_company_open (Phase 19 #90)
+  // when BeginSession fails with a multi-user-lock signal — the target .qbw
+  // is on a network share and another user is currently holding it in QB
+  // Desktop. Distinct from 9007 because the remediation is "wait for the
+  // other session to release" (or open in single-user mode), NOT "close
+  // your local QB". Auto-retry is intentionally NOT applied here: multi-
+  // user locks typically last the duration of the other user's working
+  // session (minutes to hours), not seconds.
+  9008: "QuickBooks company file is locked by another user (multi-user mode). Wait for the other session to release the file, or coordinate with the holder to open in single-user mode.",
 };
 
 export function qbStatusCodeMessage(statusCode: number): string | undefined {

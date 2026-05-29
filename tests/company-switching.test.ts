@@ -19,8 +19,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
-import { QBSessionManager } from "../src/session/manager.js";
+import {
+  QBLaunchError,
+  QBMultiUserLockError,
+  QBSessionManager,
+} from "../src/session/manager.js";
 import { registerReportTools } from "../src/tools/reports.js";
+import { QB_LAUNCH_POLL_MS } from "../src/util/qb-desktop-launch.js";
 
 type Handler = (
   args: unknown
@@ -241,6 +246,335 @@ describe("qb_company_list — enumerate .qbw files under root", () => {
     expect(r.isError).toBe(false);
     expect(r.body.count).toBe(0);
     expect(r.body.companies).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 19 #90 — launchIfClosed
+// ---------------------------------------------------------------------------
+//
+// The auto-launch path can only be exercised end-to-end on a real Windows +
+// QB Desktop box (the spawn + QBXMLRP2 attach is not mockable in CI). What
+// IS testable in sim:
+//   - Sim mode treats `launchIfClosed: true` as a no-op (the reseed path
+//     already covers the "open a new book" UX).
+//   - The tool surface accepts launchIfClosed in its zod schema.
+//
+// What's testable via dependency injection (forced-live-mode stubs):
+//   - Error classification routing: file-conflict on initial openSession
+//     throws QBLaunchError 9007 WITHOUT attempting launch; multi-user-lock
+//     throws QBMultiUserLockError 9008.
+//   - No-executable surfaces 9007 with reason 'no-executable'.
+//   - Spawn-failure surfaces 9007 with reason 'launch-spawn-failed'.
+//   - Successful launch + first-attempt-attach populates lastSwitchLaunchInfo
+//     with the right source / exe / poll count.
+//   - Launch-timeout: all retries exhaust → 9007 with reason 'launch-timeout'.
+//   - File-conflict surfaced DURING polling exits the loop early.
+
+/**
+ * Build a forced-live-mode session manager with every external dependency
+ * stubbed: openSession is queue-driven, sleepImpl is instant, spawnImpl is
+ * a recording no-op, exeResolverImpl returns a fixed result. closeSession
+ * is stubbed to no-op (the production version touches winax which we don't
+ * want to import in tests).
+ *
+ * Returns the manager plus accessors for the stub state (spawnCalls,
+ * openCalls) so tests can assert on what happened.
+ */
+const makeFakeLiveManager = (opts: {
+  openErrors?: Array<Error | null>; // null at index N means "succeed on attempt N"
+  exeResolution?: { exe: string; source: "env" | "registry" | "fallback" } | null;
+  spawnThrows?: Error;
+}) => {
+  const mgr = new QBSessionManager({
+    companyFile: "C:\\initial.qbw",
+    appName: "vitest-launch",
+    qbxmlVersion: "16.0",
+  });
+  // Force live mode regardless of the resolved platform/env.
+  (mgr as unknown as { simulationMode: boolean }).simulationMode = false;
+  // Instant sleep so the 30s poll budget collapses to a single tick.
+  (mgr as unknown as { sleepImpl: (ms: number) => Promise<void> }).sleepImpl = async () => {};
+
+  const spawnCalls: Array<{ exe: string; companyFile: string }> = [];
+  (mgr as unknown as { spawnImpl: (exe: string, companyFile: string) => void }).spawnImpl =
+    (exe, companyFile) => {
+      spawnCalls.push({ exe, companyFile });
+      if (opts.spawnThrows) throw opts.spawnThrows;
+    };
+
+  const exeResolution = opts.exeResolution === undefined
+    ? { exe: "C:\\fake\\qbw32.exe", source: "registry" as const }
+    : opts.exeResolution;
+  (mgr as unknown as { exeResolverImpl: () => unknown }).exeResolverImpl = () => exeResolution;
+
+  // closeSession bypasses winax — sim store reset is unnecessary here.
+  let openCalls = 0;
+  const openErrors = opts.openErrors ?? [];
+  (mgr as unknown as { closeSession: () => Promise<void> }).closeSession = async () => {
+    (mgr as unknown as { session: unknown }).session = null;
+  };
+  (mgr as unknown as { openSession: () => Promise<unknown> }).openSession = async () => {
+    const idx = openCalls++;
+    const err = openErrors[idx];
+    if (err) throw err;
+    const fakeSession = {
+      ticket: `live-ticket-${idx}`,
+      companyFile: (mgr as unknown as { config: { companyFile: string } }).config.companyFile,
+      openedAt: new Date(),
+    };
+    (mgr as unknown as { session: unknown }).session = fakeSession;
+    return fakeSession;
+  };
+
+  return {
+    mgr,
+    spawnCalls,
+    getOpenCalls: () => openCalls,
+  };
+};
+
+describe("switchCompanyFile launchIfClosed — sim mode is a no-op", () => {
+  it("sim mode ignores launchIfClosed: true and still reseeds the store", async () => {
+    const { session, call } = setupHarness();
+    await session.openSession();
+
+    await session.addEntity("Customer", { Name: "Should Be Gone" });
+    const r = await call("qb_company_open", {
+      companyFile: "C:\\fixtures\\B.qbw",
+      launchIfClosed: true,
+    });
+    expect(r.isError).toBe(false);
+    expect(r.body.success).toBe(true);
+    expect(r.body.simulationMode).toBe(true);
+    expect(r.body.simulationStoreReset).toBe(true);
+    // No launch metadata in sim mode — the flag was a no-op.
+    expect(r.body.launched).toBeUndefined();
+    expect(r.body.launchSource).toBeUndefined();
+
+    // Sim store actually reseeded.
+    const stale = await session.queryEntity("Customer", { FullName: "Should Be Gone" });
+    expect(stale).toHaveLength(0);
+  });
+
+  it("zod schema accepts launchIfClosed:true and launchIfClosed:false", async () => {
+    const handlers = new Map<string, { schema: Record<string, z.ZodTypeAny>; handler: Handler }>();
+    const fakeServer = {
+      tool: (name: string, _d: string, schema: Record<string, z.ZodTypeAny>, handler: Handler) => {
+        handlers.set(name, { schema, handler });
+      },
+    };
+    const mgr = new QBSessionManager({
+      companyFile: "simulation",
+      appName: "vitest-schema",
+      qbxmlVersion: "16.0",
+    });
+    registerReportTools(fakeServer as never, () => mgr);
+
+    const cmd = handlers.get("qb_company_open");
+    expect(cmd).toBeDefined();
+    const schema = z.object(cmd!.schema);
+    expect(schema.safeParse({ companyFile: "C:\\X.qbw", launchIfClosed: true }).success).toBe(true);
+    expect(schema.safeParse({ companyFile: "C:\\X.qbw", launchIfClosed: false }).success).toBe(true);
+    expect(schema.safeParse({ companyFile: "C:\\X.qbw" }).success).toBe(true);
+  });
+});
+
+describe("switchCompanyFile launchIfClosed — live-mode error routing", () => {
+  it("file-conflict error on initial openSession → QBLaunchError 9007 WITHOUT calling spawn", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      openErrors: [new Error("QuickBooks is already open with a different company file")],
+    });
+
+    await expect(
+      mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: true }),
+    ).rejects.toMatchObject({
+      name: "QBLaunchError",
+      statusCode: 9007,
+      reason: "file-conflict",
+    });
+    // Critical: spawn must NOT have been attempted. Launching another QB
+    // process when one is already running with a different file would
+    // worsen the conflict, not resolve it.
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("multi-user-lock error on initial openSession → QBMultiUserLockError 9008 WITHOUT calling spawn", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      openErrors: [new Error("The company file is in use by another user")],
+    });
+
+    await expect(
+      mgr.switchCompanyFile("\\\\server\\share\\Locked.qbw", { launchIfClosed: true }),
+    ).rejects.toMatchObject({
+      name: "QBMultiUserLockError",
+      statusCode: 9008,
+    });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("unrecognized error WITH launchIfClosed:false → bubbles unchanged (no launch attempted)", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      openErrors: [new Error("3120: required field missing")],
+    });
+
+    await expect(
+      mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: false }),
+    ).rejects.toThrow(/3120/);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("no executable found → QBLaunchError 9007 reason='no-executable'", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      openErrors: [new Error("QuickBooks is not running")],
+      exeResolution: null,
+    });
+
+    await expect(
+      mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: true }),
+    ).rejects.toMatchObject({
+      name: "QBLaunchError",
+      statusCode: 9007,
+      reason: "no-executable",
+    });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("spawn itself throws → QBLaunchError 9007 reason='launch-spawn-failed'", async () => {
+    const { mgr } = makeFakeLiveManager({
+      openErrors: [new Error("QuickBooks is not running")],
+      spawnThrows: new Error("EACCES: permission denied"),
+    });
+
+    await expect(
+      mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: true }),
+    ).rejects.toMatchObject({
+      name: "QBLaunchError",
+      statusCode: 9007,
+      reason: "launch-spawn-failed",
+    });
+  });
+
+  it("launch succeeds + first poll attaches → returns session and populates launch metadata", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      // index 0 = initial fail (no file open), index 1 = first poll succeeds
+      openErrors: [new Error("no company file is open"), null],
+    });
+
+    const session = await mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: true });
+    expect(session.companyFile).toBe("C:\\new.qbw");
+    expect(spawnCalls).toEqual([{ exe: "C:\\fake\\qbw32.exe", companyFile: "C:\\new.qbw" }]);
+
+    const info = mgr.getLastSwitchLaunchInfo();
+    expect(info).toEqual({
+      launched: true,
+      launchSource: "registry",
+      launchExe: "C:\\fake\\qbw32.exe",
+      launchPollAttempts: 1,
+    });
+  });
+
+  it("launch + poll succeeds on the 3rd retry → launchPollAttempts is 3", async () => {
+    const errMsg = "QuickBooks is not running";
+    const { mgr } = makeFakeLiveManager({
+      // Initial fail + 2 poll failures + success
+      openErrors: [
+        new Error(errMsg),
+        new Error(errMsg),
+        new Error(errMsg),
+        null,
+      ],
+    });
+
+    const session = await mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: true });
+    expect(session.companyFile).toBe("C:\\new.qbw");
+    expect(mgr.getLastSwitchLaunchInfo().launchPollAttempts).toBe(3);
+  });
+
+  it("launch + all retries exhausted → QBLaunchError 9007 reason='launch-timeout'", async () => {
+    const errMsg = "QuickBooks is not running";
+    // Initial + 5 polls all fail (poll length is 5).
+    const failures = Array(1 + QB_LAUNCH_POLL_MS.length).fill(new Error(errMsg));
+    const { mgr } = makeFakeLiveManager({ openErrors: failures });
+
+    await expect(
+      mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: true }),
+    ).rejects.toMatchObject({
+      name: "QBLaunchError",
+      statusCode: 9007,
+      reason: "launch-timeout",
+    });
+  });
+
+  it("file-conflict surfacing DURING poll exits early (does not exhaust budget)", async () => {
+    // Initial = no-file, but mid-poll QB Desktop finishes opening with a
+    // different file (a corner case where the spawn arg didn't survive
+    // QB's "restore last session" preference). Must exit on the first
+    // file-conflict signal, not keep polling.
+    const errs: Array<Error | null> = [
+      new Error("no company file is open"),
+      new Error("QuickBooks is open with a different company file"),
+    ];
+    const { mgr } = makeFakeLiveManager({ openErrors: errs });
+
+    let getOpenCallsRef = 0;
+    Object.defineProperty(mgr, "_test_open_marker", {
+      get() { return getOpenCallsRef++; },
+    });
+
+    await expect(
+      mgr.switchCompanyFile("C:\\new.qbw", { launchIfClosed: true }),
+    ).rejects.toMatchObject({
+      name: "QBLaunchError",
+      reason: "file-conflict",
+    });
+  });
+
+  it("default launchIfClosed:false on a file-not-loaded error → bubbles unchanged (no launch)", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      openErrors: [new Error("no company file is open")],
+    });
+
+    await expect(
+      mgr.switchCompanyFile("C:\\new.qbw"),
+    ).rejects.toThrow(/no company file is open/);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("getLastSwitchLaunchInfo resets on every switchCompanyFile call", async () => {
+    const { mgr } = makeFakeLiveManager({
+      openErrors: [new Error("no company file is open"), null, null],
+    });
+
+    // First call: launch succeeds on first poll.
+    await mgr.switchCompanyFile("C:\\A.qbw", { launchIfClosed: true });
+    expect(mgr.getLastSwitchLaunchInfo().launched).toBe(true);
+
+    // Second call (now that the file is "loaded"): initial open succeeds,
+    // no launch. Metadata must reset.
+    await mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true });
+    expect(mgr.getLastSwitchLaunchInfo()).toEqual({ launched: false });
+  });
+});
+
+// QBLaunchError + QBMultiUserLockError are real Error subclasses surfaced
+// through the same statusCode contract the rest of the manager uses.
+describe("QBLaunchError + QBMultiUserLockError — error class contract", () => {
+  it("QBLaunchError is an Error with statusCode 9007 and reason field", () => {
+    const e = new QBLaunchError("file-conflict", "msg", "underlying");
+    expect(e).toBeInstanceOf(Error);
+    expect(e.name).toBe("QBLaunchError");
+    expect(e.statusCode).toBe(9007);
+    expect(e.reason).toBe("file-conflict");
+    expect(e.underlyingMessage).toBe("underlying");
+  });
+
+  it("QBMultiUserLockError is an Error with statusCode 9008", () => {
+    const e = new QBMultiUserLockError("locked", "underlying");
+    expect(e).toBeInstanceOf(Error);
+    expect(e.name).toBe("QBMultiUserLockError");
+    expect(e.statusCode).toBe(9008);
+    expect(e.underlyingMessage).toBe("underlying");
   });
 });
 

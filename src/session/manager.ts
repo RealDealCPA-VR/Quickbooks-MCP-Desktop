@@ -47,6 +47,16 @@ import type { ComDispatchObject } from "winax";
 import { SimulationStore } from "./simulation-store.js";
 import { QBLookupCache } from "./lookup-cache.js";
 import { getQbxmlLogger } from "../util/qbxml-logger.js";
+import {
+  classifyBeginSessionError,
+  defaultFileExists,
+  defaultLaunchQBDesktop,
+  defaultRegistryQuery,
+  QB_LAUNCH_POLL_MS,
+  resolveQBDesktopExe,
+  type QBExeResolution,
+  type QBExeSource,
+} from "../util/qb-desktop-launch.js";
 
 // ---------------------------------------------------------------------------
 // QBXMLRP2 SDK constants (Intuit QuickBooks SDK 16.0)
@@ -129,6 +139,57 @@ export class QBIdempotencyKeyConflictError extends Error {
     this.statusCode = 9002;
     this.idempotencyKey = idempotencyKey;
     this.entityType = entityType;
+  }
+}
+
+/**
+ * Thrown by `switchCompanyFile` when `launchIfClosed: true` cannot resolve
+ * the connection because: (a) QB Desktop is already running with a
+ * different .qbw open and we cannot swap without UI automation, (b) the
+ * launch attempt was made but never attached within the
+ * `QB_LAUNCH_POLL_MS` budget, or (c) no QB Desktop executable could be
+ * located via the env-var / registry / known-paths fallback chain.
+ *
+ * Carries `statusCode 9007` (synthetic sentinel — outside QB SDK's 0/1/3xxx/
+ * 5xx range). Surfaced as a structured `isError: true` response by the
+ * `qb_company_open` tool's catch block.
+ *
+ * Distinct from `QBMultiUserLockError` (9008): a multi-user lock means
+ * another user holds the file and retry is pointless; 9007 means the
+ * local QB Desktop state can be fixed (close the conflicting file, launch
+ * QB manually, or set QB_DESKTOP_EXE).
+ */
+export class QBLaunchError extends Error {
+  statusCode: number;
+  reason: "file-conflict" | "no-executable" | "launch-timeout" | "launch-spawn-failed";
+  underlyingMessage?: string;
+  constructor(
+    reason: "file-conflict" | "no-executable" | "launch-timeout" | "launch-spawn-failed",
+    message: string,
+    underlyingMessage?: string,
+  ) {
+    super(message);
+    this.name = "QBLaunchError";
+    this.statusCode = 9007;
+    this.reason = reason;
+    if (underlyingMessage) this.underlyingMessage = underlyingMessage;
+  }
+}
+
+/**
+ * Thrown by `switchCompanyFile` when BeginSession reports the target .qbw
+ * is held by another user in multi-user mode. Carries `statusCode 9008`.
+ * Auto-retry is intentionally NOT applied (multi-user locks last the
+ * duration of the other user's working session — not seconds).
+ */
+export class QBMultiUserLockError extends Error {
+  statusCode: number;
+  underlyingMessage?: string;
+  constructor(message: string, underlyingMessage?: string) {
+    super(message);
+    this.name = "QBMultiUserLockError";
+    this.statusCode = 9008;
+    if (underlyingMessage) this.underlyingMessage = underlyingMessage;
   }
 }
 
@@ -608,6 +669,51 @@ export class QBSessionManager {
   private sleepImpl: (ms: number) => Promise<void> = defaultSleep;
 
   /**
+   * QB Desktop spawn implementation (Phase 19 #90). Defaults to a detached
+   * `child_process.spawn` so QB survives the Node process exit; tests
+   * override via `(sm as any).spawnImpl = stub` to capture the call without
+   * actually launching anything.
+   *
+   * The stub-vs-real split is necessary because there's no way to verify
+   * the auto-launch path without a Windows + QB box — the test seam lets
+   * us at least confirm "the orchestrator called spawn with the right exe
+   * and .qbw path" deterministically.
+   */
+  private spawnImpl: (exe: string, companyFile: string) => void = defaultLaunchQBDesktop;
+
+  /**
+   * QB Desktop executable resolver (Phase 19 #90). Walks the env-var /
+   * registry / known-paths fallback chain and returns the first hit.
+   * Defaults to the production resolver from qb-desktop-launch.ts; tests
+   * override via `(sm as any).exeResolverImpl = stub` to drive every
+   * branch without touching the real registry or filesystem.
+   */
+  private exeResolverImpl: () => QBExeResolution | null = () =>
+    resolveQBDesktopExe({
+      envExe: process.env.QB_DESKTOP_EXE,
+      fileExists: defaultFileExists,
+      registryQuery: defaultRegistryQuery,
+    });
+
+  /**
+   * Metadata from the most recent `switchCompanyFile` call (Phase 19 #90).
+   * The `qb_company_open` tool reads this immediately after the await so
+   * the response surface can include `launched: true, launchSource,
+   * launchExe, launchPollAttempts` when the auto-launch path fired.
+   *
+   * Tracked as a manager field rather than threaded through the return
+   * type so the existing `switchCompanyFile` signature stays backward-
+   * compatible (existing tests / call sites use the QBSession return
+   * value unchanged). Reset to `{ launched: false }` on every call.
+   */
+  private lastSwitchLaunchInfo: {
+    launched: boolean;
+    launchSource?: QBExeSource;
+    launchExe?: string;
+    launchPollAttempts?: number;
+  } = { launched: false };
+
+  /**
    * Epoch-millisecond timestamps of every transient-retry firing in
    * `sendLiveRequestWithRetry` (Phase 14 #67). Each entry corresponds to one
    * successful classify-as-transient → sleep → reconnect → retry leg — the
@@ -841,7 +947,10 @@ export class QBSessionManager {
    * prior path are gone. This is the deliberate sim-fidelity tradeoff
    * documented in DECISIONS.md (2026-05-09).
    */
-  async switchCompanyFile(companyFile: string): Promise<QBSession> {
+  async switchCompanyFile(
+    companyFile: string,
+    options: { launchIfClosed?: boolean } = {},
+  ): Promise<QBSession> {
     await this.closeSession();
     this.config.companyFile = companyFile;
     if (this.simulationMode) {
@@ -872,7 +981,168 @@ export class QBSessionManager {
     // Any cached entry from the prior file is meaningless against the new
     // one. companyFileChanged clears the cache + records the new path.
     this.lookupCache.companyFileChanged(companyFile);
-    return this.openSession();
+    // Reset launch metadata — a fresh switchCompanyFile call starts with no
+    // launch attempted. Set inside `attemptLaunchAndAttach` when the auto-
+    // launch path fires.
+    this.lastSwitchLaunchInfo = { launched: false };
+
+    try {
+      return await this.openSession();
+    } catch (err) {
+      if (!options.launchIfClosed) throw err;
+      // Sim mode: openSession can't fail in sim (it just synthesizes a ticket),
+      // so reaching this branch in sim mode is a hard error from the manager
+      // internals, not a missing-file situation. Bubble the original error
+      // unchanged — launchIfClosed: true is documented as a no-op in sim mode
+      // (the existing reseed already covers the "open a new book" UX).
+      if (this.simulationMode) throw err;
+      return this.attemptLaunchAndAttach(companyFile, err);
+    }
+  }
+
+  /**
+   * Auto-launch QB Desktop and poll for attach (Phase 19 #90). Called from
+   * `switchCompanyFile` when the first `openSession` throws AND
+   * `launchIfClosed: true` was set AND we're in live mode.
+   *
+   * Behavior:
+   *   1. Classify the initial error. If it's a file-conflict (different
+   *      .qbw open) → throw QBLaunchError 9007 immediately (auto-resolution
+   *      requires UI automation, which is fragile across QB versions —
+   *      operator must close the conflicting file). If it's a multi-user
+   *      lock → throw QBMultiUserLockError 9008 (the lock will last for
+   *      the other user's session; retry budget would be wasted). If it's
+   *      anything other than "file-not-loaded" or "unknown" → bubble the
+   *      original error unchanged.
+   *   2. Locate the QB Desktop exe via the env-var / registry / known-
+   *      paths fallback chain. No exe found → throw QBLaunchError 9007
+   *      (no-executable) with a remediation hint pointing at
+   *      QB_DESKTOP_EXE.
+   *   3. Spawn QB Desktop with the target .qbw as a process arg. A spawn
+   *      error itself (exe not executable, permission denied) wraps to
+   *      QBLaunchError 9007 (launch-spawn-failed).
+   *   4. Poll `openSession` against QB_LAUNCH_POLL_MS. On each poll
+   *      failure, re-classify: a file-conflict or multi-user-lock during
+   *      polling exits the loop with the appropriate synthetic error;
+   *      anything else (typically "still loading") keeps polling.
+   *   5. Budget exhausted → throw QBLaunchError 9007 (launch-timeout)
+   *      with the last underlying error message.
+   *
+   * Side effect: populates `this.lastSwitchLaunchInfo` so the tool layer
+   * can surface launch metadata in the response.
+   */
+  private async attemptLaunchAndAttach(
+    companyFile: string,
+    initialError: unknown,
+  ): Promise<QBSession> {
+    const initialMsg = initialError instanceof Error ? initialError.message : String(initialError);
+    const initialClass = classifyBeginSessionError(initialMsg);
+
+    if (initialClass === "file-conflict") {
+      throw new QBLaunchError(
+        "file-conflict",
+        "QuickBooks Desktop is already open with a different company file. Close it in QB Desktop (File → Close Company), then retry qb_company_open. Auto-swap is not attempted because the close path requires UI automation and risks discarding unsaved changes in the currently-open book.",
+        initialMsg,
+      );
+    }
+    if (initialClass === "multi-user-lock") {
+      throw new QBMultiUserLockError(
+        "QuickBooks company file is locked by another user in multi-user mode. Wait for the other session to release the file, or coordinate with the holder to open it in single-user mode.",
+        initialMsg,
+      );
+    }
+    if (initialClass !== "file-not-loaded" && initialClass !== "unknown") {
+      // Defensive — `classifyBeginSessionError` is closed over the four
+      // discriminants above, but TypeScript narrows on the `if` chain.
+      throw initialError;
+    }
+
+    const resolved = this.exeResolverImpl();
+    if (!resolved) {
+      throw new QBLaunchError(
+        "no-executable",
+        "Cannot launch QuickBooks Desktop: no executable found. Tried the QB_DESKTOP_EXE env var, the Windows registry under HKLM\\SOFTWARE\\Intuit\\QuickBooks, and known Program Files paths. Set QB_DESKTOP_EXE to the absolute path of qbw32.exe (or qbw.exe) and retry.",
+        initialMsg,
+      );
+    }
+
+    try {
+      this.spawnImpl(resolved.exe, companyFile);
+    } catch (spawnErr) {
+      const spawnMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+      throw new QBLaunchError(
+        "launch-spawn-failed",
+        `Failed to launch QuickBooks Desktop at ${resolved.exe}: ${spawnMsg}. Verify the executable is runnable by the current user (try double-clicking it manually) and that the .qbw path is accessible.`,
+        initialMsg,
+      );
+    }
+
+    let lastErr: unknown = initialError;
+    let pollAttempts = 0;
+    for (let attempt = 0; attempt < QB_LAUNCH_POLL_MS.length; attempt++) {
+      await this.sleepImpl(QB_LAUNCH_POLL_MS[attempt]);
+      pollAttempts++;
+      try {
+        const session = await this.openSession();
+        this.lastSwitchLaunchInfo = {
+          launched: true,
+          launchSource: resolved.source,
+          launchExe: resolved.exe,
+          launchPollAttempts: pollAttempts,
+        };
+        return session;
+      } catch (pollErr) {
+        lastErr = pollErr;
+        const pollMsg = pollErr instanceof Error ? pollErr.message : String(pollErr);
+        const pollClass = classifyBeginSessionError(pollMsg);
+        // During polling, a file-conflict or multi-user-lock is terminal —
+        // QB Desktop has finished starting up but landed in a state we
+        // can't auto-resolve. Exit early so the operator sees the right
+        // remediation hint instead of waiting out the full 30s budget.
+        if (pollClass === "file-conflict") {
+          throw new QBLaunchError(
+            "file-conflict",
+            `QuickBooks Desktop launched but opened a different company file than requested (${companyFile}). Close the currently-open file in QB Desktop and retry.`,
+            pollMsg,
+          );
+        }
+        if (pollClass === "multi-user-lock") {
+          throw new QBMultiUserLockError(
+            "QuickBooks Desktop launched but the target company file is locked by another user (multi-user mode).",
+            pollMsg,
+          );
+        }
+        // Otherwise keep polling — QB is probably still loading.
+      }
+    }
+
+    const lastMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    const totalMs = QB_LAUNCH_POLL_MS.reduce((a, b) => a + b, 0);
+    throw new QBLaunchError(
+      "launch-timeout",
+      `QuickBooks Desktop launch attempted (${resolved.exe}) but the session did not attach within ${totalMs}ms across ${QB_LAUNCH_POLL_MS.length} retries. The launch may have failed silently, the .qbw may be invalid or unreadable, or QB Desktop may be waiting on a UI prompt (e.g. an authorization dialog, an update notification, or a corrupt-file warning). Open QB Desktop manually, dismiss any dialogs, then retry without launchIfClosed.`,
+      lastMsg,
+    );
+  }
+
+  /**
+   * Read the launch metadata recorded by the most recent
+   * `switchCompanyFile` call (Phase 19 #90). Returns `{ launched: false }`
+   * when the call did not trigger the auto-launch path (default behavior,
+   * sim mode, `launchIfClosed: false`, or the initial `openSession`
+   * succeeded without retry).
+   *
+   * Consumed by `qb_company_open` to enrich its success response with
+   * `launchSource` + `launchExe` + `launchPollAttempts` when the
+   * auto-launch path fired.
+   */
+  getLastSwitchLaunchInfo(): {
+    launched: boolean;
+    launchSource?: QBExeSource;
+    launchExe?: string;
+    launchPollAttempts?: number;
+  } {
+    return this.lastSwitchLaunchInfo;
   }
 
   /**

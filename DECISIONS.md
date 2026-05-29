@@ -29,6 +29,77 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-05-29 — CLI doctor probe model + exit-code precedence (Phase 19 #91 closed)
+
+**Chosen:**
+1. **Three-state probe model — `ok` / `fail` / `skip`** (not a binary pass/fail). `fail` = an operator-fixable problem (carries a one-line remediation); `skip` = the probe was inconclusive / not applicable on this platform (no remediation). This lets a non-Windows box report "live readiness undetermined" honestly instead of drowning the operator in red `✗`s for things that legitimately don't apply in simulation mode.
+2. **Exit-code arithmetic: 0 all-green / 1 any-fail / 2 any-skip, with `fail` outranking `skip`.** A box with both a hard failure and an inconclusive probe exits **1** — the actionable signal wins. Matches the lint/test exit contract so CI can gate on it.
+3. **Pure core, impure shell.** `runDoctor(deps)` + the seven `probe*` helpers + `formatReport` are I/O-free over an injected `DoctorDeps` bag; `main()` is the only part that touches `process` / prints / exits. Tests drive every branch deterministically (35 tests) without a Windows + QB install — same test-seam discipline as #90's `makeFakeLiveManager`.
+4. **QB-install probe reuses #90's exe-detection chain** (`resolveQBDesktopExe` + `defaultRegistryQuery` + `defaultFileExists`) and surfaces BOTH the resolved exe path AND the source branch (`env` / `registry` / `fallback`) so the operator sees exactly which path the runtime will fire at launch.
+5. **Per-probe judgement calls:**
+   - **Node version:** only major **20** is `ok`; anything else (incl. 22+) `fail`s — the documented winax-break constraint, not a soft warning.
+   - **QB_COMPANY_FILE unset → `fail`** (the headline live-mode setting; wrong/missing path is the #1 setup failure). Remediation notes sim mode runs without it.
+   - **QB_COMPANY_ROOT unset → `ok`** (it defaults to `dirname(QB_COMPANY_FILE)`) — only set-but-missing is a `fail`.
+   - **COM probe** distinguishes "key absent" (`fail`) from "reg.exe couldn't run" (`skip`) via the spawn error code (`ENOENT` → skip; non-zero exit status → false/fail).
+   - **winax probe** does a real `require("winax")` (an ABI mismatch surfaces exactly as it would at runtime) and classifies missing vs abi-mismatch for a specific remediation.
+
+**Why:** The doctor's value is diagnosing ~80% of setup failures without a debugger. A binary pass/fail forces every Windows-only probe to lie on a Mac (either false-fail or false-pass); the `skip` state + exit 2 keeps the report truthful across platforms. Reusing the exe-detection chain (rather than reimplementing) means the doctor reports the *same* path the launcher will use — no drift between "what the doctor checked" and "what runs."
+
+**Alternatives rejected:**
+- **Binary pass/fail** — would either spam red on legitimate sim-mode boxes or hide real gaps; rejected for the three-state model.
+- **`skip` outranking `fail` (exit 2 wins)** — rejected because a real, fixable failure is the more urgent signal; CI should see exit 1.
+- **A standalone exe-detection reimplementation in the doctor** — rejected; it would drift from #90's launcher chain. Composed instead.
+- **Treating non-Windows as a hard `fail`** — rejected; simulation mode is the documented default on non-Windows, so it's `skip` (inconclusive for *live* readiness), not a failure.
+
+**Tradeoffs / consequences:**
+- A fully-unconfigured Windows box (no `QB_COMPANY_FILE`, QB not at a known path) exits **1** even though the server would still boot in sim mode. This is intentional — the doctor is a *live-readiness* tool; sim users don't need it.
+- The winax probe actually loads the native addon (a real side effect). Acceptable for a diagnostic; it's exactly what we want to test.
+- The known-paths list inherited from #90 is the brittle surface: a QB install at a non-standard path with no registry `InstallPath` reports `✗ QuickBooks Desktop` even when QB is present. Remediation points at `QB_DESKTOP_EXE`, which is the escape hatch. (Observed live on the dev box: COM registered ✓ but exe not at known paths → correctly told to set `QB_DESKTOP_EXE`.)
+
+---
+
+## 2026-05-28 — `qb_company_open` auto-launch resolves design Qs (a)/(b)/(c)/(d) (Phase 19 #90 closed)
+
+**Chosen:**
+1. **(a) Exe detection:** **fallback chain** — `$QB_DESKTOP_EXE` env override → Windows registry (`HKLM\SOFTWARE\Intuit\QuickBooks*\InstallPath`, parsed via `reg query /s`; newest subkey wins on multi-version installs) → 9 known Program Files paths covering QB 2022-2025 + Enterprise Solutions 23-24.
+2. **(b) File-conflict (QB Desktop already open with a DIFFERENT .qbw):** **fail fast with synthetic statusCode 9007** (`reason: "file-conflict"`) naming the operator-resolvable remediation ("close it in QB Desktop, then retry"). **No UI automation, no force-kill.**
+3. **(c) Multi-user lock (file held by another user on a network share):** **synthetic statusCode 9008** with a remediation hint ("wait for release, or coordinate single-user mode"). **No retry** — the wait would be wasted budget.
+4. **(d) Sim mode behavior:** **no-op.** `launchIfClosed: true` is silently ignored; the existing simulation-store reseed path already covers the "open a new book" UX.
+
+Poll schedule: `[1000, 2000, 4000, 8000, 15000]ms` = 30s total budget across 5 retries after spawn (exponential at the head for warm restarts; long tail for cold starts). Schedule pinned by `QB_LAUNCH_POLL_MS` and tested as a contract.
+
+**Why each:**
+
+- **(a) Fallback chain over env-only:** the env-only path puts setup friction on every buyer. Registry-only has no escape hatch for non-standard installs. The chain is ~10ms of cold-path work — cheap insurance and matches the rest of the project's "support what works, allow override for the rest" philosophy.
+- **(b) Fail-fast over UI automation:** sending `File → Close Company` via SendKeys/SendMessage is fragile across QB Desktop versions (the menu structure changes, save-changes dialogs can hang the script). Force-killing `qbw32.exe` risks `.qbw` corruption if there are unsaved changes. The operator can close the conflicting file in 5 seconds; the automation gamble is materially worse than the explicit remediation. Symmetric with how `qb_closing_date_set` handles missing wire surface (#85, 9005) — surface a clear error + UI navigation hint rather than fake the operation.
+- **(c) 9008 + remediation, no retry:** multi-user locks typically last for the duration of the other user's working session (minutes to hours), not seconds. A 30s retry budget would be wasted; either the lock is the wrong tier of problem to auto-resolve or it's gone before we'd even check.
+- **(d) Sim no-op:** `switchCompanyFile` in sim mode never throws from `openSession` (it just synthesizes a ticket), so the launch branch is structurally unreachable. Validating the flag in sim would be theater. The reseed contract from DECISIONS.md 2026-05-09 already gives the operator a "new book" experience without needing QB Desktop at all.
+
+**Alternatives rejected:**
+
+- **(a) Env var ONLY.** Rejected: friction tax on every buyer; setup-failure triage cost (the thing #91 is about reducing) goes UP.
+- **(a) Registry ONLY.** Rejected: no escape hatch when QB is installed in `D:\Apps\QB\` because the operator's `C:\` is full. The override path is what makes the system humane.
+- **(b) UI automation to close the conflicting file.** Rejected as above. Considered briefly via PowerShell's `[System.Windows.Forms.SendKeys]::SendWait('%fc')` (Alt+F, C), but the save-changes dialog branch (which appears whenever the open file has uncommitted writes) is unreachable from a one-shot key sequence — the script would either hang or proceed past the dialog blindly. Both outcomes are worse than the explicit error.
+- **(b) Force-kill `qbw32.exe` then relaunch.** Rejected on data-safety grounds: an open `.qbw` with pending writes can corrupt under a hard kill (Intuit's own guidance warns against this). The remediation cost of a corrupted .qbw — restore from backup, lose hours of work — is materially worse than asking the operator to click File → Close Company.
+- **(c) Retry with exponential backoff for 30s.** Rejected: a multi-user lock is not transient at human timescales. The 30s retry exists for "QB Desktop is still starting up" (the file-not-loaded branch), not for "another human is using the file."
+- **(c) Surface QB's raw error verbatim.** Rejected as the path of least integration: the 9008 wrapping consolidates remediation hints into one shape (matching the 9001-9007 pattern), the orchestration layer can branch on `statusCode === 9008` cleanly, and the underlying message is still preserved in `underlyingMessage` for forensic debugging.
+- **(d) Even spawn-stub the launch in sim mode for shape consistency.** Rejected: shape consistency is a fake virtue when one mode has no real wire surface to consist with. Reseed already gives sim the right observational contract.
+
+**Tradeoffs / consequences:**
+
+- **Live verification is deferred.** All test coverage drives through forced-live-mode dependency-injection stubs (`spawnImpl`, `exeResolverImpl`, `sleepImpl`, `openSession`). The actual spawn + QBXMLRP2 attach behavior cannot be exercised in CI; first real-Windows run may surface an unanticipated QB Desktop error message that classifies as "unknown" instead of one of the three known buckets — fix is to extend the regex sets in `qb-desktop-launch.ts`, not redesign the orchestration. The `underlyingMessage` field on `QBLaunchError` / `QBMultiUserLockError` carries the verbatim QB message so this kind of expansion is fast.
+- **The classifier regex sets are the brittle surface.** A change in QB Desktop's wording (e.g. a 2027 update that switches "is in use by another user" to "is currently held by another user") would silently drop into the "unknown" bucket. Mitigation: every change to QB Desktop's error wording would also trigger a 9007/9008 → "unknown" misclassification observable in the wild; bug reports surface as "the doctor said all 7 probes pass but qb_company_open with launchIfClosed:true doesn't auto-launch on file-not-loaded errors." Add patterns then.
+- **`QB_DESKTOP_EXE` becomes a documented env var.** README env-var table needs updating once #91 doctor probes verify it (the doctor's exe-detection check is the natural surface for telling the operator "we found QB at X via Y" — see Phase 19 #91 spec).
+- **The fallback path list ages.** New QB Desktop versions (2026, 2027) will land in new install dirs over time. Annual maintenance cost: append a path. Alternative — scrape ProgramFiles glob — was rejected as overengineered; the env-var override covers the long tail.
+
+**Revisit when:**
+
+- A live operator reports a `BeginSession` error message that drops to "unknown" instead of classifying — add the new pattern.
+- QB Desktop 2027 ships under a new install directory not in `KNOWN_QB_DESKTOP_PATHS` — append the path.
+- The operator base expands beyond Windows (QB Online or QB Mac) — the entire launch path is moot in non-Windows contexts; the env-var probe at module load handles the platform branch already.
+
+---
+
 ## 2026-05-24 — Distribution model: private GitHub repo only, no npm publish (Phase 19 #88 closed NOT-PURSUED)
 
 **Chosen:** Distribute the MCP server exclusively via the private GitHub repo `github.com/RealDealCPA-VR/Quickbooks-MCP-Desktop`. Buyers are granted access by being added as repo collaborators and install via `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop` (`bin` + `prepare: npm run build` wiring from #87 makes this work today, no publish step). **No npm publish — ever — under the current monetization model.**

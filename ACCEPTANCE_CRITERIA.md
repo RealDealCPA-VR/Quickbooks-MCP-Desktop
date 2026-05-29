@@ -81,6 +81,47 @@ _(Move entries here when criteria are satisfied. Keep the criteria list intact �
 
 ---
 
+### Item 91 — CLI doctor command (`quickbooks-desktop-mcp-doctor`) _(Phase 19)_ — done 2026-05-29
+
+**Status:** done
+
+**Behavioral criteria** _(observable, testable, no ambiguity)_:
+- [x] [src/cli/doctor.ts](src/cli/doctor.ts) replaces the #87 stub. The bin entry `quickbooks-desktop-mcp-doctor` → `dist/cli/doctor.js` (package.json) now runs the real probes. Importing the module (tests) does NOT print or exit — `main()` only runs when invoked as the CLI entry (`import.meta.url === pathToFileURL(process.argv[1]).href`).
+- [x] Runs exactly **seven** probes in order: Node version, Platform, QuickBooks Desktop, QBXMLRP2 COM, QB_COMPANY_FILE, QB_COMPANY_ROOT, winax. Pinned in [tests/doctor.test.ts](tests/doctor.test.ts) ("runs exactly the seven documented probes").
+- [x] Each probe yields `ok` (`✓`) / `fail` (`✗`) / `skip` (`⚠`). Every `fail` carries a one-line remediation rendered on an indented `→` line; `ok`/`skip` never emit a remediation line.
+- [x] Exit code: **0** when all green; **1** when any probe fails; **2** when a probe is skipped and none fail. `fail` outranks `skip` (both present → exit 1). Pinned across four `runDoctor exit codes` tests.
+- [x] **Node version:** major 20 → `ok`; any other major (incl. 22+, 18) → `fail` with an nvm remediation; unparseable → `skip`.
+- [x] **Platform:** `win32` → `ok` (surfaces arch); any other → `skip` ("simulation mode only") — NOT a fail.
+- [x] **QuickBooks Desktop:** non-Windows → `skip`. On Windows, composes #90's `resolveQBDesktopExe({ envExe: QB_DESKTOP_EXE, fileExists, registryQuery })` and on success surfaces BOTH `resolved.exe` AND `source: env|registry|fallback`; null resolution → `fail` with a QB_DESKTOP_EXE remediation.
+- [x] **QBXMLRP2 COM:** non-Windows → `skip`. `comRegistered()` true → `ok`; false → `fail` (regsvr32 / reinstall hint); null → `skip` ("could not query the registry").
+- [x] **QB_COMPANY_FILE:** unset/blank → `fail`; set-but-missing → `fail` echoing the bad path; set+exists → `ok`.
+- [x] **QB_COMPANY_ROOT:** unset → `ok` ("defaults to dirname of QB_COMPANY_FILE"); set-but-missing-dir → `fail`; set+exists → `ok`.
+- [x] **winax:** non-Windows → `skip`; `ok` → `ok`; `missing` → `fail` (`npm install winax`); `abi-mismatch` → `fail` (`npm rebuild winax`); null → `skip`.
+
+**Regression criteria** _(things that should still work after the change)_:
+- [x] `npm run build` clean. `npm test` → **63 files / 1725 tests** (was 62 / 1690; +1 file, +35 tests). No other test file touched.
+- [x] No production code outside [src/cli/doctor.ts](src/cli/doctor.ts) changed — the doctor only *imports* `resolveQBDesktopExe` / `defaultRegistryQuery` / `defaultFileExists` from [src/util/qb-desktop-launch.ts](src/util/qb-desktop-launch.ts); those exports are unchanged. Server (`dist/index.js`) and its 150-tool surface untouched.
+- [x] Live smoke on the Windows dev box: `node dist/cli/doctor.js` → honest output (`✓` Node 20.20.2, `✓` Windows x64, `✗` QB Desktop not at known paths, `✓` QBXMLRP2 registered, `✗` QB_COMPANY_FILE unset, `✓` QB_COMPANY_ROOT default, `✓` winax loadable) → exit 1.
+
+**Documentation criteria**:
+- [x] [README.md](README.md) smoke-test parenthetical ("probes coming in #91 — currently a stub that exits 2") replaced with a real description of the 7 probes + 0/1/2 contract.
+- [x] No `instructions` block change in [src/index.ts](src/index.ts) — the doctor is a separate bin, not an MCP tool. Tool count stays 150.
+- [x] [DECISIONS.md](DECISIONS.md) 2026-05-29 entry — three-state probe model, exit-code precedence (fail > skip), pure-core/impure-shell test seam, exe-chain reuse, and per-probe judgement calls (Node-20-only, company-file-unset-fails, company-root-unset-ok, COM ENOENT-vs-status, real winax require).
+- [x] No `ARCHITECTURE.md` / `REQUIREMENTS.md` change — a diagnostic CLI adds no subsystem and redefines no product behavior.
+
+**Verification commands**:
+```bash
+npm run build
+npm test                          # 1725/1725 (incl. 35 in tests/doctor.test.ts)
+node dist/cli/doctor.js           # prints the 7-probe report; exit 0/1/2
+```
+
+**Notes**:
+- The known-paths list (inherited from #90) is the brittle surface: a QB install at a non-standard path with no registry `InstallPath` reports `✗ QuickBooks Desktop` even when QB is present — exactly what was observed on the dev box (COM registered, exe not at known paths). The `QB_DESKTOP_EXE` remediation is the escape hatch, and the same env var fixes both the doctor AND #90's launcher in one shot.
+- The winax probe loads the native addon for real (a side effect) so an ABI mismatch surfaces exactly as it would at runtime — the most faithful possible check.
+
+---
+
 ### Item 41 — Line-level detail in `*_list` responses (`includeLineItems`) _(Phase 10)_ — done 2026-05-09
 
 **Status:** done

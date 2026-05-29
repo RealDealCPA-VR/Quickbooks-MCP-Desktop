@@ -901,15 +901,19 @@ export function registerReportTools(
   // state" — same in both modes. See DECISIONS.md 2026-05-09.
   server.tool(
     "qb_company_open",
-    "Switch the active QuickBooks Desktop company file. Closes the current session, swaps the configured company file path, and opens a new session against the new file. In live mode the file must either be the one currently open in QuickBooks Desktop or be openable by QBXMLRP2 (typically requires QB to have it open already — QBXMLRP2 won't open a file QB hasn't loaded). In simulation mode the in-memory store is reset to fresh seed (deliberate sim-fidelity tradeoff — real QB persists per-file, sim doesn't; see DECISIONS.md 2026-05-09).",
+    "Switch the active QuickBooks Desktop company file. Closes the current session, swaps the configured company file path, and opens a new session against the new file. In live mode the file must either be the one currently open in QuickBooks Desktop or be openable by QBXMLRP2 (typically requires QB to have it open already — QBXMLRP2 won't open a file QB hasn't loaded). Pass launchIfClosed:true to auto-spawn QB Desktop with the .qbw as a process arg when no file is currently loaded (Phase 19 #90 — live-only; sim mode no-ops the flag). In simulation mode the in-memory store is reset to fresh seed (deliberate sim-fidelity tradeoff — real QB persists per-file, sim doesn't; see DECISIONS.md 2026-05-09).",
     {
       companyFile: z.string().min(1).describe("Absolute or UNC path to the .qbw file (e.g. 'C:\\\\path\\\\to\\\\Acme.qbw' or '\\\\\\\\server\\\\share\\\\Acme.qbw'). Pass an empty string to fall back to 'whatever file QB Desktop has open' — but the schema rejects empty strings to force an explicit choice; if you want the currently-open file, just don't call this tool."),
+      launchIfClosed: z.boolean().optional().describe("If true and live mode and the initial BeginSession reports no company file is loaded (or QB Desktop isn't running), spawn QB Desktop with the target .qbw and poll for attach (~30s budget across 5 exponential retries: 1s, 2s, 4s, 8s, 15s). Executable detection chain: $QB_DESKTOP_EXE → Windows registry (HKLM\\\\SOFTWARE\\\\Intuit\\\\QuickBooks\\\\*\\\\InstallPath) → known Program Files paths. Default false — explicit opt-in. In simulation mode this flag is a no-op (the store reseed already covers the 'open a new book' UX). Failure modes: statusCode 9007 if QB Desktop is already open with a DIFFERENT file (auto-swap not attempted — close it first), no executable is locatable, the spawn itself fails, or the poll budget expires without attach. statusCode 9008 if the .qbw is locked by another user in multi-user mode (retry not useful — wait for release). On success, the response includes launched:true plus launchSource ('env' | 'registry' | 'fallback'), launchExe (the resolved path), and launchPollAttempts."),
     },
-    async ({ companyFile }) => {
+    async ({ companyFile, launchIfClosed }) => {
       const session = getSession();
       const previousCompanyFile = session.getCompanyFile();
       try {
-        const newSession = await session.switchCompanyFile(companyFile);
+        const newSession = await session.switchCompanyFile(companyFile, {
+          launchIfClosed: !!launchIfClosed,
+        });
+        const launchInfo = session.getLastSwitchLaunchInfo();
         return {
           content: [{
             type: "text" as const,
@@ -923,11 +927,19 @@ export function registerReportTools(
               ...(session.isSimulation()
                 ? { simulationStoreReset: true }
                 : {}),
+              ...(launchInfo.launched
+                ? {
+                    launched: true,
+                    launchSource: launchInfo.launchSource,
+                    launchExe: launchInfo.launchExe,
+                    launchPollAttempts: launchInfo.launchPollAttempts,
+                  }
+                : {}),
             }, null, 2),
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number };
+        const e = err as { message?: string; statusCode?: number; reason?: string; underlyingMessage?: string };
         const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
         return {
           content: [{
@@ -938,6 +950,8 @@ export function registerReportTools(
               statusMessage: e.message ?? "Failed to open company file",
               previousCompanyFile,
               attemptedCompanyFile: companyFile,
+              ...(e.reason ? { reason: e.reason } : {}),
+              ...(e.underlyingMessage ? { underlyingMessage: e.underlyingMessage } : {}),
               ...(humanReadable ? { humanReadable } : {}),
             }),
           }],

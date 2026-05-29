@@ -159,7 +159,7 @@ Restart your MCP host. The server should register **150 tools**. From the host:
 - In sim: `qb_customer_list` — returns the seed customers.
 - In live: `qb_company_info` — returns the open company's name + fiscal-year settings.
 
-If startup fails, run `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop quickbooks-desktop-mcp-doctor` for diagnostics _(probes coming in #91 — currently a stub that exits 2 with a not-yet-implemented message)_.
+If startup fails, run `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop quickbooks-desktop-mcp-doctor` for diagnostics. It probes seven things (Node version, platform, QuickBooks Desktop install + which exe path will be used, QBXMLRP2 COM registration, `QB_COMPANY_FILE` set+exists, `QB_COMPANY_ROOT` set+exists, `winax` load status), prints `✓ / ✗ / ⚠` with a one-line fix on every `✗`, and exits **0** (all green) / **1** (a problem to fix) / **2** (a probe couldn't run, e.g. on a non-Windows box).
 
 ---
 

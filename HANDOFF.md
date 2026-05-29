@@ -1,62 +1,55 @@
 # Handoff State
 
-_Last updated: 2026-05-24. **#88 closed NOT-PURSUED.** Phase 19 remaining: #90, #91, #92 (3 items). Tests still **1647** (61 files, +0 — docs + governance change only). Tool count still **150**. Distribution model decided and pinned in DECISIONS.md: private GitHub repo only, no npm publish, ever, under the current monetization model. The `github:RealDealCPA-VR/Quickbooks-MCP-Desktop` form in the README is now the permanent install path — not provisional. The previously planned post-publish README sweep (6 places, `github:OWNER/REPO` → `quickbooks-desktop-mcp`) is dead and should not be done._
+_Last updated: 2026-05-29. **Phase 19 #91 closed.** CLI doctor (`quickbooks-desktop-mcp-doctor`) fleshed out — 7 pure probes over an injected `DoctorDeps` bag, `✓ / ✗ / ⚠` per probe with a one-line remediation on every `✗`, exit **0** all-green / **1** any-fail / **2** any-skip (fail outranks skip). QB-install probe reuses #90's `resolveQBDesktopExe` chain and surfaces both the resolved exe path AND the source branch. Verified live on the Windows box. Build green, **63 test files / 1725 tests passing** (was 62 / 1690 → +1 file, +35 tests). Tool count unchanged at 150 (doctor is a separate bin, not an MCP tool). **Phase 19 now has only #92 left (Windows installer — lower priority, gated on a signing-cert decision).** The feature/delivery backlog is effectively complete._
 
 ## Last Session Summary
 
-- **Closed #88 NOT-PURSUED.** Operator decision: distribute via private GitHub repo only — buyers added as collaborators, install via `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop`. Public npm publish gives the product away free; private npm publish needs Pro ($7/mo) for a scoped private package with zero added gating value. Closes #88 in [todo.md:165](todo.md#L165) with rationale inline (mirrors #45 SDK-BLOCKED style). Phase 19 remaining drops from 4 to 3 items. The `github:RealDealCPA-VR/...` install form is now **permanent**, not provisional — the previously planned 6-place post-publish README sweep is dead.
-- **Governance pinned + README aligned.** New top entry in [DECISIONS.md](DECISIONS.md) `2026-05-24 — Distribution model` with full rejected-alternatives, tradeoffs, and revisit triggers. [README.md:39](README.md#L39) §2 install-path table dropped from 3 rows to 2 (npm row removed); GitHub row now flags "Requires access to the private repo". The 5 host blocks in §3, §4 live-mode env block, and §6 smoke test were untouched — they already use the final `github:` form.
-- **Verification clean.** `npm run build` exit 0. `npm test` → 61 files / 1647 tests passed (unchanged — pure docs + governance change). Tool count still 150. Project memory saved at `project_distribution_model.md` so future sessions don't re-debate npm publishing.
+- **Phase 19 #91 implemented end-to-end.** [src/cli/doctor.ts](src/cli/doctor.ts) replaced the #87 stub. Architecture: a pure, I/O-free core (`runDoctor(deps)` + seven `probe*` helpers + `formatReport`) over an injected `DoctorDeps` bag; `main()` is the only impure part (wires `buildDefaultDeps()`, prints, `process.exit`). Same test-seam discipline as #90's `makeFakeLiveManager`.
+- **Seven probes:** Node version (major 20 only → ok; else fail), Platform (win32 → ok; else skip — sim mode is legit off-Windows), QuickBooks Desktop (reuses #90's `resolveQBDesktopExe` + surfaces `exe` + `source: env|registry|fallback`), QBXMLRP2 COM (`reg query` the ProgID; distinguishes key-absent→fail from reg.exe-unavailable→skip via the spawn error code), QB_COMPANY_FILE (unset/missing → fail), QB_COMPANY_ROOT (unset → ok, defaults to dirname; set-but-missing → fail), winax (real `require("winax")`, classifies missing vs abi-mismatch).
+- **Exit-code contract:** 0 all-green / 1 any-fail / 2 any-skip-and-no-fail. `fail` outranks `skip` (CI-friendly; actionable signal wins).
+- **Live verified on the Windows dev box.** `node dist/cli/doctor.js` → exit 1 with honest output: `✓` Node 20.20.2, `✓` Windows x64, `✗` QB Desktop not at known paths (COM is registered but the exe isn't at a known path on this box → correctly told to set `QB_DESKTOP_EXE`), `✓` QBXMLRP2 registered, `✗` QB_COMPANY_FILE unset, `✓` QB_COMPANY_ROOT default, `✓` winax loadable.
+- **Tests.** New [tests/doctor.test.ts](tests/doctor.test.ts) (35 tests: every branch of all 7 probes, the 4 exit-code paths incl. fail-outranks-skip, and `formatReport` rendering — symbols, remediation arrows, summary line). No other test file touched.
+- **Docs.** README smoke-test parenthetical rewritten (real 7-probe description + 0/1/2 contract). DECISIONS.md 2026-05-29 + ACCEPTANCE_CRITERIA.md Item 91 entry + todo.md #91 closed.
 
 ## Verify Before Continuing
 
 - [ ] `npm run build` → exit 0.
-- [ ] `npm test` → `Test Files 61 passed | Tests 1647 passed`.
-- [ ] [README.md](README.md) §2 — install-path table has exactly **2 rows** (GitHub + Local clone); no "npm" row.
-- [ ] [README.md](README.md) §3/§4/§6 — every code block still uses `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop` (5 host blocks + smoke test = 6 places). **No changes here — verify nothing was disturbed.**
-- [ ] [DECISIONS.md](DECISIONS.md) — top entry is `2026-05-24 — Distribution model: private GitHub repo only`.
-- [ ] [todo.md](todo.md) — #88 is `[x]` with NOT-PURSUED 2026-05-24 inline note. Phase 19 unchecked items: #90, #91, #92 (3 only).
-- [ ] **(Windows + QB) carried** — all live spot-checks from prior handoffs (#74 cache layer, #73 autoExhaust, #64a + #64b dry-run, #63 / #66 / #61–65, plus the 18-item legacy bucket).
+- [ ] `npm test` → `Test Files 63 passed | Tests 1725 passed`.
+- [ ] `node dist/cli/doctor.js` → prints a 7-line probe report (Node version / Platform / QuickBooks Desktop / QBXMLRP2 COM / QB_COMPANY_FILE / QB_COMPANY_ROOT / winax) + a `Summary: N passed, N failed, N skipped → exit N` line, and the process exit code matches that summary.
+- [ ] [src/cli/doctor.ts](src/cli/doctor.ts) exports `runDoctor`, `formatReport`, `buildDefaultDeps`, all seven `probe*` functions, `defaultComRegistered`, `defaultWinaxStatus`, and the `DoctorDeps` / `ProbeResult` / `ProbeStatus` / `DoctorReport` types. `main()` is NOT exported and only runs when invoked as the bin entry.
+- [ ] [todo.md](todo.md) — **#91 is `[x]`** with the 2026-05-29 close annotation. Phase 19 unchecked: only **#92**.
+- [ ] [DECISIONS.md](DECISIONS.md) — top entry is `2026-05-29 — CLI doctor probe model + exit-code precedence (Phase 19 #91 closed)`. The 2026-05-28 #90 entry is still immediately below.
+- [ ] **(Windows + QB) carried** — all live spot-checks from prior handoffs, including #90's `launchIfClosed: true` first-run verification (file-not-loaded → spawn+attach; different .qbw open → 9007 file-conflict).
 
 ## Next Task
 
-**Operator should pick from remaining Phase 19 items. Three left.**
+**Only Phase 19 #92 remains — and it's blocked on a non-technical decision, not code.**
 
-- [ ] **#90.** Auto-launch QB Desktop on `qb_company_open`. Meatier feature, 4 design questions still open: (a) exe-path detection (registry vs `QB_DESKTOP_EXE` vs fallback chain); (b) conflicting-file behavior (UI automation to close vs fail clearly); (c) multi-user lock surfacing; (d) sim no-op confirmation.
+- [ ] **#92.** (Lower priority) Windows installer — bundle the Node runtime + built CLI into a **signed** `.exe` via `pkg` or `oclif`, to reach accountants who would never type `npx`. **Gating decision is the code-signing certificate (~$200-400/yr), not the packaging.** Do NOT start building this without the operator first deciding (a) whether there's real non-developer demand and (b) whether they'll buy a signing cert — an unsigned installer trips SmartScreen and is worse than the `npx` path for trust. **Recommend surfacing this as a question to the operator rather than auto-starting it.**
 
-- [ ] **#91.** Flesh out the doctor probes. Stub file already exists at [src/cli/doctor.ts](src/cli/doctor.ts). Add the 7 probes listed in the stub's comment block; exit 0 if all green, 1 if any fail, 2 if a probe couldn't run. Each `✗` needs a one-line remediation hint. **Note:** the §6 smoke test in the install section references the doctor command — once #91 lands, the parenthetical "currently a stub that exits 2" callout in [README.md](README.md) §6 should be removed. **Recommended forward-motion option** — no product decisions required; the spec is in the stub.
-
-- [ ] **#92.** Windows installer. Low priority; signing cert ($200-400/yr) is the gating decision. Doesn't conflict with #88's NOT-PURSUED — installer would bundle a built `dist/` from the private repo, signed.
+If the operator does not want #92 yet, **Phase 19 (and the whole fix list) is complete.** Reasonable forward motion in that case: a final pass on the carried Windows-only live verifications (they're the only `partial` items left across the project), or close out the project formally.
 
 ## Context Notes
 
-- **DO NOT re-debate npm publishing.** [DECISIONS.md](DECISIONS.md) 2026-05-24 pins the choice. The repo is private; access is sold via collaborator grants; the `github:RealDealCPA-VR/Quickbooks-MCP-Desktop` `npx` form is the permanent install. The trigger conditions for revisiting are documented at the bottom of that decision entry — none of them apply today.
+- **#91 reused #90's exe-detection chain by design.** The doctor imports `resolveQBDesktopExe` + `defaultRegistryQuery` + `defaultFileExists` from [src/util/qb-desktop-launch.ts](src/util/qb-desktop-launch.ts) — do NOT reimplement. The known-paths list there is the shared brittle surface: a QB install at a non-standard path with no registry `InstallPath` reports `✗ QuickBooks Desktop` in the doctor even when QB is present. `QB_DESKTOP_EXE` is the escape hatch and fixes both the doctor probe AND the launcher in one shot. (Observed live: this box has QBXMLRP2 registered but no exe at a known path.)
 
-- **The previously planned "post-publish README sweep" is dead.** Prior handoffs noted that once #88 publishes, 6 README places needed changing `github:RealDealCPA-VR/Quickbooks-MCP-Desktop` → `quickbooks-desktop-mcp`. That sweep is no longer applicable. The `github:` form is the final form.
+- **Doctor test-seam pattern.** `runDoctor` / the `probe*` helpers / `formatReport` are pure over `DoctorDeps`. To test a branch, build a deps bag with `makeDeps({ ...override })` in [tests/doctor.test.ts](tests/doctor.test.ts) and assert on the returned `ProbeResult` / `DoctorReport`. The real side-effecting probes (`defaultComRegistered`, `defaultWinaxStatus`, `defaultRegistryQuery`, `defaultFileExists`) are only wired in `buildDefaultDeps()` — never call them from a test.
 
-- **The §2 access caveat is the only buyer-facing note about repo gating** — added 2026-05-24 as "Requires access to the private repo" in the GitHub row's "When" column. If buyer feedback surfaces confusion about `gh auth login` / `GITHUB_TOKEN` setup, add a §1 prerequisites bullet then. Default is to keep README terse.
+- **Probe judgement calls that look opinionated but are deliberate** (all in DECISIONS.md 2026-05-29): Node major-20-only is a hard fail (not a warn) because v22 breaks winax; `QB_COMPANY_FILE` unset is a fail (headline live setting) while `QB_COMPANY_ROOT` unset is `ok` (it defaults to dirname); non-Windows is `skip` not `fail` (sim mode is the documented default); `fail` outranks `skip` for the exit code.
 
-- **GitHub-anchor algorithm gotcha** (carried from #89). Lowercase + strip punctuation (keeps word chars / spaces / hyphens) + replace spaces with hyphens. `+`, `.`, and em-dashes (`—`) all get stripped to nothing — but their surrounding spaces remain, collapsing into multi-hyphens. When adding new internal anchor targets, prefer punctuation-free headings or test the generated anchor before linking.
+- **The CLI entry guard** is `import.meta.url === pathToFileURL(process.argv[1]).href`. This keeps `main()` from printing/exiting when vitest imports the module. If you add another bin or move the file, preserve that guard or tests will call `process.exit`.
 
-- **`npx -y github:OWNER/REPO` is load-bearing for the install section** (carried from #89). #87 wired the `bin` + `prepare: npm run build` script in `package.json`. When npm/git installs the package from a GitHub URL it runs `prepare`, which builds `dist/`, and then resolves the `bin` entry matching the package name (`quickbooks-desktop-mcp` → `dist/index.js`). The second bin (`quickbooks-desktop-mcp-doctor`) is invoked by name as a second arg: `npx -y github:... quickbooks-desktop-mcp-doctor`. This pattern is now permanent — see DECISIONS.md 2026-05-24.
-
-- **GitHub repo URL is `https://github.com/RealDealCPA-VR/Quickbooks-MCP-Desktop`** (carried from #89). Used in the §2 install-path table and every §3 host block + §6 smoke test = 7 places. Confirmed via `git remote -v`. **If the repo is ever moved or renamed**, sweep these 7 places AND every buyer needs to update their host config (`npx -y github:OWNER/REPO` doesn't follow GitHub redirects — npm's github-fetch driver doesn't honor them). This is now operationally load-bearing.
-
-- **§4 (live-mode env swap) is deliberately one shared block, not five copies** (carried from #89). Operators read the host blocks in §3, find theirs, then jump to §4 to swap the env. This keeps the section to one page and avoids 5× duplication of the same Windows path.
-
-- **Phase 19 numbering starts at #87** (carried). Items #85 `qb_closing_date_*` and #86 MCP prompts were recovered during the 2026-05-22 cleanup and closed 2026-05-12. Always grep for the next free number before adding a new item.
-
-- **No-decision-required forward-motion option = #91** (carried — recommendation still stands). The stub at [src/cli/doctor.ts](src/cli/doctor.ts) enumerates exactly what to build: 7 probes, exit-code contract, remediation hints. #90 has 4 open design questions; #92 has the signing-cert gating decision. #91 just needs implementation.
-
-- **Carried gotchas** (unchanged from prior handoffs):
-  - QBXMLRP2 cannot OPEN a `.qbw` — only attach to one QB Desktop has already loaded. **#90 directly addresses this.** _(Documented in README §1 prereqs.)_
-  - Live verification requires `C:\nvm4w\nodejs\node.exe` v20.20.2 (system PATH v22 breaks winax). _(Documented in README §1 prereqs.)_
-  - `winax` is in `optionalDependencies` — non-Windows installs skip it cleanly.
-  - statusCodes: 9001 read-only, 9002 idempotency conflict, 9003 edition, 9004 payroll, 9005 SDK-no-write, 9006 reserved-but-zero-emit.
-  - `*Core` private methods are the chokepoint for dry-run + read-only gating — any new mutation primitive should split add/modify/delete into `*Core` + public wrapper (DECISIONS.md V1).
+- **Carried gotchas** (unchanged from #90's handoff — still authoritative):
+  - QBXMLRP2 cannot OPEN a `.qbw` — only attach. #90's auto-launch path spawns QB Desktop with the .qbw as a process arg to resolve this.
+  - Live verification requires `C:\nvm4w\nodejs\node.exe` v20.20.2 (system PATH v22 breaks winax) — this is exactly what the doctor's Node-version probe enforces.
+  - `winax` is in `optionalDependencies` — non-Windows installs skip it cleanly; the doctor's winax probe `skip`s off-Windows accordingly.
+  - statusCodes: 9001 read-only, 9002 idempotency conflict, 9003 edition, 9004 payroll, 9005 SDK-no-write, 9006 reserved-but-zero-emit, 9007 launch failure, 9008 multi-user lock. (The doctor uses its own `ok`/`fail`/`skip` model + 0/1/2 exit codes — it does NOT emit QB statusCodes; it's a pre-flight CLI, not a tool handler.)
+  - `*Core` private methods are the chokepoint for dry-run + read-only gating.
   - `structuredClone` is the deep-clone primitive in sim store snapshot/restore.
   - `idCounter` ticks twice per add (ListID + EditSequence).
   - `fast-xml-parser` doesn't decode numeric character entities; DOES coerce numeric-looking text to numbers.
   - Dispatch order in sim `processRequest`: non-entity-typed `*QueryRq` / `*ModRq` / `AttachableAddRq` / `DataExtDefQueryRq` MUST precede the `endsWith` catch-alls.
-  - `BillPayment*` total is on `TotalAmount`, not `Amount` — coalesce.
-  - #66 wire-shape decision: `AuditTrail` is a `CustomDetailReportType` value, NOT a `TxnReportType` value.
+
+- **Phase 19 numbering** ends at #92. There is no #93 — the fix list is closed once #92 is resolved (built or explicitly deferred).
+
+- **DO NOT re-debate** npm publishing (DECISIONS.md 2026-05-24) or #90's design Qs (DECISIONS.md 2026-05-28).
