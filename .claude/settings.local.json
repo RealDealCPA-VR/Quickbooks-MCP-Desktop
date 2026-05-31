@@ -130,7 +130,9 @@
       "PowerShell(npx vitest run tests/doctor.test.ts 2>&1 | Select-String -Pattern \"Test Files|Tests |✓|✗|FAIL|Error\" | Select-Object -First 30; \"EXIT: $LASTEXITCODE\")",
       "PowerShell(node dist/cli/doctor.js; \"EXIT: $LASTEXITCODE\")",
       "PowerShell(npm test 2>&1 | Select-String -Pattern \"Test Files|Tests |FAIL\" | Select-Object -Last 5; \"EXIT: $LASTEXITCODE\")",
-      "PowerShell(npm run build 2>&1 | Select-Object -Last 3; \"BUILD EXIT: $LASTEXITCODE\"; npm test 2>&1 | Select-String -Pattern \"Test Files|Tests \" | Select-Object -Last 2; \"TEST EXIT: $LASTEXITCODE\")"
+      "PowerShell(npm run build 2>&1 | Select-Object -Last 3; \"BUILD EXIT: $LASTEXITCODE\"; npm test 2>&1 | Select-String -Pattern \"Test Files|Tests \" | Select-Object -Last 2; \"TEST EXIT: $LASTEXITCODE\")",
+      "Bash(ls -la SKILL.md)",
+      "Bash(wc -l SKILL.md)"
     ]
   }
 }
