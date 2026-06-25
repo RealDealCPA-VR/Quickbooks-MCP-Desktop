@@ -1,0 +1,27 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest   # native 'winax' (QBXML COM) must compile on Windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'   # from .nvmrc
+      - name: Install & build
+        run: |
+          npm ci
+          npm run build
+      - name: Stage production deps (keeps native winax, drops devDeps)
+        run: npm ci --omit=dev
+      - name: Bundle self-contained server
+        shell: pwsh
+        run: Compress-Archive -Path dist,node_modules,package.json -DestinationPath "quickbooks-mcp-${{ github.ref_name }}.zip" -Force
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: quickbooks-mcp-*.zip
+          generate_release_notes: true
