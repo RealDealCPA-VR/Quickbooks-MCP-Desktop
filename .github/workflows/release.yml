@@ -16,8 +16,22 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Drop devDeps (keep built dist + native winax)
+      - name: Ensure native winax (QuickBooks COM bridge) is compiled into the bundle
+        shell: pwsh
+        run: |
+          # winax is an optionalDependency that the committed package-lock.json
+          # omits (lockfile was generated off-Windows), so `npm ci` never installs
+          # it and the bundle would silently ship without the QBXML COM bridge.
+          # Force-install it on the Windows runner so the native module compiles.
+          npm install winax@^3.4.2 --no-save
+      - name: Drop devDeps (keep prod + optional winax)
         run: npm prune --omit=dev
+      - name: GATE - fail the release if the winax native binary is absent
+        shell: pwsh
+        run: |
+          $bin = Get-ChildItem node_modules/winax -Recurse -Filter *.node -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $bin) { throw "winax native .node binary missing - the QuickBooks MCP would be non-functional. Failing the release." }
+          Write-Host "winax binary present: $($bin.FullName)"
       - name: Bundle self-contained server
         shell: pwsh
         run: Compress-Archive -Path dist,node_modules,package.json -DestinationPath "quickbooks-mcp-${{ github.ref_name }}.zip" -Force
