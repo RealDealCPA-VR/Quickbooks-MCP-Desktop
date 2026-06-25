@@ -12,6 +12,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'   # from .nvmrc
+      - name: Pin a node-gyp-compatible Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # runner default Python 3.14 isn't supported by node-gyp 10
+      - name: Activate MSVC dev environment (so node-gyp finds Visual Studio)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - name: Install & build
         run: |
           npm ci
