@@ -16,8 +16,8 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Stage production deps (keeps native winax, drops devDeps)
-        run: npm ci --omit=dev
+      - name: Drop devDeps (keep built dist + native winax)
+        run: npm prune --omit=dev
       - name: Bundle self-contained server
         shell: pwsh
         run: Compress-Archive -Path dist,node_modules,package.json -DestinationPath "quickbooks-mcp-${{ github.ref_name }}.zip" -Force
