@@ -16,14 +16,17 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Ensure native winax (QuickBooks COM bridge) is compiled into the bundle
+      - name: Compile native winax (QuickBooks COM bridge) into the bundle
         shell: pwsh
         run: |
-          # winax is an optionalDependency that the committed package-lock.json
-          # omits (lockfile was generated off-Windows), so `npm ci` never installs
-          # it and the bundle would silently ship without the QBXML COM bridge.
-          # Force-install it on the Windows runner so the native module compiles.
-          npm install winax@^3.4.2 --no-save
+          # The committed package-lock.json omits winax (a Windows-only
+          # optionalDependency), so `npm ci` records it as optional-skipped and a
+          # plain `npm install winax` then reports "up to date" without compiling.
+          # Promote winax to a HARD dependency so node-gyp actually builds it on the
+          # runner. --foreground-scripts surfaces the gyp output if the build fails.
+          npm pkg delete optionalDependencies.winax
+          npm pkg set dependencies.winax="^3.4.2"
+          npm install --foreground-scripts
       - name: Drop devDeps (keep prod + optional winax)
         run: npm prune --omit=dev
       - name: GATE - fail the release if the winax native binary is absent
