@@ -6,7 +6,7 @@ permissions:
   contents: write
 jobs:
   release:
-    runs-on: windows-latest   # native 'winax' (QBXML COM) must compile on Windows
+    runs-on: windows-2022   # pinned: windows-latest moved to VS 18 (2026), which node-gyp 10 (Node 20) can't find. winax needs VS 2022.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
