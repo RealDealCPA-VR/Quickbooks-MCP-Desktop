@@ -94,6 +94,61 @@ Same as read, but step 5 calls `buildAddRequest` / `buildModRequest` / `buildDel
 * Single session per process.
 * Closed explicitly via `qb_session_disconnect` or implicitly when the process exits.
 * In simulation mode the "session" is a synthetic ticket; in live mode it's a real QBXMLRP2 ticket.
+* **Company switching (live).** `switchCompanyFile` closes the SDK session, then tries `BeginSession` on the new file. On failure, `attemptLaunchAndAttach` may (a) gracefully close QB Desktop (`closeCurrentCompany`; WM_CLOSE to the `MauiFrame` window via `scripts/qb-close-desktop.ps1`, never a kill), (b) spawn QB on the `.qbw`, (c) start `scripts/qb-login-autofill.ps1` to fill QB's login window from the vault, and (d) poll `openSession` on `QB_LAUNCH_POLL_MS` (90s). The exe is resolved before anything is closed. If QB is running and the caller didn't allow a close, it never spawns a second QB instance; it only polls.
+
+### Crash recovery, health and activity (added 2026-10-05)
+
+* **Health** ([src/util/qb-health.ts](src/util/qb-health.ts) + `scripts/qb-health.ps1`, read-only).
+  * Inputs: QBW processes (responding?), their visible windows, File Doctor / Tool Hub processes, and WerFault windows mentioning QuickBooks.
+  * `interpretHealth` turns these into one `state` plus a summary and a recommended action. Cached 3 s.
+* **Recovery** (`QBSessionManager.recover`):
+  * checks health first;
+  * refuses (9010) on `file-doctor` or `dialog`;
+  * rechecks `not-responding` after 10 s, and force-kills only with `forceCloseHungQuickBooks`;
+  * drops the dead ticket, then re-runs the open path for the SAME file (`switchCompanyFileInner` with `preserveIdempotency`).
+* **Request path** (`sendRequest`):
+  * a QB-gone error (RPC unavailable, disconnected, could not start…) triggers `recover()`, then **reads** are retried once and **writes** throw 9011 (`isWriteRequest`);
+  * a modal-dialog error throws 9010 `dialog` with the on-screen titles;
+  * with no session, QB not running and a saved login, it starts QB on the file itself rather than an SDK unattended open (which pops error 80070057 for password-protected files).
+* **Serialization:** `runExclusive` makes company switches and recoveries mutually exclusive, and requests wait for one in flight.
+* **Activity** ([src/util/activity-log.ts](src/util/activity-log.ts)):
+  * the ring buffer holds 300 events, plus JSON lines in `activity.log` beside the credential store (trimmed at 1 MB);
+  * written by the manager (sessions, switches, recoveries), the web API (login and access changes, jobs), and the authorization guard (refused calls);
+  * it never contains secrets.
+* **Web control:** `/api/state` adds health, session diagnostics, activity, storage, connected agents and the current job. Background jobs (`/api/session/reconnect`, `/api/session/open`, `/api/quickbooks/force-close` with typed confirm and frozen-only) run one at a time.
+
+### Credential store + local web server (added 2026-10-05)
+
+* **Why it exists:** QBXMLRP2 cannot pass a QB user name/password, so logging into a password-protected file means filling in QB's own login dialog. The operator also wants agents on other tailnet devices to use specific files.
+* **Store:** `%APPDATA%\quickbooks-desktop-mcp\credentials.json` (`QB_CREDENTIALS_FILE` overrides).
+  * Format: `{version:2, entries:[{companyFile, username, password:<DPAPI base64>, updatedAt, authorizedPeers:[{address, nodeId, nodeName, loginName, addedAt}]}]}`. Version-1 files load unchanged.
+  * Saves are atomic (temp file + rename) and serialized in-process.
+  * It is re-read on every use, so page edits apply to the next tool call with no restart.
+* **Web server** ([src/web/server.ts](src/web/server.ts)) starts with the MCP process (`QB_WEB=0` disables it). It listens on `127.0.0.1:8765` and this machine's tailnet IPv4, **never 0.0.0.0**.
+  * `GET /`: the logins page ([src/web/admin-page.ts](src/web/admin-page.ts)).
+  * `/api/*`: page JSON.
+  * `/mcp`: MCP Streamable HTTP for remote agents.
+  * Defenses: a Host allowlist (DNS rebinding); `X-QB-Admin` + JSON content type + an Origin check on the API; no CORS; a 64 KB body cap; CSP `default-src 'none'`.
+  * If the port is taken (another instance), the page is skipped and stdio MCP continues. `QB_HTTP_ONLY=1` runs without stdio.
+* **Caller identity** ([src/util/caller-authorization.ts](src/util/caller-authorization.ts), [src/util/tailnet.ts](src/util/tailnet.ts)):
+  * `local`: stdio, loopback HTTP, or this machine's own tailnet IP. Unrestricted.
+  * `tailnet`: any other 100.64/10 address, identified by `tailscale whois` (StableID, node name, owner login; cached 60s).
+  * Page/API admins: `local`, devices of the same Tailscale login as this machine (never `tagged-devices`), and `QB_WEB_ADMINS`.
+* **One McpServer per caller.** `createMcpServer(identity)` in [src/index.ts](src/index.ts) builds a server per stdio host and per HTTP session.
+  * `installAuthorizationGuard` wraps `server.tool` *before* the register calls. For a tailnet caller every handler first checks the target (`qb_company_open`) or the currently active company file against the store; a failure returns `statusCode 9009`.
+  * `qb_company_list` / `qb_company_credentials_list` output is filtered to the caller's files.
+  * An HTTP session is bound to the identity that created it.
+  * All instances share the single `QBSessionManager`, which is why the check is against the file active at call time.
+* **Who touches plaintext passwords:**
+  * The browser → `POST /api/logins` → Node (in memory, only for the save) → `scripts/qb-dpapi-protect.ps1` (stdin, base64) encrypts.
+  * `scripts/qb-login-autofill.ps1` (Win32 `WM_SETTEXT` / `BM_CLICK`) decrypts at the moment of need.
+  * No tool or API response contains a password or ciphertext.
+* **Invariants:**
+  * Never return a password to a tool caller.
+  * Never request secrets via MCP elicitation.
+  * Never bind beyond loopback + tailnet.
+  * New tools are covered by the guard automatically because it wraps `server.tool`. Only add a tool to `ALWAYS_ALLOWED` if it exposes no company data, or filters its output.
+* **PowerShell helpers are Windows PowerShell 5.1 scripts and must stay pure ASCII.** 5.1 reads BOM-less files as ANSI. A test enforces this.
 
 ---
 
@@ -151,7 +206,7 @@ return {
 * **Simulation:** in-memory `Map<string, EntityStore>`, where `EntityStore = Map<id, StoredEntity>`. Lost on process exit. Seeded on construction.
 * **Live:** persistence is QuickBooks Desktop's `.qbw` file. The MCP server is stateless beyond the session ticket.
 
-There is no project-side persistent storage today. If we ever need to cache live responses or persist a request log, that's a new subsystem and requires an `ARCHITECTURE.md` update.
+The only project-side persistent storage is the credential store (see Session lifecycle → Credential store + local web server). If we ever need to cache live responses or persist a request log, that's a new subsystem and requires an `ARCHITECTURE.md` update.
 
 ---
 

@@ -53,9 +53,10 @@ export function buildQBXMLRequest(request: QBXMLRequest): string {
     if (req.attributes) {
       for (const [k, v] of Object.entries(req.attributes)) {
         if (v === undefined || v === null) continue;
-        attrParts.push(`${k}="${escapeXml(String(v))}"`);
+        attrParts.push(`${assertXmlName(k)}="${escapeXml(String(v))}"`);
       }
     }
+    assertXmlName(req.type);
     lines.push(`    <${req.type} ${attrParts.join(" ")}>`);
     lines.push(...serializeBody(req.body, 3));
     lines.push(`    </${req.type}>`);
@@ -586,6 +587,7 @@ function serializeBody(
 
   for (const [key, value] of Object.entries(body)) {
     if (value === undefined || value === null) continue;
+    assertXmlName(key);
 
     if (Array.isArray(value)) {
       if (value.length === 0) {
@@ -625,8 +627,40 @@ function serializeBody(
   return lines;
 }
 
+/**
+ * Thrown when a string that would be interpolated as an XML element or
+ * attribute NAME isn't a plain qbXML identifier. Names can't be escaped, so
+ * the only safe policy is to reject. Without this guard `qb_raw_query` could
+ * smuggle a `<CustomerAddRq>` into a query envelope through `entityType` (or
+ * a key in its free-form `filters` JSON) and bypass the read-only gate.
+ */
+export class QBXMLNameError extends Error {
+  readonly statusCode = -1;
+  constructor(name: string) {
+    super(
+      `Invalid qbXML element/attribute name: ${JSON.stringify(name.slice(0, 80))}. ` +
+      "Names must match /^[A-Za-z][A-Za-z0-9_]*$/."
+    );
+    this.name = "QBXMLNameError";
+  }
+}
+
+const XML_NAME_RE = /^[A-Za-z][A-Za-z0-9_]*$/;
+
+function assertXmlName(name: string): string {
+  if (!XML_NAME_RE.test(name)) throw new QBXMLNameError(name);
+  return name;
+}
+
+// XML 1.0 forbids C0 control chars other than TAB/LF/CR, U+FFFE/U+FFFF, and
+// unpaired surrogates. Pasted memos occasionally carry these; emitting them
+// raw makes QBXMLRP2 reject the whole envelope with a parse error.
+const XML_INVALID_CHARS_RE =
+  /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
 function escapeXml(str: string): string {
   return str
+    .replace(XML_INVALID_CHARS_RE, "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")

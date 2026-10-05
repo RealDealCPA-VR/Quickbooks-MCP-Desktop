@@ -8,13 +8,13 @@ This guide is server-agnostic. Drop it into Claude, GPT, opencode, Cursor, or an
 
 ## What this server is
 
-A read/write bridge between an LLM agent and **QuickBooks Desktop** (the on-premise Windows accounting application — not QuickBooks Online, which has a different API). The server exposes **150 tools** covering:
+A read/write bridge between an LLM agent and **QuickBooks Desktop** (the on-premise Windows accounting application — not QuickBooks Online, which has a different API). The server exposes **154 tools** covering:
 
 - **Records** — Customer / Vendor / Account / Item / Employee / Class / Terms (CRUD)
 - **Transactions** — Invoice / Bill / Check / Deposit / Transfer / Journal Entry / Estimate / Sales Order / Purchase Order / Sales Receipt / Credit Memo / Statement Charge / Inventory Adjustment / Time Tracking / Vehicle Mileage / Credit Card Charge/Credit / Sales Tax Payment (full CRUD where the SDK allows)
 - **Reports** — P&L, Balance Sheet, Statement of Cash Flows, Trial Balance, General Ledger, AR/AP Aging, Sales by Customer/Item, Expenses by Vendor, Customer/Vendor Balance Detail, Tax Line Mapping, Audit Log, W-2 Summary
 - **Workflows** — 1099 prep, bank reconciliation, engagement profitability, client packet (tax-prep workpaper bundle), invoice/bill/JE write-off, payment application, transaction memo search
-- **Session management** — connection lifecycle, company-file switching, read-only mode, MCP-side caching, host info, closing-date inspection
+- **Session management** — connection lifecycle, company-file switching (close one file, open another, auto-login from saved logins), per-device file authorization for remote tailnet agents, read-only mode, MCP-side caching, host info, closing-date inspection
 
 Operating modes:
 - **live** — talks to a running QuickBooks Desktop instance via QBXMLRP2 (Windows-only)
@@ -32,11 +32,105 @@ Operating modes:
 
 ---
 
-## Quick start (3 steps)
+## Quick start (4 steps)
 
 1. **Confirm connection.** Call `qb_session_status` (zero wire I/O) — confirms `connected: true`, surfaces mode, companyFile, readOnly state, cached host info, and recent transient-retry stats.
-2. **Confirm scope.** Call `qb_company_info` — confirms which `.qbw` file the operator has open. If wrong file, use `qb_company_list` to discover available files and `qb_company_open` to switch.
-3. **Read the patterns below before mutating.** Status codes, idempotency, dry-run, read-only, editSequence — each is non-obvious and each is necessary.
+2. **Confirm scope.** Call `qb_company_info` — confirms which `.qbw` file the operator has open. If it's the wrong file, follow **Opening a company file** below.
+3. **Remote agent?** If you reached the server over the tailnet (`http://<host>:8765/mcp`), you may use only the company files the operator authorized for your device. Call `qb_company_list` first: it lists exactly those files.
+4. **Read the patterns below before mutating.** Status codes, idempotency, dry-run, read-only, editSequence — each is non-obvious and each is necessary.
+
+---
+
+## Connecting, company files, logins and authorization
+
+### How agents connect
+
+| You are | Connect via | What you may touch |
+|---|---|---|
+| The MCP host on the computer running QuickBooks (e.g. Claude Desktop) | stdio (the host's config launches the server) | Every company file |
+| An agent on **another device on the operator's tailnet** | Streamable HTTP at `http://<host's tailnet IP>:8765/mcp` (the server prints the exact URL at startup; the operator can read it on the logins page) | Only the company files the operator authorized for **your device** |
+
+Remote identity is your device's tailnet address, confirmed with `tailscale whois` and pinned to the device's node. You cannot claim another identity, and you cannot reuse another device's MCP session. Nothing on the server is reachable from the LAN or the internet: it listens only on `127.0.0.1` and the tailnet address.
+
+### The logins page (operator-facing)
+
+The server runs a local web page alongside MCP: `http://127.0.0.1:8765/` on the host, or `http://<tailnet IP>:8765/` from the operator's own tailnet devices. On it the operator:
+
+- enters each company file's **QuickBooks user name and password** once (files under `QB_COMPANY_ROOT` are pre-listed);
+- sees saved logins pre-filled on later visits ("Already saved — nothing to re-enter"), changes them as needed, and saves; the new login **overwrites** the old one;
+- **authorizes tailnet devices per company file** (pick a device or type its 100.x address).
+
+Logins are stored on the host computer, encrypted for the operator's Windows account, and picked up automatically on the next tool call. No restart is needed.
+
+**You never see or handle passwords.** No tool returns one. The server uses the saved login itself when it opens a file in QuickBooks.
+
+- `qb_company_credentials_list` → which files have a saved login: `username`, `hasPassword`, `authorizedPeers`.
+- `qb_company_credentials_edit({ companyFile? })` → the page URL. For the local agent it also opens the page in the operator's browser, pre-selecting `companyFile`.
+- **Never ask the operator to type a QuickBooks password into the chat.** If a login is missing or wrong, call `qb_company_credentials_edit` and ask them to fix it on the page.
+
+### Opening a company file
+
+```
+qb_company_list({ depth: 3 })            // files you may use; hasSavedLogin per file
+qb_company_open({ companyFile, closeCurrentCompany: true })
+qb_company_info()                        // confirm you're in the right book
+```
+
+- If QuickBooks already has the requested file open, `qb_company_open` just attaches.
+- `closeCurrentCompany: true` is how you go **from one company file to another**:
+  1. The server closes QuickBooks gracefully. It is never force-killed.
+  2. It relaunches QuickBooks on the new file.
+  3. It types the saved login into QuickBooks' login window.
+  4. It attaches. This takes up to about 90 seconds.
+- Without `closeCurrentCompany`, a different open file returns `9007 file-conflict`. Use `launchIfClosed: true` alone when QuickBooks isn't running.
+- The success response carries:
+  - `closedPreviousQuickBooks: true` when the previous company was closed;
+  - `loginAutofill`:
+    - `filled`: the login was used;
+    - `not-needed`: QB didn't ask;
+    - `no-credentials`: nothing saved for the file;
+    - `no-login-window`: QB never showed a login window. Treat it as a problem only if the open then timed out.
+- **Closing QuickBooks interrupts the operator if they are working in it.** Before `closeCurrentCompany: true`, check `qb_company_info`, and if a different file is open, confirm with the operator that it's OK to switch.
+- The first time this app opens a given file, a QuickBooks Admin must approve the **Application Certificate** prompt in the QuickBooks window. The server never answers it. A timeout on a never-before-used file usually means that prompt is waiting.
+
+| Failure | Meaning | What to do |
+|---|---|---|
+| `9007` reason `file-conflict` | QB has a different file open | Retry with `closeCurrentCompany: true` (after confirming with the operator) |
+| `9007` reason `close-failed` | QB showed a prompt while closing (unsaved form, backup reminder); the message names the open QB windows | Ask the operator to answer it in QuickBooks, then retry |
+| `9007` reason `login-rejected` | QB refused the saved login (submitted once, never retried) | `qb_company_credentials_edit({ companyFile })` → operator fixes it → retry |
+| `9007` reason `launch-timeout` | QB didn't attach in time: login window with no saved login, certificate prompt, upgrade prompt | Read the message. If it mentions the login, send the operator to the logins page |
+| `9007` reason `no-executable` | QuickBooks Desktop not found | Operator sets `QB_DESKTOP_EXE` |
+| `9008` | File locked by another user (multi-user) | Wait. Don't retry in a loop |
+| `9009` | **Your device isn't authorized for that file** (or no specific file is selected yet) | `qb_company_list` to see your files, then `qb_company_open` one of them. For another file, ask the operator to authorize your device on the logins page. Never try to work around it |
+
+### When QuickBooks crashes, freezes, or File Doctor runs
+
+QuickBooks Desktop on the operator's computer is not always stable. It can crash, freeze on a big report, stop on a dialog, or hand off to **File Doctor**. Build around that:
+
+1. **Reads recover by themselves.** If QuickBooks disappears in the middle of a query or report, the server reconnects to the same company file (starting QuickBooks and logging in with the saved login if needed) and retries the read **once**. You just get the result, a little slower.
+2. **Writes are never repeated automatically.** If QuickBooks dies during an add, update or delete, you get **statusCode 9011**: the server reconnected, but the write may or may not have been saved. **Look the record up** (list or query) before retrying, and always pass an `idempotencyKey` on creates, so a retry that was in fact saved replays instead of duplicating. Replay protection survives the reconnect.
+3. **When something still fails, call `qb_health` before anything else.** It reports:
+   - `state`: `ready` | `login` | `dialog` | `not-responding` | `file-doctor` | `crashed` | `starting` | `not-running`;
+   - a plain summary and the `recommendedAction`;
+   - the titles of any QuickBooks dialogs on screen;
+   - this server's session (connected file, last error, last recovery);
+   - recent activity.
+4. **Then act on the state:**
+
+| `qb_health.state` | Meaning | What you do |
+|---|---|---|
+| `ready` | QuickBooks is fine | Retry. If requests still fail, call `qb_session_recover` |
+| `not-running` / `crashed` | QuickBooks is gone | `qb_session_recover`. It reopens the same file and logs in |
+| `dialog` | A QuickBooks window needs an answer (error box, backup reminder, update) | Tell the operator **exactly** what the dialog says (`dialogs`). Wait for them, then `qb_session_recover` |
+| `login` | QuickBooks is at its login window | During an open the server fills it in. Otherwise check the saved login on the logins page (`qb_company_credentials_edit`) |
+| `file-doctor` | File Doctor / Tool Hub is repairing the file | **Wait.** Never reopen a file mid-repair; `qb_session_recover` refuses (9010) until File Doctor is closed. Then recover |
+| `not-responding` | QuickBooks is frozen | Wait a minute (big reports freeze QuickBooks). If it stays frozen, **ask the operator** before `qb_session_recover({ forceCloseHungQuickBooks: true })`: it kills QuickBooks and loses any unsaved form |
+
+5. **statusCode 9010** means "QuickBooks needs a person". Its `reason` (`file-doctor`, `dialog`, `not-responding`, `crashed`, `recovery-failed`) and `recommendedAction` say what to tell the operator. Don't loop on it: one recover attempt after the operator acts is enough.
+
+The operator sees the same picture live on the logins page (Overview tab), and can press **Reconnect**, **Open in QuickBooks**, or **Force close** there.
+
+As a remote agent, **every** data tool is checked against the file that is open *at that moment*. QuickBooks has one open file shared by all agents, so if someone else switched files, your next call can return 9009. Re-open your file with `qb_company_open` and continue.
 
 ---
 
@@ -137,6 +231,11 @@ The server returns a structured error shape on every failure: `{ success: false,
 | 9004 | Payroll subscription required or not active | Out-of-scope without subscription |
 | 9005 | QBXML SDK has no write path for this | Document the manual UI step instead |
 | 9006 | Dry-run not supported in this mode | Composite outlier — run for real or refactor |
+| 9007 | Company-file open/switch failed (`reason`: file-conflict, close-failed, login-rejected, launch-timeout, launch-spawn-failed, no-executable) | See **Opening a company file** |
+| 9008 | Company file locked by another user (multi-user) | Wait for release; don't loop |
+| 9009 | This device isn't authorized for that company file (remote agents) | `qb_company_list` → open an authorized file, or ask the operator to authorize it |
+| 9010 | QuickBooks needs a person (`reason`: file-doctor, dialog, not-responding, crashed, recovery-failed) | `qb_health`, tell the operator what's on screen, then `qb_session_recover` once |
+| 9011 | QuickBooks crashed during a WRITE; the server reconnected | Look the record up before retrying; retry with the same `idempotencyKey` |
 | -1   | QBXML parse error | Usually schema-order — read `hint` field |
 
 When `hint` is present, it carries `kind` + `field` + `schemaOrder` candidates. Use it before retrying.
@@ -215,6 +314,12 @@ For each vendor above threshold (default $600), drill in with `qb_1099_detail({ 
 
 ## What to avoid
 
+- **Retrying a write blindly after 9011 or a crash.** Check first; use idempotency keys.
+- **Hammering a broken QuickBooks.** After a failure call `qb_health` once and follow `recommendedAction`. Don't loop retries or recovers.
+- **Force-closing QuickBooks without the operator's OK.**
+- **Asking for QuickBooks passwords in chat.** Never. Logins go on the logins page (`qb_company_credentials_edit`); the server applies them itself.
+- **Switching company files without checking first.** `closeCurrentCompany: true` closes the QuickBooks window the operator may be working in. Confirm before switching away from a file someone has open.
+- **Probing files you aren't authorized for** (remote agents). A 9009 is a decision by the operator, not an error to route around.
 - **`qb_closing_date_set`** is an informational stub. The QBXML SDK has no write path for company preferences at any version. Always returns 9005 with explicit QB Desktop UI navigation steps (Edit → Preferences → Accounting → Company Preferences). Don't call it expecting a write.
 - **Memorized transactions** — the SDK doesn't expose them. For recurring workflows, use `qb_invoice_duplicate` / `qb_bill_duplicate` / `qb_journal_entry_duplicate` / `qb_sales_receipt_duplicate`. Each reads a source transaction by `sourceTxnId` and submits a fresh add with operator-supplied overrides.
 - **Hard-deleting accounts with transaction history** — QB rejects with 3260. Use `qb_account_make_inactive` (flips `IsActive: false`; account hides from default list view, history preserved).
@@ -242,7 +347,8 @@ The architecture commits to behavioral parity wherever the gap doesn't introduce
 
 | File | What it covers |
 |------|----------------|
-| `README.md` | Full tool table, setup instructions, MCP host configuration |
+| `README.md` | Setup, MCP host configuration, the control page, multi-company, remote agents, crash recovery, security |
+| `docs/TOOLS.md` | Every tool and its arguments |
 | `HANDOFF.md` | Current implementation state — useful if you're a coding agent extending the server |
 | `CLAUDE.md` | Project governance — operating system for AI-assisted development |
 | `DECISIONS.md` | Architectural decision log — read before changing a load-bearing pattern |

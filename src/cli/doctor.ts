@@ -86,7 +86,7 @@ export interface DoctorDeps {
   /** Synchronous file existence check (defaults to `node:fs.existsSync`). */
   fileExists: (p: string) => boolean;
   /** QB registry probe — returns a candidate exe path or null (see #90). */
-  registryQuery: () => string | null;
+  registryQuery: () => string | readonly string[] | null;
   /**
    * Whether the QBXMLRP2 COM component is registered. `null` means the probe
    * could not run (non-Windows, or `reg.exe` unavailable) → reported as skip.

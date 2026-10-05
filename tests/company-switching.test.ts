@@ -285,6 +285,12 @@ const makeFakeLiveManager = (opts: {
   openErrors?: Array<Error | null>; // null at index N means "succeed on attempt N"
   exeResolution?: { exe: string; source: "env" | "registry" | "fallback" } | null;
   spawnThrows?: Error;
+  qbRunning?: boolean;
+  closeResult?: { closed: boolean; outcome: "not-running" | "closed" | "timeout" | "error"; detail?: string };
+  // undefined → no saved login (autofill helper not started)
+  autofill?: { status: string; detail?: string } | "pending";
+  fileMissing?: boolean;
+  savedLogin?: boolean;
 }) => {
   const mgr = new QBSessionManager({
     companyFile: "C:\\initial.qbw",
@@ -308,6 +314,35 @@ const makeFakeLiveManager = (opts: {
     : opts.exeResolution;
   (mgr as unknown as { exeResolverImpl: () => unknown }).exeResolverImpl = () => exeResolution;
 
+  // Ordered event log so tests can assert close-before-spawn etc.
+  const events: string[] = [];
+  const origSpawn = (mgr as unknown as { spawnImpl: (exe: string, f: string) => void }).spawnImpl;
+  (mgr as unknown as { spawnImpl: (exe: string, f: string) => void }).spawnImpl = (exe, f) => {
+    events.push("spawn");
+    origSpawn(exe, f);
+  };
+  (mgr as unknown as { isQBRunningImpl: () => boolean }).isQBRunningImpl = () => !!opts.qbRunning;
+  (mgr as unknown as { fileExistsImpl: (p: string) => boolean }).fileExistsImpl = () => !opts.fileMissing;
+  (mgr as unknown as { hasSavedLoginImpl: (p: string) => boolean }).hasSavedLoginImpl = () => !!opts.savedLogin;
+  let closeCalls = 0;
+  (mgr as unknown as { closeQBImpl: () => Promise<unknown> }).closeQBImpl = async () => {
+    closeCalls++;
+    events.push("close");
+    if ((opts.closeResult?.closed ?? true)) opts.qbRunning = false;
+    return opts.closeResult ?? { closed: true, outcome: "closed" };
+  };
+  let autofillStarts = 0;
+  let autofillCancels = 0;
+  (mgr as unknown as { loginAutofillImpl: (f: string) => unknown }).loginAutofillImpl = () => {
+    if (opts.autofill === undefined) return null;
+    autofillStarts++;
+    events.push("autofill");
+    const result = opts.autofill === "pending"
+      ? new Promise(() => { /* never settles — attach happened first */ })
+      : Promise.resolve(opts.autofill);
+    return { result, cancel: () => { autofillCancels++; } };
+  };
+
   // closeSession bypasses winax — sim store reset is unnecessary here.
   let openCalls = 0;
   const openErrors = opts.openErrors ?? [];
@@ -316,6 +351,7 @@ const makeFakeLiveManager = (opts: {
   };
   (mgr as unknown as { openSession: () => Promise<unknown> }).openSession = async () => {
     const idx = openCalls++;
+    events.push("open");
     const err = openErrors[idx];
     if (err) throw err;
     const fakeSession = {
@@ -330,7 +366,11 @@ const makeFakeLiveManager = (opts: {
   return {
     mgr,
     spawnCalls,
+    events,
     getOpenCalls: () => openCalls,
+    getCloseCalls: () => closeCalls,
+    getAutofillStarts: () => autofillStarts,
+    getAutofillCancels: () => autofillCancels,
   };
 };
 
@@ -471,6 +511,7 @@ describe("switchCompanyFile launchIfClosed — live-mode error routing", () => {
       launchSource: "registry",
       launchExe: "C:\\fake\\qbw32.exe",
       launchPollAttempts: 1,
+      loginAutofill: "no-credentials",
     });
   });
 
@@ -615,5 +656,248 @@ describe("qb_company_open + qb_company_list — round-trip discovery → switch"
     expect(open.isError).toBe(false);
     expect(open.body.companyFile).toBe(target);
     expect(open.body.simulationStoreReset).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Close one company file and go into another (closeCurrentCompany) + login
+// autofill. Added 2026-10-05.
+// ---------------------------------------------------------------------------
+
+describe("switchCompanyFile closeCurrentCompany — close the open file, open another", () => {
+  const conflict = () => new Error("A company data file is already open and it is different from the one requested.");
+
+  it("file-conflict WITHOUT closeCurrentCompany → 9007 file-conflict, QB not closed, nothing spawned", async () => {
+    const { mgr, spawnCalls, getCloseCalls } = makeFakeLiveManager({ openErrors: [conflict()] });
+    await expect(mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true })).rejects.toMatchObject({
+      name: "QBLaunchError", statusCode: 9007, reason: "file-conflict",
+    });
+    expect(getCloseCalls()).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("the error text tells the agent about closeCurrentCompany", async () => {
+    const { mgr } = makeFakeLiveManager({ openErrors: [conflict()] });
+    await expect(mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true })).rejects.toThrow(/closeCurrentCompany:true/);
+  });
+
+  it("file-conflict WITH closeCurrentCompany → close QB, THEN spawn on B, attach, report closedPreviousQuickBooks", async () => {
+    const { mgr, spawnCalls, events, getCloseCalls } = makeFakeLiveManager({
+      openErrors: [conflict(), null],
+      qbRunning: true,
+    });
+    const session = await mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true });
+    expect(session.companyFile).toBe("C:\\B.qbw");
+    expect(getCloseCalls()).toBe(1);
+    expect(spawnCalls).toEqual([{ exe: "C:\\fake\\qbw32.exe", companyFile: "C:\\B.qbw" }]);
+    expect(events.indexOf("close")).toBeLessThan(events.indexOf("spawn"));
+    expect(mgr.getLastSwitchLaunchInfo()).toMatchObject({
+      launched: true, closedPreviousQuickBooks: true, launchPollAttempts: 1, loginAutofill: "no-credentials",
+    });
+    expect(mgr.getCompanyFile()).toBe("C:\\B.qbw");
+  });
+
+  it("closeCurrentCompany implies launchIfClosed (no need to pass both)", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({ openErrors: [conflict(), null] });
+    await mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true, launchIfClosed: false });
+    expect(spawnCalls).toHaveLength(1);
+  });
+
+  it("graceful close times out (QB showing a prompt) → 9007 close-failed, nothing spawned", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      openErrors: [conflict()],
+      closeResult: { closed: false, outcome: "timeout", detail: "QuickBooks Desktop did not exit after a graceful close request" },
+    });
+    await expect(mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true })).rejects.toMatchObject({
+      name: "QBLaunchError", statusCode: 9007, reason: "close-failed",
+    });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("no executable → fails BEFORE closing QB (never leaves the operator with QB closed and nothing reopened)", async () => {
+    const { mgr, getCloseCalls } = makeFakeLiveManager({ openErrors: [conflict()], exeResolution: null });
+    await expect(mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true })).rejects.toMatchObject({
+      reason: "no-executable",
+    });
+    expect(getCloseCalls()).toBe(0);
+  });
+
+  it("target file already open → attaches directly; QB is NOT closed", async () => {
+    const { mgr, spawnCalls, getCloseCalls } = makeFakeLiveManager({ openErrors: [null], qbRunning: true });
+    await mgr.switchCompanyFile("C:\\A.qbw", { closeCurrentCompany: true });
+    expect(getCloseCalls()).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+    expect(mgr.getLastSwitchLaunchInfo()).toEqual({ launched: false });
+  });
+
+  it("QB running, unrecognized failure, closeCurrentCompany:false → attach-only polling, no second QB spawned", async () => {
+    const { mgr, spawnCalls, getCloseCalls } = makeFakeLiveManager({
+      openErrors: [new Error("QuickBooks did not finish its initialization"), null],
+      qbRunning: true,
+    });
+    await mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true });
+    expect(spawnCalls).toHaveLength(0);
+    expect(getCloseCalls()).toBe(0);
+    expect(mgr.getLastSwitchLaunchInfo()).toMatchObject({ launched: false, launchPollAttempts: 1 });
+  });
+
+  it("QB running, unrecognized failure, closeCurrentCompany:true → close + relaunch", async () => {
+    const { mgr, spawnCalls, getCloseCalls } = makeFakeLiveManager({
+      openErrors: [new Error("no company file is open"), null],
+      qbRunning: true,
+    });
+    await mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true });
+    expect(getCloseCalls()).toBe(1);
+    expect(spawnCalls).toHaveLength(1);
+  });
+
+  it("simulation mode: closeCurrentCompany is a no-op (store reseeds, nothing closed)", async () => {
+    const { session, call } = setupHarness();
+    await session.openSession();
+    const r = await call("qb_company_open", { companyFile: "C:\\fixtures\\B.qbw", closeCurrentCompany: true });
+    expect(r.isError).toBe(false);
+    expect(r.body.simulationStoreReset).toBe(true);
+    expect(r.body.closedPreviousQuickBooks).toBeUndefined();
+  });
+});
+
+describe("switchCompanyFile file-not-found pre-check", () => {
+  it("missing .qbw → 9007 file-not-found; current session NOT closed, QB not closed, nothing spawned", async () => {
+    const { mgr, spawnCalls, getCloseCalls, getOpenCalls } = makeFakeLiveManager({ openErrors: [null], fileMissing: true });
+    await mgr.openSession();
+    const before = mgr.getSession();
+    await expect(mgr.switchCompanyFile("C:UsersVRtypo.qbw", { closeCurrentCompany: true })).rejects.toMatchObject({
+      name: "QBLaunchError", statusCode: 9007, reason: "file-not-found",
+    });
+    expect(mgr.getSession()).toBe(before);
+    expect(mgr.getCompanyFile()).toBe("C:\\initial.qbw");
+    expect(getCloseCalls()).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+    expect(getOpenCalls()).toBe(1);
+  });
+});
+
+describe("switchCompanyFile login autofill", () => {
+  it("saved login filled → attach → loginAutofill:'filled'", async () => {
+    const { mgr, getAutofillStarts } = makeFakeLiveManager({
+      openErrors: [new Error("no company file is open"), new Error("still loading"), null],
+      autofill: { status: "filled" },
+    });
+    await mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true });
+    expect(getAutofillStarts()).toBe(1);
+    expect(mgr.getLastSwitchLaunchInfo().loginAutofill).toBe("filled");
+  });
+
+  it("attach before any login prompt → loginAutofill:'not-needed' and the helper is cancelled", async () => {
+    const { mgr, getAutofillCancels } = makeFakeLiveManager({
+      openErrors: [new Error("no company file is open"), null],
+      autofill: "pending",
+    });
+    await mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true });
+    expect(mgr.getLastSwitchLaunchInfo().loginAutofill).toBe("not-needed");
+    expect(getAutofillCancels()).toBe(1);
+  });
+
+  it("saved login rejected and nobody logs in by hand → 9007 login-rejected after the full wait", async () => {
+    const failures = Array(1 + QB_LAUNCH_POLL_MS.length).fill(new Error("still loading"));
+    const { mgr, getOpenCalls } = makeFakeLiveManager({
+      openErrors: failures,
+      autofill: { status: "rejected" },
+    });
+    await expect(mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true })).rejects.toMatchObject({
+      name: "QBLaunchError", statusCode: 9007, reason: "login-rejected",
+    });
+    // keeps waiting so a human can type the right password
+    expect(getOpenCalls()).toBe(1 + QB_LAUNCH_POLL_MS.length);
+  });
+
+  it("saved login rejected but the operator logs in by hand → attaches; loginAutofill:'rejected'", async () => {
+    const { mgr } = makeFakeLiveManager({
+      openErrors: [new Error("no company file is open"), new Error("A modal dialog box is showing"), null],
+      autofill: { status: "rejected" },
+    });
+    await mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true });
+    expect(mgr.getLastSwitchLaunchInfo().loginAutofill).toBe("rejected");
+  });
+
+  it("timeout with no saved login → message points at qb_company_credentials_edit", async () => {
+    const failures = Array(1 + QB_LAUNCH_POLL_MS.length).fill(new Error("QuickBooks is not running"));
+    const { mgr } = makeFakeLiveManager({ openErrors: failures });
+    await expect(mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true })).rejects.toThrow(/qb_company_credentials_edit/);
+  });
+
+  it("qb_company_open surfaces closedPreviousQuickBooks + loginAutofill in the tool response", async () => {
+    const handlers = new Map<string, Handler>();
+    const fakeServer = { tool: (n: string, _d: string, _s: unknown, h: Handler) => { handlers.set(n, h); } };
+    const { mgr } = makeFakeLiveManager({
+      openErrors: [new Error("A company data file is already open and it is different from the one requested."), null],
+      autofill: { status: "filled" },
+    });
+    registerReportTools(fakeServer as never, () => mgr);
+    const res = await handlers.get("qb_company_open")!({ companyFile: "C:\\B.qbw", closeCurrentCompany: true });
+    const body = JSON.parse(res.content[0].text);
+    expect(res.isError).toBeFalsy();
+    expect(body).toMatchObject({ success: true, closedPreviousQuickBooks: true, loginAutofill: "filled", launched: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Close-first ordering + direct launch with a saved login (live finding
+// 2026-10-05: asking the SDK for file B while an SDK-launched QB still runs
+// file A produced QuickBooks' "unexpected error 80070057" dialog).
+// ---------------------------------------------------------------------------
+
+describe("switchCompanyFile ordering — close first, launch directly when a login is saved", () => {
+  it("switching away from our open file with a saved login: close QB → spawn → autofill → attach; no SDK call before the close", async () => {
+    const { mgr, events, spawnCalls } = makeFakeLiveManager({
+      openErrors: [null, new Error("A modal dialog box is showing"), null],
+      qbRunning: true,
+      savedLogin: true,
+      autofill: { status: "filled" },
+    });
+    await mgr.openSession(); // session on C:\initial.qbw
+    events.length = 0;
+    await mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true });
+    expect(events.slice(0, 3)).toEqual(["close", "spawn", "autofill"]);
+    expect(events.indexOf("open")).toBeGreaterThan(events.indexOf("close"));
+    expect(spawnCalls).toEqual([{ exe: "C:\\fake\\qbw32.exe", companyFile: "C:\\B.qbw" }]);
+    expect(mgr.getLastSwitchLaunchInfo()).toMatchObject({ launched: true, closedPreviousQuickBooks: true, loginAutofill: "filled" });
+  });
+
+  it("switching away with NO saved login: close QB first, then let the SDK open it (automatic-login files)", async () => {
+    const { mgr, events, spawnCalls } = makeFakeLiveManager({ openErrors: [null, null], qbRunning: true });
+    await mgr.openSession();
+    events.length = 0;
+    await mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true });
+    expect(events).toEqual(["close", "open"]);
+    expect(spawnCalls).toHaveLength(0);
+    expect(mgr.getLastSwitchLaunchInfo()).toEqual({ launched: false, closedPreviousQuickBooks: true });
+  });
+
+  it("QB not running + saved login: start QB on the file directly (no unattended SDK open)", async () => {
+    const { mgr, events } = makeFakeLiveManager({ openErrors: [null], savedLogin: true, autofill: "pending" });
+    await mgr.switchCompanyFile("C:\\B.qbw", { launchIfClosed: true });
+    expect(events).toEqual(["spawn", "autofill", "open"]);
+    expect(mgr.getLastSwitchLaunchInfo()).toMatchObject({ launched: true, loginAutofill: "not-needed" });
+  });
+
+  it("re-opening the SAME file we already have open does not close QB", async () => {
+    const { mgr, getCloseCalls, spawnCalls } = makeFakeLiveManager({ openErrors: [null, null], qbRunning: true, savedLogin: true });
+    await mgr.openSession();
+    await mgr.switchCompanyFile("c:\\INITIAL.qbw", { closeCurrentCompany: true });
+    expect(getCloseCalls()).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("close-first stalls on a QB prompt → 9007 close-failed and nothing spawned", async () => {
+    const { mgr, spawnCalls } = makeFakeLiveManager({
+      openErrors: [null],
+      qbRunning: true,
+      savedLogin: true,
+      closeResult: { closed: false, outcome: "timeout", detail: "QuickBooks Desktop did not exit" },
+    });
+    await mgr.openSession();
+    await expect(mgr.switchCompanyFile("C:\\B.qbw", { closeCurrentCompany: true })).rejects.toMatchObject({ reason: "close-failed" });
+    expect(spawnCalls).toHaveLength(0);
   });
 });

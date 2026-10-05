@@ -1,55 +1,101 @@
 # Handoff State
 
-_Last updated: 2026-05-29. **Phase 19 #91 closed.** CLI doctor (`quickbooks-desktop-mcp-doctor`) fleshed out — 7 pure probes over an injected `DoctorDeps` bag, `✓ / ✗ / ⚠` per probe with a one-line remediation on every `✗`, exit **0** all-green / **1** any-fail / **2** any-skip (fail outranks skip). QB-install probe reuses #90's `resolveQBDesktopExe` chain and surfaces both the resolved exe path AND the source branch. Verified live on the Windows box. Build green, **63 test files / 1725 tests passing** (was 62 / 1690 → +1 file, +35 tests). Tool count unchanged at 150 (doctor is a separate bin, not an MCP tool). **Phase 19 now has only #92 left (Windows installer — lower priority, gated on a signing-cert decision).** The feature/delivery backlog is effectively complete._
+> **Update (later on 2026-10-05): #106 control page redesign + crash recovery.**
+> - **Control page:** a 5-tab page: Overview pipeline + actions, Company files, Access grid, Activity, Storage & security.
+> - **Health:** `qb_health`, built on [src/util/qb-health.ts](src/util/qb-health.ts) + `scripts/qb-health.ps1`.
+> - **Recovery:** `qb_session_recover` and `QBSessionManager.recover()`. Reads auto-retry after a crash; writes get 9011. Recovery refuses with 9010 while File Doctor runs, a dialog is open, or QB is hung; force-close happens only with permission.
+> - **Activity:** `activity.log` ([src/util/activity-log.ts](src/util/activity-log.ts)).
+> - **Status codes:** 9010/9011 added to qb-status-codes, SKILL.md, README and the instructions block.
+> - **Totals:** 154 tools; 65 files / 1816 tests green.
+> - **Also fixed live today:** the auto-fill now presses QuickBooks' custom OK button (mouse-click fallback); switching closes QB *before* asking the SDK for the next file (this avoided the 80070057 dialog); `file-not-found` is checked before anything closes; a rejected login keeps waiting so a human can type.
+> - **Docs:**
+>   - The README was rewritten as a product page: hero, highlights, mermaid diagram, quick start, control page with screenshots, multi-company, remote agents, crash recovery, security, merged config table (stale "live mode errors until Phase 7" text fixed), troubleshooting.
+>   - The 154-tool reference moved verbatim to [docs/TOOLS.md](docs/TOOLS.md).
+>   - The screenshots in `docs/images/` come from `node scripts/demo-control-page.mjs [port] --root <folder> --exit-after <s>`, which uses made-up data only. The repo is PUBLIC, so never screenshot real client files, devices, IPs or logins.
+> - **Next live checks:** #106, close QB with its X during an agent session and then run a report; #105, a second tailnet device. Steps are in ACCEPTANCE_CRITERIA Items 105/106.
+> - **Gotcha:** never use shell one-liners (`node -e` / `sed`) to write regexes containing backslashes into TS. They were silently corrupted three times today; use the Edit tool.
+
+
+_Last updated: 2026-10-05 (second session of the day)._
+
+This session built **Phase 20 #105**:
+- a local **logins web page** that starts with the MCP server;
+- **remote MCP for agents on other tailnet devices**, with **per-company-file authorization pinned to the device's tailnet address + Tailscale node**.
+
+The server uses saved logins itself, so agents never receive passwords (the operator chose this). The Windows popup from earlier today is gone. SKILL.md is updated for agents.
+
+Status: build green; **64 test files / 1787 tests passing** with `QB_UI_TESTS=1`; still **152 tools**.
 
 ## Last Session Summary
 
-- **Phase 19 #91 implemented end-to-end.** [src/cli/doctor.ts](src/cli/doctor.ts) replaced the #87 stub. Architecture: a pure, I/O-free core (`runDoctor(deps)` + seven `probe*` helpers + `formatReport`) over an injected `DoctorDeps` bag; `main()` is the only impure part (wires `buildDefaultDeps()`, prints, `process.exit`). Same test-seam discipline as #90's `makeFakeLiveManager`.
-- **Seven probes:** Node version (major 20 only → ok; else fail), Platform (win32 → ok; else skip — sim mode is legit off-Windows), QuickBooks Desktop (reuses #90's `resolveQBDesktopExe` + surfaces `exe` + `source: env|registry|fallback`), QBXMLRP2 COM (`reg query` the ProgID; distinguishes key-absent→fail from reg.exe-unavailable→skip via the spawn error code), QB_COMPANY_FILE (unset/missing → fail), QB_COMPANY_ROOT (unset → ok, defaults to dirname; set-but-missing → fail), winax (real `require("winax")`, classifies missing vs abi-mismatch).
-- **Exit-code contract:** 0 all-green / 1 any-fail / 2 any-skip-and-no-fail. `fail` outranks `skip` (CI-friendly; actionable signal wins).
-- **Live verified on the Windows dev box.** `node dist/cli/doctor.js` → exit 1 with honest output: `✓` Node 20.20.2, `✓` Windows x64, `✗` QB Desktop not at known paths (COM is registered but the exe isn't at a known path on this box → correctly told to set `QB_DESKTOP_EXE`), `✓` QBXMLRP2 registered, `✗` QB_COMPANY_FILE unset, `✓` QB_COMPANY_ROOT default, `✓` winax loadable.
-- **Tests.** New [tests/doctor.test.ts](tests/doctor.test.ts) (35 tests: every branch of all 7 probes, the 4 exit-code paths incl. fail-outranks-skip, and `formatReport` rendering — symbols, remediation arrows, summary line). No other test file touched.
-- **Docs.** README smoke-test parenthetical rewritten (real 7-probe description + 0/1/2 contract). DECISIONS.md 2026-05-29 + ACCEPTANCE_CRITERIA.md Item 91 entry + todo.md #91 closed.
+- **Operator decisions (AskUserQuestion, 2026-10-05):**
+  1. The server uses credentials itself, not returning them to the agent.
+  2. Tailnet authorization governs remote agents (MCP over HTTP) **and** the page.
+  3. The webpage replaces the popup.
+
+  All three are recorded in DECISIONS.md, top entry.
+- **New modules:**
+  - [src/web/server.ts](src/web/server.ts): `node:http` server serving the page, `/api/*` and `/mcp` (SDK `StreamableHTTPServerTransport`, one McpServer per session).
+  - [src/web/admin-page.ts](src/web/admin-page.ts): self-contained HTML/JS; light and dark; renders with textContent only.
+  - [src/util/tailnet.ts](src/util/tailnet.ts): `tailscale ip`, `whois --json` and `status --json`, with an injectable runner.
+  - [src/util/caller-authorization.ts](src/util/caller-authorization.ts): identities, rules, and `installAuthorizationGuard`.
+  - [scripts/qb-dpapi-protect.ps1](scripts/qb-dpapi-protect.ps1): reads base64 on stdin, writes a DPAPI blob.
+- **Changed modules:**
+  - [src/util/qb-credentials.ts](src/util/qb-credentials.ts): store v2 with `authorizedPeers`, atomic write, `upsertLogin` / `removeEntry` / `addAuthorizedPeer` / `removeAuthorizedPeer`, `protectPassword`. The popup code is gone.
+  - [src/tools/company-credentials.ts](src/tools/company-credentials.ts): `_edit` returns or opens the page URL; `_list` includes authorizations.
+  - [src/index.ts](src/index.ts): `createMcpServer(identity)` factory; `main()` starts stdio plus the web server; new instructions bullets.
+  - `qb-status-codes.ts`: adds 9009.
+- **Removed:** `scripts/qb-credentials-dialog.ps1`.
+- **Verified live on this PC (simulation mode, temp store, port 8799; your real store untouched):**
+  - the banner shows both URLs;
+  - the page answers on `127.0.0.1` and this PC's tailnet IP;
+  - the API without its header gets 403;
+  - a real DPAPI save leaves no plaintext on disk (328-char ciphertext);
+  - a user-name change keeps the password;
+  - a real whois authorization of another of the operator's tailnet devices pinned its node StableID;
+  - an MCP client over HTTP via both addresses saw 152 tools with no leak;
+  - the stdio `qb_company_credentials_edit` returned the `?file=` URL.
+- **Screenshots** (headless Edge) were checked at 1100px light and 520px dark.
 
 ## Verify Before Continuing
 
 - [ ] `npm run build` → exit 0.
-- [ ] `npm test` → `Test Files 63 passed | Tests 1725 passed`.
-- [ ] `node dist/cli/doctor.js` → prints a 7-line probe report (Node version / Platform / QuickBooks Desktop / QBXMLRP2 COM / QB_COMPANY_FILE / QB_COMPANY_ROOT / winax) + a `Summary: N passed, N failed, N skipped → exit N` line, and the process exit code matches that summary.
-- [ ] [src/cli/doctor.ts](src/cli/doctor.ts) exports `runDoctor`, `formatReport`, `buildDefaultDeps`, all seven `probe*` functions, `defaultComRegistered`, `defaultWinaxStatus`, and the `DoctorDeps` / `ProbeResult` / `ProbeStatus` / `DoctorReport` types. `main()` is NOT exported and only runs when invoked as the bin entry.
-- [ ] [todo.md](todo.md) — **#91 is `[x]`** with the 2026-05-29 close annotation. Phase 19 unchecked: only **#92**.
-- [ ] [DECISIONS.md](DECISIONS.md) — top entry is `2026-05-29 — CLI doctor probe model + exit-code precedence (Phase 19 #91 closed)`. The 2026-05-28 #90 entry is still immediately below.
-- [ ] **(Windows + QB) carried** — all live spot-checks from prior handoffs, including #90's `launchIfClosed: true` first-run verification (file-not-loaded → spawn+attach; different .qbw open → 9007 file-conflict).
+- [ ] `npm test` passes. `QB_UI_TESTS=1 npx vitest run` → 1787 tests pass; these open OFF-SCREEN windows titled "AUTOFILL TEST - DO NOT TYPE HERE".
+- [ ] Start the server (Claude Desktop restart, or `QB_HTTP_ONLY=1 node dist/index.js`). The banner prints `Logins page: http://127.0.0.1:8765/  http://<tailnet IP>:8765/`, and the page opens in a browser.
+- [ ] **(Operator, live) #105 open criterion:**
+  1. On another tailnet device, add the MCP server `{ "type": "http", "url": "http://<host tailnet IP>:8765/mcp" }`.
+  2. Call `qb_company_list`: it should show nothing authorized and return 9009 on data tools.
+  3. Authorize that device for one file on the page.
+  4. `qb_company_list` now shows the file, and `qb_company_open` works.
+- [ ] **(Operator, live) #93 still open:** a password-protected `.qbw` with a saved login → `qb_company_open({companyFile, closeCurrentCompany:true})` → `loginAutofill:"filled"`. See ACCEPTANCE_CRITERIA Item 93.
+- [ ] Windows Firewall: a first bind on the tailnet IP may raise a firewall prompt for node.exe. Allow it on the Tailscale (private) network only.
 
 ## Next Task
 
-**Only Phase 19 #92 remains — and it's blocked on a non-technical decision, not code.**
-
-- [ ] **#92.** (Lower priority) Windows installer — bundle the Node runtime + built CLI into a **signed** `.exe` via `pkg` or `oclif`, to reach accountants who would never type `npx`. **Gating decision is the code-signing certificate (~$200-400/yr), not the packaging.** Do NOT start building this without the operator first deciding (a) whether there's real non-developer demand and (b) whether they'll buy a signing cert — an unsigned installer trips SmartScreen and is worse than the `npx` path for trust. **Recommend surfacing this as a question to the operator rather than auto-starting it.**
-
-If the operator does not want #92 yet, **Phase 19 (and the whole fix list) is complete.** Reasonable forward motion in that case: a final pass on the carried Windows-only live verifications (they're the only `partial` items left across the project), or close out the project formally.
+Operator-run live checks for **#105** and **#93** (steps above). Then the review backlog in todo.md Phase 20, starting with **#94: parser numeric coercion** and **#95/#96** (Add/Mod element order and names). Phase 19 #92 (installer) is still gated on the signing-cert decision.
 
 ## Context Notes
 
-- **#91 reused #90's exe-detection chain by design.** The doctor imports `resolveQBDesktopExe` + `defaultRegistryQuery` + `defaultFileExists` from [src/util/qb-desktop-launch.ts](src/util/qb-desktop-launch.ts) — do NOT reimplement. The known-paths list there is the shared brittle surface: a QB install at a non-standard path with no registry `InstallPath` reports `✗ QuickBooks Desktop` in the doctor even when QB is present. `QB_DESKTOP_EXE` is the escape hatch and fixes both the doctor probe AND the launcher in one shot. (Observed live: this box has QBXMLRP2 registered but no exe at a known path.)
-
-- **Doctor test-seam pattern.** `runDoctor` / the `probe*` helpers / `formatReport` are pure over `DoctorDeps`. To test a branch, build a deps bag with `makeDeps({ ...override })` in [tests/doctor.test.ts](tests/doctor.test.ts) and assert on the returned `ProbeResult` / `DoctorReport`. The real side-effecting probes (`defaultComRegistered`, `defaultWinaxStatus`, `defaultRegistryQuery`, `defaultFileExists`) are only wired in `buildDefaultDeps()` — never call them from a test.
-
-- **Probe judgement calls that look opinionated but are deliberate** (all in DECISIONS.md 2026-05-29): Node major-20-only is a hard fail (not a warn) because v22 breaks winax; `QB_COMPANY_FILE` unset is a fail (headline live setting) while `QB_COMPANY_ROOT` unset is `ok` (it defaults to dirname); non-Windows is `skip` not `fail` (sim mode is the documented default); `fail` outranks `skip` for the exit code.
-
-- **The CLI entry guard** is `import.meta.url === pathToFileURL(process.argv[1]).href`. This keeps `main()` from printing/exiting when vitest imports the module. If you add another bin or move the file, preserve that guard or tests will call `process.exit`.
-
-- **Carried gotchas** (unchanged from #90's handoff — still authoritative):
-  - QBXMLRP2 cannot OPEN a `.qbw` — only attach. #90's auto-launch path spawns QB Desktop with the .qbw as a process arg to resolve this.
-  - Live verification requires `C:\nvm4w\nodejs\node.exe` v20.20.2 (system PATH v22 breaks winax) — this is exactly what the doctor's Node-version probe enforces.
-  - `winax` is in `optionalDependencies` — non-Windows installs skip it cleanly; the doctor's winax probe `skip`s off-Windows accordingly.
-  - statusCodes: 9001 read-only, 9002 idempotency conflict, 9003 edition, 9004 payroll, 9005 SDK-no-write, 9006 reserved-but-zero-emit, 9007 launch failure, 9008 multi-user lock. (The doctor uses its own `ok`/`fail`/`skip` model + 0/1/2 exit codes — it does NOT emit QB statusCodes; it's a pre-flight CLI, not a tool handler.)
-  - `*Core` private methods are the chokepoint for dry-run + read-only gating.
-  - `structuredClone` is the deep-clone primitive in sim store snapshot/restore.
-  - `idCounter` ticks twice per add (ListID + EditSequence).
-  - `fast-xml-parser` doesn't decode numeric character entities; DOES coerce numeric-looking text to numbers.
-  - Dispatch order in sim `processRequest`: non-entity-typed `*QueryRq` / `*ModRq` / `AttachableAddRq` / `DataExtDefQueryRq` MUST precede the `endsWith` catch-alls.
-
-- **Phase 19 numbering** ends at #92. There is no #93 — the fix list is closed once #92 is resolved (built or explicitly deferred).
-
-- **DO NOT re-debate** npm publishing (DECISIONS.md 2026-05-24) or #90's design Qs (DECISIONS.md 2026-05-28).
+- **Every tool is guarded automatically for remote callers.** `installAuthorizationGuard` wraps `server.tool` and must run before the `register*Tools` calls (it does, inside `createMcpServer`).
+  - A new tool needs nothing special unless it should be callable without an authorized active file. In that case add it to `ALWAYS_ALLOWED` **and** make sure it exposes no company data, or filter its output in `filterResult`.
+- **One QB session is shared by all callers.** That's why remote calls are checked against the file active *at call time*, not "the file this agent opened". Concurrent multi-file use is out of scope (F13.4).
+- **Identity:**
+  - Loopback and this PC's own tailnet IP are `local` (unrestricted).
+  - Other 100.64/10 addresses go through `tailscale whois` (60s cache; `clearWhoisCache()` for tests).
+  - Page admins are `local` plus devices of the same Tailscale login as this PC (never `tagged-devices`) plus `QB_WEB_ADMINS`. On a single-owner tailnet every device is therefore a page admin; per-file MCP authorization is separate.
+- **Test seams:**
+  - `startWebServer({ port: 0, listenHosts: ["127.0.0.1"], tailscale: fakeRunner, protect: fakeProtect, identifyCaller })`. `identifyCaller` lets tests act as remote devices from loopback (see tests/company-credentials.test.ts, which drives a real SDK `Client` over HTTP).
+  - `upsertLogin(..., { protect })` avoids PowerShell.
+- **Port collisions:** if 8765 is busy (e.g. a second MCP process), the page and `/mcp` are skipped with a stderr note. Stdio MCP still works, and both processes share the same store.
+- **Store compatibility:** v1 files (popup era) load fine. The autofill script reads `entries[].companyFile/username/password` only, so it is unaffected by v2.
+- **PowerShell helpers:**
+  - They must stay pure ASCII (a test enforces this).
+  - Pass secrets via stdin as base64, never as argv.
+  - In 5.1, `ConvertFrom-Json` emits arrays as one object.
+  - Exceptions inside WinForms handlers are swallowed.
+- **Never put a fake "QuickBooks login" window on the operator's screen**, and **never probe real client books** (blocked as production reads). Both apply from earlier today.
+- **Carried gotchas:**
+  - Live mode needs Node v20.20.2 at `C:\nvm4w\nodejs\node.exe`.
+  - statusCodes 9001-9009; 9007 has 6 reasons.
+  - `*Core` methods gate dry-run and read-only.
+  - The sim dispatch-order rule still applies.
