@@ -41,9 +41,10 @@
  *     incidentally contains the substring "not open" doesn't misclassify.
  */
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Exe detection
@@ -69,6 +70,14 @@ export const KNOWN_QB_DESKTOP_PATHS: readonly string[] = Object.freeze([
   "C:\\Program Files\\Intuit\\QuickBooks\\qbw.exe",
   "C:\\Program Files\\Intuit\\QuickBooks 2024\\qbw.exe",
   "C:\\Program Files\\Intuit\\QuickBooks 2023\\qbw.exe",
+  // 64-bit QB (2022+ / Enterprise 22+) installs under Program Files, not
+  // (x86), and ships QBW.EXE — observed on the dev box 2026-10-05 for
+  // Enterprise 24.0. Appended (not interleaved) to keep prior order stable.
+  "C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 25.0\\qbw.exe",
+  "C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 24.0\\qbw.exe",
+  "C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 23.0\\qbw.exe",
+  "C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 22.0\\qbw.exe",
+  "C:\\Program Files\\Intuit\\QuickBooks 2025\\qbw.exe",
 ]);
 
 /**
@@ -92,7 +101,8 @@ export interface QBExeResolution {
 export interface QBExeResolver {
   envExe?: string;
   fileExists: (p: string) => boolean;
-  registryQuery: () => string | null;
+  /** One candidate exe path, an ordered list of candidates, or null. */
+  registryQuery: () => string | readonly string[] | null;
 }
 
 /**
@@ -111,8 +121,12 @@ export function resolveQBDesktopExe(resolver: QBExeResolver): QBExeResolution | 
     }
   }
   const fromRegistry = resolver.registryQuery();
-  if (fromRegistry && resolver.fileExists(fromRegistry)) {
-    return { exe: fromRegistry, source: "registry" };
+  const registryCandidates =
+    fromRegistry == null ? [] : typeof fromRegistry === "string" ? [fromRegistry] : fromRegistry;
+  for (const candidate of registryCandidates) {
+    if (candidate && resolver.fileExists(candidate)) {
+      return { exe: candidate, source: "registry" };
+    }
   }
   for (const candidate of KNOWN_QB_DESKTOP_PATHS) {
     if (resolver.fileExists(candidate)) {
@@ -138,13 +152,18 @@ export function resolveQBDesktopExe(resolver: QBExeResolver): QBExeResolution | 
  * Returns `null` (not throws) on any failure — the caller's fallback chain
  * is the recovery path.
  */
-export function defaultRegistryQuery(): string | null {
+export function defaultRegistryQuery(): readonly string[] | null {
   if (process.platform !== "win32") return null;
   let out: string;
   try {
+    // No /v filter: Intuit writes the exe under a "Path" value (full exe
+    // path — e.g. HKLM\SOFTWARE\Intuit\QuickBooks\34.0\belacct → Path =
+    // ...\QuickBooks Enterprise Solutions 24.0\qbw.exe, observed live
+    // 2026-10-05), while older installs used "InstallPath" (a directory).
+    // Filtering on InstallPath alone missed every modern install.
     out = execFileSync(
       "reg",
-      ["query", "HKLM\\SOFTWARE\\Intuit\\QuickBooks", "/v", "InstallPath", "/s"],
+      ["query", "HKLM\\SOFTWARE\\Intuit\\QuickBooks", "/s"],
       {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
@@ -155,7 +174,32 @@ export function defaultRegistryQuery(): string | null {
   } catch {
     return null;
   }
-  return parseRegistryQuery(out);
+  const candidates = parseRegistryCandidates(out);
+  return candidates.length > 0 ? candidates : null;
+}
+
+/**
+ * Every plausible exe path in a `reg query /s` dump, newest-first. A "Path"
+ * value ending in .exe is taken verbatim; an "InstallPath" directory yields
+ * both qbw.exe (64-bit, QB 2022+) and qbw32.exe (32-bit). The resolver's
+ * fileExists check picks whichever is actually on disk. Later keys in the
+ * dump are newer versions, so the list is reversed.
+ */
+export function parseRegistryCandidates(regOutput: string): string[] {
+  const out: string[] = [];
+  for (const m of regOutput.matchAll(/^\s*(Path|InstallPath)\s+REG_SZ\s+(.+?)\s*$/gim)) {
+    const value = m[2].trim();
+    if (!value) continue;
+    if (m[1].toLowerCase() === "path") {
+      if (/\.exe$/i.test(value)) out.push(value);
+    } else {
+      out.push(path.join(value, "qbw32.exe"), path.join(value, "qbw.exe"));
+    }
+  }
+  // Newest-first, keeping each path's first (i.e. newest) occurrence. Pairs
+  // from one InstallPath are reversed together, so re-order within the pair
+  // is irrelevant — fileExists decides.
+  return [...new Set(out.reverse())];
 }
 
 /**
@@ -210,6 +254,12 @@ const FILE_CONFLICT_PATTERNS: readonly RegExp[] = Object.freeze([
   /already\s+(?:open|loaded)\s+with\s+a\s+different/i,
   /not\s+the\s+same\s+as\s+the\s+(?:file|company)\s+currently/i,
   /different\s+\.qbw/i,
+  // Intuit's documented BeginSession text: "A company data file is already
+  // open and it is different from the one requested." Sourced from the SDK
+  // error table — not yet observed on the dev box (live probing of real
+  // client books was out of scope on 2026-10-05).
+  /already\s+open\s+and\s+it\s+is\s+different/i,
+  /different\s+from\s+the\s+one\s+requested/i,
 ]);
 
 /**
@@ -235,6 +285,7 @@ const FILE_NOT_LOADED_PATTERNS: readonly RegExp[] = Object.freeze([
   /quickbooks\s+is\s+not\s+running/i,
   /company\s+file\s+not\s+(?:open|loaded|found)/i,
   /no\s+such\s+(?:interface|object)/i,
+  /if\s+quickbooks\s+is\s+not\s+running,\s+a\s+company\s+file\s+must\s+be\s+specified/i,
   /0x80040420/i,
   /0x80040402/i,
 ]);
@@ -277,7 +328,9 @@ export function classifyBeginSessionError(message: string): BeginSessionErrorCla
  * machines. A flat 30s sleep wastes time on warm restarts that finish in
  * 2s. The exponential head + long tail gets the best of both.
  */
-export const QB_LAUNCH_POLL_MS: readonly number[] = Object.freeze([1000, 2000, 4000, 8000, 15000]);
+export const QB_LAUNCH_POLL_MS: readonly number[] = Object.freeze([
+  1000, 2000, 4000, 8000, 15000, 15000, 15000, 30000,
+]);
 
 /**
  * Default implementation of the spawn primitive. Uses `spawn` with
@@ -305,4 +358,129 @@ export function defaultLaunchQBDesktop(exe: string, companyFile: string): void {
  */
 export function defaultFileExists(p: string): boolean {
   return existsSync(p);
+}
+
+// ---------------------------------------------------------------------------
+// Running-instance detection + graceful close
+// ---------------------------------------------------------------------------
+
+/** Image names QB Desktop runs under (64-bit QB 2022+ / Enterprise 22+ is QBW.EXE). */
+export const QB_DESKTOP_IMAGE_NAMES: readonly string[] = Object.freeze(["QBW.EXE", "QBW32.EXE"]);
+
+/**
+ * True when a QB Desktop GUI process is running. Uses `tasklist` (always
+ * present on Windows). Off-Windows, or if tasklist fails → false.
+ */
+export function defaultIsQBDesktopRunning(): boolean {
+  if (process.platform !== "win32") return false;
+  for (const image of QB_DESKTOP_IMAGE_NAMES) {
+    try {
+      const out = execFileSync("tasklist", ["/FI", `IMAGENAME eq ${image}`, "/FO", "CSV", "/NH"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+        windowsHide: true,
+      });
+      if (out.toLowerCase().includes(`"${image.toLowerCase()}"`)) return true;
+    } catch {
+      /* tasklist unavailable — treat as not running */
+    }
+  }
+  return false;
+}
+
+export interface QBCloseResult {
+  /** True when no QB Desktop process remains afterwards. */
+  closed: boolean;
+  outcome: "not-running" | "closed" | "timeout" | "error";
+  detail?: string;
+}
+
+/**
+ * Budget for QB Desktop to exit after a graceful close request. Measured on
+ * the dev box (Enterprise 24.0, 2026-10-05): WM_CLOSE → process exit took
+ * 20-25s, so 90s leaves headroom for larger files / slower disks.
+ */
+export const QB_CLOSE_TIMEOUT_MS = 90_000;
+
+/**
+ * Gracefully close QB Desktop — the programmatic equivalent of clicking the
+ * main window's X — via scripts/qb-close-desktop.ps1, which posts WM_CLOSE
+ * to QB's "MauiFrame" window and waits for exit. NEVER force-kills: a
+ * force-kill mid-write risks damaging the .TLG/.ND files, and an open form
+ * with unsaved edits would be silently lost. If QB raises a prompt (unsaved
+ * form, backup reminder, exit confirmation) the close stalls and this
+ * returns `timeout`, naming the visible QB windows so the operator knows
+ * what to answer.
+ *
+ * (Process.CloseMainWindow() is NOT used first: on QB Enterprise 24 .NET
+ * picked a toolbar "Afx:" window as MainWindowHandle and the close was
+ * silently ignored — observed live 2026-10-05.)
+ */
+export function defaultCloseQBDesktop(timeoutMs: number = QB_CLOSE_TIMEOUT_MS): Promise<QBCloseResult> {
+  if (process.platform !== "win32") {
+    return Promise.resolve({ closed: true, outcome: "not-running" });
+  }
+  const script = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "scripts", "qb-close-desktop.ps1");
+  return new Promise((resolve) => {
+    const child = spawn(
+      "powershell.exe",
+      [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", script,
+        "-TimeoutMs", String(Math.max(1000, Math.floor(timeoutMs))),
+        "-ProcessNames", QB_DESKTOP_IMAGE_NAMES.map((n) => n.replace(/\.EXE$/i, "")).join(","),
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => { stdout += String(d); });
+    child.stderr.on("data", (d) => { stderr += String(d); });
+    child.on("error", (err) => resolve({ closed: false, outcome: "error", detail: err.message }));
+    child.on("close", () => {
+      let r: { outcome?: string; windows?: unknown; detail?: unknown } | null = null;
+      try {
+        r = JSON.parse(stdout.trim().split(/\r?\n/).pop() ?? "");
+      } catch { /* fall through */ }
+      if (r?.outcome === "closed" || r?.outcome === "not-running") {
+        resolve({ closed: true, outcome: r.outcome });
+      } else if (r?.outcome === "timeout") {
+        const windows = Array.isArray(r.windows) ? r.windows.map(String).filter(Boolean) : [];
+        resolve({
+          closed: false,
+          outcome: "timeout",
+          detail:
+            "QuickBooks Desktop did not exit after a graceful close request — it is probably showing a prompt (unsaved form, backup reminder, or exit confirmation). Answer it in QuickBooks, then retry." +
+            (windows.length ? ` Open QuickBooks windows: ${windows.map((w) => `"${w}"`).join(", ")}.` : ""),
+        });
+      } else {
+        resolve({
+          closed: false,
+          outcome: "error",
+          detail: (typeof r?.detail === "string" ? r.detail : (stderr || stdout).trim()).slice(0, 500),
+        });
+      }
+    });
+  });
+}
+
+/**
+ * Force-kill every QB Desktop process. ONLY for a QuickBooks that Windows
+ * reports as hung, and only when the operator (page button) or the agent
+ * (qb_session_recover forceCloseHungQuickBooks:true) explicitly allowed it.
+ * An unsaved form in QB is lost. Resolves true when no QB process remains.
+ */
+export function defaultForceCloseQBDesktop(): Promise<boolean> {
+  if (process.platform !== "win32") return Promise.resolve(true);
+  const names = QB_DESKTOP_IMAGE_NAMES.map((n) => `'${n.replace(/\.EXE$/i, "")}'`).join(",");
+  const script =
+    `Get-Process -Name ${names} -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; ` +
+    `Start-Sleep -Milliseconds 1500; ` +
+    `if (@(Get-Process -Name ${names} -ErrorAction SilentlyContinue).Count -eq 0) { 'closed' } else { 'still-running' }`;
+  return new Promise((resolve) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { timeout: 30_000, windowsHide: true }, (_err, stdout) => {
+      resolve(String(stdout ?? "").trim().endsWith("closed"));
+    });
+  });
 }

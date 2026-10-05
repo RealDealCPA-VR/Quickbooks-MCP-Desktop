@@ -125,7 +125,17 @@ The operator manages books for multiple clients, all stored as `.qbw` files in a
 
 - **F13.1** The operator can list the available company files (those discoverable under a configured root, typically the file-server folder).
 - **F13.2** The operator can switch the active company file at runtime via a tool call. Switching closes the current session, opens a session against the new file, and subsequent tool calls operate against the new file.
-- **F13.3** Switching does not require any interactive QB-side authentication. (QuickBooks authorizes the application once via its Integrated Application preferences; subsequent file opens by the same app are silent.)
+- **F13.3** Switching does not require the operator to retype anything per switch. QuickBooks authorizes the application once per file via its Application Certificate prompt (a QB Admin answers it in the QB window — intentionally not automated). Files protected by a QuickBooks user name/password are logged into automatically from the operator's saved logins (F13.5). _(Revised 2026-10-05: the original wording assumed no per-file QB login, which is false for password-protected files.)_
+- **F13.5** Whenever the MCP server runs, it serves a local web page where the operator enters a file path with its QuickBooks user name and password. Logins are stored on the computer running the server, persist across restarts, and are picked up automatically. When a file already has a saved login, the page shows it pre-filled so nothing is entered twice. The operator can change the user name or password, and saving overwrites the old login. Passwords are encrypted for the operator's Windows account and are never shown to, or returned through, any agent or the MCP wire. The server supplies them to QuickBooks itself at the moment an agent opens the file. _(Added 2026-10-05; popup replaced by the web page the same day.)_
+- **F13.7** The operator can authorize, per company file, which tailnet devices may use it. The authorization is pinned to the device's tailnet address and Tailscale node. Agents on authorized devices connect over the tailnet and may use only their authorized files; everything else is refused with a clear reason. Agents on the host computer are unrestricted. _(Added 2026-10-05.)_
+- **F13.6** The operator can go from one company file to another even while QuickBooks Desktop has a different file open: the server closes QuickBooks gracefully (never force-kills, never answers QuickBooks prompts on the operator's behalf), reopens it on the requested file, logs in with the saved login, and attaches. A wrong saved password is submitted once only and reported. _(Added 2026-10-05.)_
+- **F13.8** When QuickBooks Desktop crashes, freezes, stops on a dialog or goes through File Doctor, the operator and agents can see exactly what is happening and re-engage:
+  - read requests (reports and queries) reconnect to the same file and retry by themselves;
+  - writes are never repeated blindly;
+  - the server never reopens a file that File Doctor is repairing;
+  - QuickBooks is force-closed only when it is frozen and someone explicitly allowed it.
+
+  The control page shows the live state of agents, the server, QuickBooks and the storage, plus every access assignment and an activity history. _(Added 2026-10-05.)_
 - **F13.4** Only one company file is active at a time. QuickBooks Desktop only allows one open file per QB instance — concurrent multi-file is and remains out of scope.
 
 ---

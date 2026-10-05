@@ -49,14 +49,28 @@ import { QBLookupCache } from "./lookup-cache.js";
 import { getQbxmlLogger } from "../util/qbxml-logger.js";
 import {
   classifyBeginSessionError,
+  defaultCloseQBDesktop,
+  defaultForceCloseQBDesktop,
   defaultFileExists,
+  defaultIsQBDesktopRunning,
   defaultLaunchQBDesktop,
   defaultRegistryQuery,
   QB_LAUNCH_POLL_MS,
   resolveQBDesktopExe,
+  type QBCloseResult,
   type QBExeResolution,
   type QBExeSource,
 } from "../util/qb-desktop-launch.js";
+import { recordActivity } from "../util/activity-log.js";
+import { getQuickBooksHealth, type QBHealth } from "../util/qb-health.js";
+import {
+  findCredentialSummary,
+  normalizeCompanyPath,
+  startLoginAutofill,
+  type LoginAutofillHandle,
+  type LoginAutofillResult,
+  type LoginAutofillStatus,
+} from "../util/qb-credentials.js";
 
 // ---------------------------------------------------------------------------
 // QBXMLRP2 SDK constants (Intuit QuickBooks SDK 16.0)
@@ -143,9 +157,11 @@ export class QBIdempotencyKeyConflictError extends Error {
 }
 
 /**
- * Thrown by `switchCompanyFile` when `launchIfClosed: true` cannot resolve
- * the connection because: (a) QB Desktop is already running with a
- * different .qbw open and we cannot swap without UI automation, (b) the
+ * Thrown by `switchCompanyFile` when `launchIfClosed` / `closeCurrentCompany`
+ * cannot resolve the connection because: (a) QB Desktop is already running
+ * with a different .qbw open and closeCurrentCompany was not set, (a2) the
+ * graceful close stalled on a QB prompt ("close-failed"), (a3) QB rejected
+ * the saved login ("login-rejected"), (b) the
  * launch attempt was made but never attached within the
  * `QB_LAUNCH_POLL_MS` budget, or (c) no QB Desktop executable could be
  * located via the env-var / registry / known-paths fallback chain.
@@ -159,12 +175,24 @@ export class QBIdempotencyKeyConflictError extends Error {
  * local QB Desktop state can be fixed (close the conflicting file, launch
  * QB manually, or set QB_DESKTOP_EXE).
  */
+export type QBLaunchErrorReason =
+  | "file-conflict"
+  | "no-executable"
+  | "launch-timeout"
+  | "launch-spawn-failed"
+  // QB Desktop would not exit after a graceful close request (closeCurrentCompany).
+  | "close-failed"
+  // The saved login was submitted and QB kept its login dialog open.
+  | "login-rejected"
+  // The requested .qbw does not exist; checked before anything is closed.
+  | "file-not-found";
+
 export class QBLaunchError extends Error {
   statusCode: number;
-  reason: "file-conflict" | "no-executable" | "launch-timeout" | "launch-spawn-failed";
+  reason: QBLaunchErrorReason;
   underlyingMessage?: string;
   constructor(
-    reason: "file-conflict" | "no-executable" | "launch-timeout" | "launch-spawn-failed",
+    reason: QBLaunchErrorReason,
     message: string,
     underlyingMessage?: string,
   ) {
@@ -174,6 +202,91 @@ export class QBLaunchError extends Error {
     this.reason = reason;
     if (underlyingMessage) this.underlyingMessage = underlyingMessage;
   }
+}
+
+/**
+ * QuickBooks can't serve requests right now and a person has to act:
+ * File Doctor is repairing the file, QB is hung, a QB dialog is open, it
+ * crashed, or an automatic reconnect failed. statusCode 9010. `health`
+ * carries the snapshot so agents can tell the operator exactly what is
+ * on screen.
+ */
+export type QBUnavailableReason = "file-doctor" | "not-responding" | "dialog" | "crashed" | "recovery-failed";
+/** Company file name for messages: "Acme.qbw" (or "the open QuickBooks file"). */
+export function fileLabel(companyFile: string): string {
+  if (!companyFile || !companyFile.trim()) return "the open QuickBooks file";
+  return companyFile.split(/[\\/]/).pop() || companyFile;
+}
+
+export class QBUnavailableError extends Error {
+  statusCode = 9010;
+  reason: QBUnavailableReason;
+  recommendedAction?: string;
+  underlyingMessage?: string;
+  constructor(reason: QBUnavailableReason, message: string, recommendedAction?: string, underlyingMessage?: string) {
+    super(message);
+    this.name = "QBUnavailableError";
+    this.reason = reason;
+    if (recommendedAction) this.recommendedAction = recommendedAction;
+    if (underlyingMessage) this.underlyingMessage = underlyingMessage;
+  }
+}
+
+/**
+ * QuickBooks crashed or disconnected DURING A WRITE and the server has
+ * reconnected. Whether the write was saved is unknown, so it is NOT retried
+ * automatically. statusCode 9011. Check the record (list/query) before
+ * retrying, and use an idempotencyKey.
+ */
+export class QBRecoveredAfterWriteError extends Error {
+  statusCode = 9011;
+  underlyingMessage?: string;
+  constructor(companyFile: string, underlyingMessage?: string) {
+    super(
+      `QuickBooks crashed or disconnected during a write and the server reconnected to ${companyFile || "QuickBooks"}. ` +
+      "The write may or may not have been saved. Look the record up before retrying, and pass an idempotencyKey when you retry.",
+    );
+    this.name = "QBRecoveredAfterWriteError";
+    if (underlyingMessage) this.underlyingMessage = underlyingMessage;
+  }
+}
+
+/**
+ * Errors meaning the QuickBooks process / COM server went away (crash,
+ * File Doctor took over, QB was closed) rather than a QBXML-level failure.
+ * They trigger crash recovery. The brief "QBSession not open" stall stays
+ * with isTransientLiveError's quick retry.
+ */
+export function isQuickBooksGoneError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
+  return /0x800706ba|rpc server is unavailable|0x800706be|remote procedure call failed|0x80010108|disconnected from its clients|0x80080005|server execution failed|0x80040401|could not access quickbooks|could not start quickbooks|quickbooks is not running|no session is open/.test(msg);
+}
+
+/** QB is up but a modal dialog blocks the SDK. A person must answer it. */
+export function isQuickBooksBlockedError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
+  return msg.includes("modal dialog box is showing") || msg.includes("0x80040414");
+}
+
+/** Does this QBXML envelope change data? Writes are never auto-retried after a crash. */
+export function isWriteRequest(qbxml: string): boolean {
+  return /<\w+(?:Add|Mod|Del|Void)Rq\b/.test(qbxml) || /<(?:TxnDelRq|ListDelRq|TxnVoidRq|ClearedStatusModRq|DataExtAddRq|DataExtModRq|DataExtDelRq)\b/.test(qbxml);
+}
+
+/**
+ * Launch metadata from the most recent `switchCompanyFile` call, surfaced
+ * by `qb_company_open`. `loginAutofill` is the autofill helper's outcome:
+ * "not-needed" means the session attached before any login prompt was
+ * filled (file has no password, or QB was already logged in);
+ * "no-credentials" means nothing is saved for the file.
+ */
+export interface SwitchLaunchInfo {
+  launched: boolean;
+  launchSource?: QBExeSource;
+  launchExe?: string;
+  launchPollAttempts?: number;
+  closedPreviousQuickBooks?: boolean;
+  loginAutofill?: LoginAutofillStatus | "not-needed";
 }
 
 /**
@@ -706,12 +819,66 @@ export class QBSessionManager {
    * compatible (existing tests / call sites use the QBSession return
    * value unchanged). Reset to `{ launched: false }` on every call.
    */
-  private lastSwitchLaunchInfo: {
-    launched: boolean;
-    launchSource?: QBExeSource;
-    launchExe?: string;
-    launchPollAttempts?: number;
-  } = { launched: false };
+  private lastSwitchLaunchInfo: SwitchLaunchInfo = { launched: false };
+
+  /**
+   * Is a QB Desktop GUI process running? Consulted before spawning so we
+   * never start a second QB instance on top of one that is still loading,
+   * sitting at a login prompt, or showing "No Company Open". Tests override.
+   */
+  private isQBRunningImpl: () => boolean = defaultIsQBDesktopRunning;
+
+  /** Is a QuickBooks user name saved for this .qbw on the logins page? Tests override. */
+  private hasSavedLoginImpl: (companyFile: string) => boolean = (companyFile) => {
+    try {
+      return !!findCredentialSummary(companyFile)?.username;
+    } catch {
+      return false;
+    }
+  };
+
+  /** QuickBooks health snapshot (crash recovery + diagnostics). Tests override. */
+  private healthImpl: (opts?: { fresh?: boolean }) => Promise<QBHealth> = (opts) => getQuickBooksHealth(opts);
+
+  /** Force-kill QuickBooks: only for a hung QB, and only when the caller explicitly allows it. Tests override. */
+  private forceCloseImpl: () => Promise<boolean> = defaultForceCloseQBDesktop;
+
+  /** Re-open after a crash and retry reads automatically. QB_AUTO_RECOVER=0 disables it. */
+  private autoRecover: boolean = process.env.QB_AUTO_RECOVER !== "0";
+
+  // Diagnostics for qb_health and the logins page.
+  private lastRequestAt: Date | null = null;
+  private lastError: { at: Date; message: string } | null = null;
+  private lastRecovery: { at: Date; ok: boolean; message: string } | null = null;
+  private recoveryCount = 0;
+
+  // One company-switch / recovery at a time; requests wait for it to finish.
+  private opChain: Promise<unknown> = Promise.resolve();
+  private opInFlight: Promise<unknown> | null = null;
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.opChain.then(fn, fn);
+    const settled = run.then(() => undefined, () => undefined);
+    this.opChain = settled;
+    this.opInFlight = settled;
+    void settled.then(() => { if (this.opInFlight === settled) this.opInFlight = null; });
+    return run;
+  }
+
+  /** Does the requested .qbw exist? Live-mode pre-check in switchCompanyFile. Tests override. */
+  private fileExistsImpl: (p: string) => boolean = defaultFileExists;
+
+  /**
+   * Gracefully close QB Desktop (WM_CLOSE, never a force-kill). Used only
+   * when the caller passes closeCurrentCompany: true. Tests override.
+   */
+  private closeQBImpl: () => Promise<QBCloseResult> = () => defaultCloseQBDesktop();
+
+  /**
+   * Start the login-dialog autofill helper for a .qbw. Returns null when
+   * no login is saved for that file. Tests override.
+   */
+  private loginAutofillImpl: (companyFile: string) => LoginAutofillHandle | null = (companyFile) =>
+    startLoginAutofill({ companyFile });
 
   /**
    * Epoch-millisecond timestamps of every transient-retry firing in
@@ -840,6 +1007,7 @@ export class QBSessionManager {
       openedAt: new Date(),
     };
     console.error(`[QB Session] Live session opened: ticket=${ticket}`);
+    recordActivity({ level: "success", category: "session", message: `Session opened on ${fileLabel(this.config.companyFile)}`, companyFile: this.config.companyFile });
     return this.session;
   }
 
@@ -876,6 +1044,7 @@ export class QBSessionManager {
     this.rp = null;
     this.session = null;
     console.error(`[QB Session] Live session closed: ticket=${ticket}`);
+    recordActivity({ level: "info", category: "session", message: `Disconnected from ${fileLabel(this.config.companyFile)}`, companyFile: this.config.companyFile });
   }
 
   isConnected(): boolean {
@@ -949,8 +1118,51 @@ export class QBSessionManager {
    */
   async switchCompanyFile(
     companyFile: string,
-    options: { launchIfClosed?: boolean } = {},
+    options: { launchIfClosed?: boolean; closeCurrentCompany?: boolean } = {},
   ): Promise<QBSession> {
+    return this.runExclusive(async () => {
+      const from = this.config.companyFile;
+      if (!this.simulationMode) {
+        recordActivity({ level: "info", category: "switch", message: `Opening ${fileLabel(companyFile)}${options.closeCurrentCompany && from && from !== companyFile ? ` (closing ${fileLabel(from)} first)` : ""}`, companyFile });
+      }
+      try {
+        const s = await this.switchCompanyFileInner(companyFile, options);
+        const info = this.lastSwitchLaunchInfo;
+        recordActivity({
+          level: "success",
+          category: "switch",
+          message: `Connected to ${fileLabel(companyFile)}`,
+          companyFile,
+          ...(!this.simulationMode
+            ? { detail: [info.closedPreviousQuickBooks ? "closed the previous company" : "", info.launched ? "started QuickBooks" : "", info.loginAutofill ? `login: ${info.loginAutofill}` : ""].filter(Boolean).join("; ") || "attached to the open file" }
+            : { detail: "simulation" }),
+        });
+        return s;
+      } catch (err) {
+        const e = err as { message?: string; reason?: string };
+        recordActivity({ level: "error", category: "switch", message: `Could not open ${fileLabel(companyFile)}${e.reason ? ` (${e.reason})` : ""}`, companyFile, detail: e.message });
+        throw err;
+      }
+    });
+  }
+
+  private async switchCompanyFileInner(
+    companyFile: string,
+    options: { launchIfClosed?: boolean; closeCurrentCompany?: boolean; preserveIdempotency?: boolean } = {},
+  ): Promise<QBSession> {
+    // closeCurrentCompany only makes sense together with a relaunch.
+    const launchIfClosed = !!options.launchIfClosed || !!options.closeCurrentCompany;
+    const previousFile = this.config.companyFile;
+    const hadSession = this.session !== null;
+    // Live: refuse a path that doesn't exist BEFORE touching the current
+    // session or QB Desktop. Otherwise a typo closes the operator's open
+    // company and launches QB on nothing (observed live 2026-10-05).
+    if (!this.simulationMode && companyFile && !this.fileExistsImpl(companyFile)) {
+      throw new QBLaunchError(
+        "file-not-found",
+        `Company file not found: ${companyFile}. Nothing was closed. Check the path (qb_company_list shows the files this server can see).`,
+      );
+    }
     await this.closeSession();
     this.config.companyFile = companyFile;
     if (this.simulationMode) {
@@ -961,8 +1173,10 @@ export class QBSessionManager {
     // Reset it on every switch so we never serve a cached result that was
     // produced against a different file. Cleared in BOTH live and sim modes
     // (live QB does persist across switches, but the in-memory cache here
-    // only holds keys observed in this process).
-    this.idempotencyCache.clear();
+    // only holds keys observed in this process). Crash recovery re-opens
+    // the SAME file and keeps the cache: a write that was in flight during
+    // the crash must still replay (not duplicate) when retried with its key.
+    if (!options.preserveIdempotency) this.idempotencyCache.clear();
     // Host info is installation-scoped (ProductName / MajorVersion / etc.),
     // not company-file-scoped — under localQBD it's the same QB process either
     // way. But the operator might be reconnecting to a freshly-installed /
@@ -986,17 +1200,51 @@ export class QBSessionManager {
     // launch path fires.
     this.lastSwitchLaunchInfo = { launched: false };
 
+    // Live-mode ordering (learned on the dev box 2026-10-05). Asking the SDK
+    // for file B while QB still runs file A makes QB try to swap files inside
+    // that instance. When A was SDK-launched ("unattended mode") and B is not
+    // authorized for automatic login, QB aborts with FindUserFromKey and
+    // throws an "unexpected error 80070057" dialog that a human must click.
+    // So:
+    //   - switching away from the file we had open → close QB FIRST;
+    //   - target has a saved login (and QB is closed) → start QB on the file
+    //     ourselves and fill its login window, instead of letting the SDK
+    //     try an unattended open that can't use a password.
+    let closedEarly = false;
+    if (!this.simulationMode && launchIfClosed) {
+      const running = this.isQBRunningImpl();
+      const switchingAway =
+        running &&
+        !!options.closeCurrentCompany &&
+        hadSession &&
+        normalizeCompanyPath(previousFile || ".") !== normalizeCompanyPath(companyFile);
+      const savedLogin = this.hasSavedLoginImpl(companyFile);
+      if (savedLogin && (switchingAway || !running)) {
+        return this.closeSpawnAndPoll(
+          companyFile,
+          new Error("QuickBooks was started on the company file directly (a saved login exists); no session attached yet."),
+          switchingAway,
+        );
+      }
+      if (switchingAway) {
+        // No saved login: close first, then let the SDK open it (works for
+        // files authorized for automatic login).
+        closedEarly = await this.closeQBOrThrow();
+        this.lastSwitchLaunchInfo = { launched: false, ...(closedEarly ? { closedPreviousQuickBooks: true } : {}) };
+      }
+    }
+
     try {
       return await this.openSession();
     } catch (err) {
-      if (!options.launchIfClosed) throw err;
+      if (!launchIfClosed) throw err;
       // Sim mode: openSession can't fail in sim (it just synthesizes a ticket),
       // so reaching this branch in sim mode is a hard error from the manager
       // internals, not a missing-file situation. Bubble the original error
       // unchanged — launchIfClosed: true is documented as a no-op in sim mode
       // (the existing reseed already covers the "open a new book" UX).
       if (this.simulationMode) throw err;
-      return this.attemptLaunchAndAttach(companyFile, err);
+      return this.attemptLaunchAndAttach(companyFile, err, !!options.closeCurrentCompany, closedEarly);
     }
   }
 
@@ -1007,9 +1255,12 @@ export class QBSessionManager {
    *
    * Behavior:
    *   1. Classify the initial error. If it's a file-conflict (different
-   *      .qbw open) → throw QBLaunchError 9007 immediately (auto-resolution
-   *      requires UI automation, which is fragile across QB versions —
-   *      operator must close the conflicting file). If it's a multi-user
+   *      .qbw open) → with closeCurrentCompany, gracefully close QB (only
+   *      after the exe is resolved) and relaunch; without it, throw
+   *      QBLaunchError 9007 pointing at closeCurrentCompany:true
+   *      (2026-10-05). If QB is running with an unclassified error and no
+   *      close is allowed, poll attach-only — never spawn a second QB
+   *      instance. If it's a multi-user
    *      lock → throw QBMultiUserLockError 9008 (the lock will last for
    *      the other user's session; retry budget would be wasted). If it's
    *      anything other than "file-not-loaded" or "unknown" → bubble the
@@ -1031,39 +1282,89 @@ export class QBSessionManager {
    * Side effect: populates `this.lastSwitchLaunchInfo` so the tool layer
    * can surface launch metadata in the response.
    */
+  /** Gracefully close QB Desktop; true if a running QB was closed. Throws 9007 close-failed. */
+  private async closeQBOrThrow(underlyingMessage?: string): Promise<boolean> {
+    const closeResult = await this.closeQBImpl();
+    if (!closeResult.closed) {
+      throw new QBLaunchError(
+        "close-failed",
+        closeResult.detail ??
+          "QuickBooks Desktop did not close. Close it manually (it may be showing a prompt), then retry.",
+        underlyingMessage,
+      );
+    }
+    return closeResult.outcome === "closed";
+  }
+
   private async attemptLaunchAndAttach(
     companyFile: string,
     initialError: unknown,
+    closeCurrentCompany: boolean,
+    alreadyClosed = false,
   ): Promise<QBSession> {
     const initialMsg = initialError instanceof Error ? initialError.message : String(initialError);
     const initialClass = classifyBeginSessionError(initialMsg);
 
+    let needClose = false;
     if (initialClass === "file-conflict") {
-      throw new QBLaunchError(
-        "file-conflict",
-        "QuickBooks Desktop is already open with a different company file. Close it in QB Desktop (File → Close Company), then retry qb_company_open. Auto-swap is not attempted because the close path requires UI automation and risks discarding unsaved changes in the currently-open book.",
-        initialMsg,
-      );
-    }
-    if (initialClass === "multi-user-lock") {
+      if (!closeCurrentCompany) {
+        throw new QBLaunchError(
+          "file-conflict",
+          "QuickBooks Desktop is already open with a different company file. Retry qb_company_open with closeCurrentCompany:true to have the server close QuickBooks gracefully (like clicking its X — any prompt such as an unsaved form stops the close) and reopen it on the requested file, or close it yourself in QB Desktop (File → Close Company) and retry.",
+          initialMsg,
+        );
+      }
+      needClose = true;
+    } else if (initialClass === "multi-user-lock") {
       throw new QBMultiUserLockError(
         "QuickBooks company file is locked by another user in multi-user mode. Wait for the other session to release the file, or coordinate with the holder to open it in single-user mode.",
         initialMsg,
       );
-    }
-    if (initialClass !== "file-not-loaded" && initialClass !== "unknown") {
+    } else if (initialClass !== "file-not-loaded" && initialClass !== "unknown") {
       // Defensive — `classifyBeginSessionError` is closed over the four
       // discriminants above, but TypeScript narrows on the `if` chain.
       throw initialError;
+    } else if (this.isQBRunningImpl()) {
+      // QB is up but BeginSession failed without a recognized conflict: it
+      // may still be loading, sitting at a login prompt, or showing "No
+      // Company Open". Spawning a second QBW.EXE on top of that is not a
+      // reliable way to open a file, so either close-and-relaunch (when the
+      // caller allowed it) or attach-only (no spawn; autofill still runs in
+      // case QB is at the login prompt for this very file).
+      needClose = closeCurrentCompany;
+      if (!needClose) return this.pollForAttach(companyFile, initialError, null, alreadyClosed);
     }
 
+    return this.closeSpawnAndPoll(companyFile, initialError, needClose, alreadyClosed);
+  }
+
+  /**
+   * Resolve the exe, optionally close QB Desktop gracefully (only after the
+   * exe is known), spawn QB on the .qbw, then poll for attach while the
+   * login autofill runs. Shared by the error-driven path above and by the
+   * direct-launch path in switchCompanyFile.
+   */
+  private async closeSpawnAndPoll(
+    companyFile: string,
+    initialError: unknown,
+    needClose: boolean,
+    alreadyClosed = false,
+  ): Promise<QBSession> {
+    const initialMsg = initialError instanceof Error ? initialError.message : String(initialError);
     const resolved = this.exeResolverImpl();
     if (!resolved) {
       throw new QBLaunchError(
         "no-executable",
-        "Cannot launch QuickBooks Desktop: no executable found. Tried the QB_DESKTOP_EXE env var, the Windows registry under HKLM\\SOFTWARE\\Intuit\\QuickBooks, and known Program Files paths. Set QB_DESKTOP_EXE to the absolute path of qbw32.exe (or qbw.exe) and retry.",
+        "Cannot launch QuickBooks Desktop: no executable found. Tried the QB_DESKTOP_EXE env var, the Windows registry under HKLM\\SOFTWARE\\Intuit\\QuickBooks, and known Program Files paths. Set QB_DESKTOP_EXE to the absolute path of qbw.exe (64-bit) or qbw32.exe and retry.",
         initialMsg,
       );
+    }
+
+    // Close only after the exe is known, so a missing exe never leaves the
+    // operator with QB closed and nothing reopened.
+    let closedPrevious = alreadyClosed;
+    if (needClose) {
+      closedPrevious = (await this.closeQBOrThrow(initialMsg)) || closedPrevious;
     }
 
     try {
@@ -1077,52 +1378,221 @@ export class QBSessionManager {
       );
     }
 
+    return this.pollForAttach(companyFile, initialError, resolved, closedPrevious);
+  }
+
+  /**
+   * Poll `openSession` on the QB_LAUNCH_POLL_MS schedule while the login
+   * autofill helper (if a login is saved for the file) fills QB's login
+   * dialog in the background. `resolved` is null when we attached to an
+   * already-running QB without spawning it.
+   */
+  private async pollForAttach(
+    companyFile: string,
+    initialError: unknown,
+    resolved: QBExeResolution | null,
+    closedPrevious = false,
+  ): Promise<QBSession> {
+    let autofill: LoginAutofillHandle | null = null;
+    try {
+      autofill = this.loginAutofillImpl(companyFile);
+    } catch {
+      autofill = null;
+    }
+    let autofillOutcome: LoginAutofillResult | null = null;
+    autofill?.result.then((r) => { autofillOutcome = r; }, () => { /* never rejects by contract */ });
+
+    const launchFields = (pollAttempts: number): SwitchLaunchInfo => ({
+      launched: resolved !== null,
+      ...(resolved ? { launchSource: resolved.source, launchExe: resolved.exe } : {}),
+      launchPollAttempts: pollAttempts,
+      ...(closedPrevious ? { closedPreviousQuickBooks: true } : {}),
+    });
+    const autofillStatus = (): LoginAutofillStatus | "not-needed" =>
+      autofill === null
+        ? "no-credentials"
+        : (autofillOutcome as LoginAutofillResult | null)?.status ?? "not-needed";
+
     let lastErr: unknown = initialError;
     let pollAttempts = 0;
-    for (let attempt = 0; attempt < QB_LAUNCH_POLL_MS.length; attempt++) {
-      await this.sleepImpl(QB_LAUNCH_POLL_MS[attempt]);
-      pollAttempts++;
-      try {
-        const session = await this.openSession();
-        this.lastSwitchLaunchInfo = {
-          launched: true,
-          launchSource: resolved.source,
-          launchExe: resolved.exe,
-          launchPollAttempts: pollAttempts,
-        };
-        return session;
-      } catch (pollErr) {
-        lastErr = pollErr;
-        const pollMsg = pollErr instanceof Error ? pollErr.message : String(pollErr);
-        const pollClass = classifyBeginSessionError(pollMsg);
-        // During polling, a file-conflict or multi-user-lock is terminal —
-        // QB Desktop has finished starting up but landed in a state we
-        // can't auto-resolve. Exit early so the operator sees the right
-        // remediation hint instead of waiting out the full 30s budget.
-        if (pollClass === "file-conflict") {
-          throw new QBLaunchError(
-            "file-conflict",
-            `QuickBooks Desktop launched but opened a different company file than requested (${companyFile}). Close the currently-open file in QB Desktop and retry.`,
-            pollMsg,
-          );
+    try {
+      for (let attempt = 0; attempt < QB_LAUNCH_POLL_MS.length; attempt++) {
+        await this.sleepImpl(QB_LAUNCH_POLL_MS[attempt]);
+        pollAttempts++;
+        try {
+          const session = await this.openSession();
+          this.lastSwitchLaunchInfo = { ...launchFields(pollAttempts), loginAutofill: autofillStatus() };
+          return session;
+        } catch (pollErr) {
+          lastErr = pollErr;
+          const pollMsg = pollErr instanceof Error ? pollErr.message : String(pollErr);
+          const pollClass = classifyBeginSessionError(pollMsg);
+          // During polling, a file-conflict or multi-user-lock is terminal —
+          // QB Desktop has finished starting up but landed in a state we
+          // can't auto-resolve. Exit early so the operator sees the right
+          // remediation hint instead of waiting out the full budget.
+          if (pollClass === "file-conflict") {
+            throw new QBLaunchError(
+              "file-conflict",
+              `QuickBooks Desktop has a different company file open than requested (${companyFile}). Retry with closeCurrentCompany:true, or close the open file in QB Desktop and retry.`,
+              pollMsg,
+            );
+          }
+          if (pollClass === "multi-user-lock") {
+            throw new QBMultiUserLockError(
+              "QuickBooks Desktop launched but the target company file is locked by another user (multi-user mode).",
+              pollMsg,
+            );
+          }
+          // A rejected saved login does NOT end the wait: QB's login window
+          // is still on screen, so the operator can type the right password
+          // by hand and we attach when they do (observed live 2026-10-05).
+          // Otherwise keep polling — QB is probably still loading.
         }
-        if (pollClass === "multi-user-lock") {
-          throw new QBMultiUserLockError(
-            "QuickBooks Desktop launched but the target company file is locked by another user (multi-user mode).",
-            pollMsg,
-          );
+      }
+    } finally {
+      // Stop the helper if it's still waiting (attached without a prompt, or
+      // we're bailing out). No-op once it has exited.
+      autofill?.cancel();
+    }
+
+    this.lastSwitchLaunchInfo = { ...launchFields(pollAttempts), loginAutofill: autofillStatus() };
+    const lastMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    const totalMs = QB_LAUNCH_POLL_MS.reduce((a, b) => a + b, 0);
+    if ((autofillOutcome as LoginAutofillResult | null)?.status === "rejected") {
+      throw new QBLaunchError(
+        "login-rejected",
+        `QuickBooks rejected the saved login for this company file (its login window stayed open), and nobody logged in by hand within ${totalMs / 1000}s. Correct the user name/password on the logins page (qb_company_credentials_edit), then retry. The saved login was submitted once only.`,
+        lastMsg,
+      );
+    }
+    if ((autofillOutcome as LoginAutofillResult | null)?.status === "submit-failed") {
+      throw new QBLaunchError(
+        "launch-timeout",
+        `The saved login was typed into QuickBooks' login window, but QuickBooks' OK button did not respond to the automated press and nobody pressed Enter within ${totalMs / 1000}s. Press Enter in the QuickBooks login window, then retry qb_company_open (it will attach to the open file).`,
+        lastMsg,
+      );
+    }
+    const loginHint =
+      autofill === null
+        ? " If QuickBooks is waiting at its login window, save this file's QuickBooks user name and password with qb_company_credentials_edit so the server can log in for you."
+        : "";
+    throw new QBLaunchError(
+      "launch-timeout",
+      `${resolved ? `QuickBooks Desktop launch attempted (${resolved.exe}) but the` : "QuickBooks Desktop is running but the"} session did not attach within ${totalMs}ms across ${QB_LAUNCH_POLL_MS.length} retries. QB Desktop may be waiting on a prompt (login window, the one-time Application Certificate approval for this file — which must be granted by a QB Admin user in the QB window — an update notice, or a file-upgrade prompt), or the .qbw may be invalid or unreadable.${loginHint}`,
+      lastMsg,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Crash recovery
+  // -------------------------------------------------------------------------
+
+  /**
+   * Re-engage QuickBooks after a crash, hang, File Doctor run or lost
+   * connection: check health, then reconnect to the SAME company file
+   * (starting QB and logging in again if needed).
+   *
+   * Refuses (QBUnavailableError 9010) when a person must act first:
+   *   - File Doctor / Tool Hub is running: never reopen a file mid-repair;
+   *   - a QB dialog other than the login window is up;
+   *   - QB is hung (checked twice, 10s apart) and forceCloseHungQuickBooks
+   *     is not set.
+   * With forceCloseHungQuickBooks, a QB that is still hung on the second
+   * check is force-closed. That's the only place this server ever kills QB.
+   */
+  async recover(opts: { forceCloseHungQuickBooks?: boolean; trigger?: string } = {}): Promise<QBSession> {
+    return this.runExclusive(() => this.recoverInner(opts));
+  }
+
+  private async recoverInner(opts: { forceCloseHungQuickBooks?: boolean; trigger?: string }): Promise<QBSession> {
+    const file = this.config.companyFile;
+    this.recoveryCount += 1;
+    recordActivity({ level: "warn", category: "recovery", message: `Reconnecting to ${fileLabel(file)}${opts.trigger ? ` after: ${opts.trigger}` : ""}`, companyFile: file });
+    const fail = (err: Error): never => {
+      this.lastRecovery = { at: new Date(), ok: false, message: err.message };
+      recordActivity({ level: "error", category: "recovery", message: `Reconnect failed: ${err.message}`, companyFile: file });
+      throw err;
+    };
+
+    if (this.simulationMode) {
+      await this.closeSession();
+      const s = await this.openSession();
+      this.lastRecovery = { at: new Date(), ok: true, message: "simulation session reopened" };
+      return s;
+    }
+
+    let health = await this.healthImpl({ fresh: true });
+    if (health.state === "file-doctor") {
+      fail(new QBUnavailableError("file-doctor", health.summary, health.recommendedAction));
+    }
+    if (health.state === "dialog") {
+      fail(new QBUnavailableError("dialog", health.summary, health.recommendedAction));
+    }
+    if (health.state === "not-responding" || (health.state === "crashed" && health.raw.quickbooks.length > 0)) {
+      await this.sleepImpl(10_000);
+      health = await this.healthImpl({ fresh: true });
+      if (health.state === "not-responding" || (health.state === "crashed" && health.raw.quickbooks.length > 0)) {
+        if (!opts.forceCloseHungQuickBooks) {
+          fail(new QBUnavailableError(
+            health.state === "crashed" ? "crashed" : "not-responding",
+            `${health.summary} It stayed that way for 10 seconds.`,
+            "Wait for QuickBooks, or allow a force close (qb_session_recover with forceCloseHungQuickBooks:true, or Force close on the logins page). Force-closing a hung QuickBooks can lose an unsaved form.",
+          ));
         }
-        // Otherwise keep polling — QB is probably still loading.
+        recordActivity({ level: "warn", category: "recovery", message: "Force-closing hung QuickBooks", companyFile: file });
+        const killed = await this.forceCloseImpl();
+        if (!killed) fail(new QBUnavailableError("recovery-failed", "QuickBooks could not be force-closed.", "Close it in Task Manager, then press Reconnect."));
       }
     }
 
-    const lastMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
-    const totalMs = QB_LAUNCH_POLL_MS.reduce((a, b) => a + b, 0);
-    throw new QBLaunchError(
-      "launch-timeout",
-      `QuickBooks Desktop launch attempted (${resolved.exe}) but the session did not attach within ${totalMs}ms across ${QB_LAUNCH_POLL_MS.length} retries. The launch may have failed silently, the .qbw may be invalid or unreadable, or QB Desktop may be waiting on a UI prompt (e.g. an authorization dialog, an update notification, or a corrupt-file warning). Open QB Desktop manually, dismiss any dialogs, then retry without launchIfClosed.`,
-      lastMsg,
-    );
+    // Drop the dead ticket without touching the files.
+    if (this.rp && this.session) {
+      try { this.rp.EndSession(this.session.ticket); } catch { /* already dead */ }
+    }
+    if (this.rp) {
+      try { this.rp.CloseConnection(); } catch { /* already dead */ }
+    }
+    this.rp = null;
+    this.session = null;
+
+    try {
+      const s = file
+        ? await this.switchCompanyFileInner(file, { launchIfClosed: true, preserveIdempotency: true })
+        : await this.openSession();
+      this.lastRecovery = { at: new Date(), ok: true, message: `reconnected to ${fileLabel(file)}` };
+      recordActivity({ level: "success", category: "recovery", message: `Reconnected to ${fileLabel(file)}`, companyFile: file });
+      return s;
+    } catch (err) {
+      const e = err as Error & { statusCode?: number };
+      if (e instanceof QBLaunchError || e instanceof QBMultiUserLockError || e instanceof QBUnavailableError) fail(e);
+      return fail(new QBUnavailableError("recovery-failed", `Could not reconnect to ${fileLabel(file)}: ${e.message}`, "Check QuickBooks on the server computer, then press Reconnect.", e.message));
+    }
+  }
+
+  /** Snapshot for qb_health / the logins page. No wire I/O. */
+  getDiagnostics(): {
+    connected: boolean;
+    companyFile: string;
+    openedAt: string | null;
+    lastRequestAt: string | null;
+    lastError: { at: string; message: string } | null;
+    lastRecovery: { at: string; ok: boolean; message: string } | null;
+    recoveryCount: number;
+    autoRecover: boolean;
+    operationInProgress: boolean;
+  } {
+    return {
+      connected: this.session !== null,
+      companyFile: this.config.companyFile,
+      openedAt: this.session?.openedAt.toISOString() ?? null,
+      lastRequestAt: this.lastRequestAt?.toISOString() ?? null,
+      lastError: this.lastError ? { at: this.lastError.at.toISOString(), message: this.lastError.message } : null,
+      lastRecovery: this.lastRecovery ? { ...this.lastRecovery, at: this.lastRecovery.at.toISOString() } : null,
+      recoveryCount: this.recoveryCount,
+      autoRecover: this.autoRecover,
+      operationInProgress: this.opInFlight !== null,
+    };
   }
 
   /**
@@ -1136,12 +1606,7 @@ export class QBSessionManager {
    * `launchSource` + `launchExe` + `launchPollAttempts` when the
    * auto-launch path fired.
    */
-  getLastSwitchLaunchInfo(): {
-    launched: boolean;
-    launchSource?: QBExeSource;
-    launchExe?: string;
-    launchPollAttempts?: number;
-  } {
+  getLastSwitchLaunchInfo(): SwitchLaunchInfo {
     return this.lastSwitchLaunchInfo;
   }
 
@@ -1242,8 +1707,15 @@ export class QBSessionManager {
    * case the log overhead is one null-check per request.
    */
   async sendRequest(qbxmlRequest: string): Promise<QBXMLResponse> {
+    // A company switch / recovery in progress owns the session: wait for it.
+    if (this.opInFlight) await this.opInFlight;
+    this.lastRequestAt = new Date();
     if (!this.session) {
-      await this.openSession();
+      if (this.simulationMode) {
+        await this.openSession();
+      } else {
+        await this.runExclusive(() => this.ensureLiveSession());
+      }
     }
 
     const logger = getQbxmlLogger();
@@ -1266,7 +1738,40 @@ export class QBSessionManager {
     // full retry sequence; the response parser runs on the FINAL successful
     // attempt only. Non-transient errors bubble out on the first failure for
     // the existing tool-side error machinery (Item 25 path) to translate.
-    return this.sendLiveRequestWithRetry(qbxmlRequest, logger);
+    // On top of that: crash recovery (see recover()) for errors meaning QB
+    // itself went away, and a clear 9010 when a QB dialog blocks the SDK.
+    try {
+      return await this.sendLiveRequestWithRetry(qbxmlRequest, logger);
+    } catch (err) {
+      this.lastError = { at: new Date(), message: err instanceof Error ? err.message : String(err) };
+      if (isQuickBooksBlockedError(err)) {
+        const health = await this.healthImpl({ fresh: true }).catch(() => null);
+        recordActivity({ level: "warn", category: "health", message: "A QuickBooks dialog is blocking requests", companyFile: this.config.companyFile, detail: health?.summary });
+        throw new QBUnavailableError("dialog", health?.summary ?? "A QuickBooks dialog is blocking requests.", health?.recommendedAction ?? "Answer the dialog in QuickBooks, then retry.", this.lastError.message);
+      }
+      if (!this.autoRecover || !isQuickBooksGoneError(err)) throw err;
+      const write = isWriteRequest(qbxmlRequest);
+      recordActivity({ level: "error", category: "health", message: `QuickBooks stopped answering during a ${write ? "write" : "read"}`, companyFile: this.config.companyFile, detail: this.lastError.message });
+      await this.recover({ trigger: this.lastError.message });
+      if (write) throw new QBRecoveredAfterWriteError(this.config.companyFile, this.lastError.message);
+      // Reads are safe to repeat: retry once on the fresh session.
+      return this.sendLiveRequestWithRetry(qbxmlRequest, logger);
+    }
+  }
+
+  /**
+   * Open a live session for the configured file. When QB isn't running and a
+   * login is saved for the file, start QB on it ourselves and fill its login
+   * window. Otherwise the SDK would try an unattended open, which can't use
+   * a password and pops QuickBooks' "unexpected error 80070057" box.
+   */
+  private async ensureLiveSession(): Promise<QBSession> {
+    if (this.session) return this.session;
+    const file = this.config.companyFile;
+    if (file && !this.isQBRunningImpl() && this.hasSavedLoginImpl(file)) {
+      return this.switchCompanyFileInner(file, { launchIfClosed: true, preserveIdempotency: true });
+    }
+    return this.openSession();
   }
 
   /**

@@ -29,6 +29,102 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-10-05 — Crash recovery: reads auto-recover, writes never auto-retry, File Doctor and hangs need a person
+
+**Chosen:**
+- **Recovery triggers:** QB-gone errors (COM/RPC server lost, could not start QB) trigger one automatic reconnect to the same file.
+- **Retry policy:** a READ is then retried once. A WRITE is not, and returns 9011 so the agent verifies first. The idempotency cache survives the reconnect.
+- **Health gate:** a health probe (processes, windows, File Doctor, WerFault) decides whether recovery may proceed:
+  - File Doctor running, or a QB dialog up → refuse with 9010 (a person must act);
+  - QB not responding → recheck after 10 s, and force-kill only with explicit permission (`forceCloseHungQuickBooks`, or the page's typed FORCE CLOSE).
+- **Startup:** with no session and QB closed, a saved login means the server starts QB on the file itself, instead of the SDK's unattended open.
+- **Visibility:** an activity log (memory + `activity.log`) plus a redesigned control page make the state visible.
+
+**Why:**
+- The operator reports QuickBooks on this desktop "fails and calls a file doctor" and that reports become unpullable after crashes. Agents need to keep working without the operator babysitting.
+- Live observation the same day: an SDK unattended open of a password-protected file produced QB's "unexpected error 80070057" dialog. That is why the server prefers its own launch-and-login path.
+
+**Alternatives rejected:**
+- **Retrying writes automatically:** risks duplicate invoices, payments, or JEs when the crash happened after QB committed.
+- **Killing QB whenever it misbehaves:** loses unsaved forms, and could corrupt a file mid-write or mid-repair.
+- **Polling health continuously in the background:** costs a PowerShell spawn every few seconds for nothing. Health is checked on demand (page polls are cached 3 s).
+
+**Tradeoffs / consequences:**
+- The QB-gone message patterns are from Windows/COM conventions. The exact text QBXMLRP2 surfaces after a real QB crash hasn't been captured live yet (see todo #106).
+- A read retried after recovery runs against a freshly reopened file, so any uncommitted QB state from before the crash is gone (that matches QB's own behavior).
+
+**Revisit when:** a live crash shows a different error text, or File Doctor uses process names the probe doesn't list.
+
+---
+
+## 2026-10-05 — Logins move to a local web page; remote tailnet agents get per-file authorization
+
+**Chosen:**
+- The WinForms popup is replaced by a **local web page** served by the MCP process (127.0.0.1 + tailnet IP, port 8765).
+  - Saved logins load pre-filled.
+  - Saving overwrites atomically.
+  - The page also manages **per-company-file authorization of tailnet devices**.
+- Agents on other tailnet devices connect over **MCP Streamable HTTP** at `/mcp` on the same server.
+  - They are identified by `tailscale whois` of the connection's source address, and the authorization is pinned to address + node StableID.
+  - Every tool call is checked against the file it targets or the currently active file (statusCode 9009).
+- **The server, not the agent, uses the credentials.** The operator chose this over returning plaintext to an authorized agent.
+- The store format becomes v2 (adds `authorizedPeers`). Node encrypts on save through `scripts/qb-dpapi-protect.ps1`.
+
+**Why:**
+- The operator asked for a page that stands up with the server, persists on the host, shows existing data, and allows edits and tailnet-pinned per-file authorizations.
+- Returning passwords would put them in agent transcripts. Server-side use meets "provided at the time of need" without that.
+- On a tailnet the source address is cryptographically bound to the node (WireGuard), so it is a sound identity. `whois` adds the StableID, so a reassigned address can't inherit access.
+
+**Alternatives rejected:**
+- **Returning the plaintext to an authorized agent** (operator declined).
+- **A self-declared agent label in the host config:** trusts the caller's own claim.
+- **A web-page-only authorization with MCP staying stdio:** it wouldn't let remote agents work at all.
+- **Binding 0.0.0.0:** exposes the page to the LAN.
+- **Express / another HTTP framework:** `node:http` plus the SDK's own transport are enough, and this adds no new dependency.
+- **Keeping both popup and page:** two editors for one store.
+
+**Tradeoffs / consequences:**
+- The page and `/mcp` exist only while an MCP process runs (`QB_HTTP_ONLY=1` allows running it as a standing service). A second process on the same port skips the page (same store, so nothing is lost).
+- All callers share the single QuickBooks session and open file. A remote agent can be refused mid-task if another caller switches files.
+- Remote `closeCurrentCompany` can close the QuickBooks window on the host. It is graceful only, and SKILL.md tells agents to confirm with the operator first.
+- Admin = devices of the same Tailscale login. If the tailnet is shared with other people on the same login, use `QB_WEB_TAILNET=0` or tighten this with `QB_WEB_ADMINS`.
+
+**Revisit when:** remote agents need concurrent access to different files (that would need multiple QB instances, which is out of scope per F13.4), or Tailscale identity headers (`tailscale serve`) become preferable to whois.
+
+---
+
+## 2026-10-05 — Company switching closes QB gracefully; per-file logins via DPAPI vault + popup + Win32 autofill
+
+**Chosen:**
+- `qb_company_open` gains `closeCurrentCompany` (opt-in, implies `launchIfClosed`). On a file-conflict, the server closes QB Desktop gracefully by posting WM_CLOSE to its `MauiFrame` window, waits up to 90s, relaunches QB on the new `.qbw`, autofills QB's login window, and polls for attach. This partly reverses 2026-05-28 design Q (b) ("fail fast on file-conflict, no UI automation") because the operator explicitly asked for close-one-open-another.
+- Logins are kept in a DPAPI-encrypted vault, edited through a WinForms popup (`qb_company_credentials_edit`), and typed into QB by a Win32 helper. Only PowerShell ever holds plaintext.
+- The poll budget goes from 30s to 90s.
+- Exe detection reads the registry `Path` value and adds the 64-bit `Program Files\...\qbw.exe` paths.
+
+**Why:**
+- BeginSession has no credential parameters, so typing into QB's dialog is the only way to log into a password-protected file.
+- Evidence observed live on the dev box (QB Enterprise 24.0):
+  - Intuit writes `HKLM\SOFTWARE\Intuit\QuickBooks\34.0\belacct\Path = ...\qbw.exe`. The old `InstallPath`-only query plus the `qbw32.exe` guess found nothing, and the doctor reported ✗.
+  - `Process.CloseMainWindow()` sometimes targeted an `Afx:` toolbar window and QB ignored the close. WM_CLOSE to `MauiFrame` closed QB in 17-19s on two consecutive runs.
+  - Opening a file took longer than 30s.
+  - The .NET UI Automation client reported Win32 and WinForms edit boxes as "Pane" with IsPassword=false, so autofill uses raw Win32 messages instead.
+
+**Alternatives rejected:**
+- **MCP elicitation for passwords:** the spec forbids requesting secrets that way, and the values would transit the client and the model's context.
+- **Force-killing QB:** risks .TLG/.ND damage and silently discards unsaved forms.
+- **Automating "File → Close Company" through the menu:** QB's Maui menus are custom-drawn, so this is fragile across versions.
+- **Auto-answering QB prompts or the Application Certificate:** these are security and data-loss decisions that belong to a human.
+- **Storing passwords in Node or plain JSON:** rejected for the obvious reason.
+
+**Tradeoffs / consequences:**
+- The login-dialog shape is assumed to be a top-level window of QBW.EXE containing an ES_PASSWORD edit plus an OK button. It is validated against a stand-in WinForms dialog only. The dev-box sample file has no password, so the real QB 24 login dialog is still unobserved: live verification is pending.
+- The conflict-text classifier pattern ("already open and it is different from the one requested") comes from Intuit's SDK error table and has not been observed live. Probing BeginSession against the operator's real client books was out of scope.
+- The vault is per Windows user and per machine. Moving to another PC means re-entering logins.
+
+**Revisit when:** the real QB login dialog or conflict text is observed and differs; or QB ships a version without `MauiFrame`. The close script falls back to `CloseMainWindow` after 20s, but check this anyway.
+
+---
+
 ## 2026-05-29 — CLI doctor probe model + exit-code precedence (Phase 19 #91 closed)
 
 **Chosen:**

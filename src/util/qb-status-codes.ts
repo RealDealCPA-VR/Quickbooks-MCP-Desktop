@@ -83,6 +83,13 @@ const TABLE: Record<number, string> = {
   // user locks typically last the duration of the other user's working
   // session (minutes to hours), not seconds.
   9008: "QuickBooks company file is locked by another user (multi-user mode). Wait for the other session to release the file, or coordinate with the holder to open in single-user mode.",
+  // 9009 — synthetic, client-side. Issued by the per-file authorization guard
+  // (src/util/caller-authorization.ts) when a remote tailnet agent calls a
+  // tool for a company file its device is not authorized for.
+  // 9010 / 9011 — synthetic. Crash recovery (QBSessionManager.recover / sendRequest).
+  9010: "QuickBooks is unavailable and needs a person: File Doctor is repairing the file, a QuickBooks dialog is waiting for an answer, QuickBooks is frozen or crashed, or an automatic reconnect failed. Check qb_health for what is on screen.",
+  9011: "QuickBooks crashed during a write; the server reconnected. The write may or may not have been saved, so look the record up before retrying (with an idempotencyKey).",
+  9009: "This device is not authorized for that QuickBooks company file. The operator grants access per file and per tailnet device on the QuickBooks MCP logins page.",
 };
 
 export function qbStatusCodeMessage(statusCode: number): string | undefined {

@@ -171,3 +171,82 @@ The server is feature-complete; this phase makes it installable + usable by any 
 - [x] **91.** CLI doctor command — `quickbooks-desktop-mcp-doctor` exits 0/1/2 after probing: Node version compatibility (winax requires v20.x; v22+ breaks), platform (Windows vs sim-only), QuickBooks Desktop installed (registry/Program Files lookup), QBXMLRP2 COM registration check (`reg query`), `QB_COMPANY_FILE` set and exists, `QB_COMPANY_ROOT` set and exists, optional `winax` install status (npm rebuilt against current Node?). Each check emits `✓` / `✗` / `⚠` with a one-line remediation hint on every `✗`. Diagnoses ~80% of setup failures without the operator opening a debugger. Same exit-code contract `linter` / `test` use — CI-friendly. _(Closed 2026-05-29. [src/cli/doctor.ts](src/cli/doctor.ts) replaced the stub: 7 pure probes over an injected `DoctorDeps` bag (`runDoctor` + `formatReport` are I/O-free; `main()` is the only impure part), exit 0 all-green / 1 any-fail / 2 any-skip with **fail outranking skip**. QB-install probe reuses #90's `resolveQBDesktopExe` + `defaultRegistryQuery` + `defaultFileExists` and surfaces BOTH the resolved exe path AND the source branch (env/registry/fallback). COM probe distinguishes "key absent" (fail) from "reg.exe unavailable" (skip) via the spawn error code. winax probe does a real `require("winax")` and classifies missing vs ABI-mismatch. 35 net new tests ([tests/doctor.test.ts](tests/doctor.test.ts)); total 1725. Verified live on the Windows box — output is honest (✗ QB Desktop not found at known paths + ✗ QB_COMPANY_FILE unset → exit 1). README §smoke-test parenthetical updated. DECISIONS.md 2026-05-29.)_
 
 - [ ] **92.** (Lower priority) Windows installer — bundle Node runtime + the built CLI into a signed `.exe` via `pkg` or `oclif`. Reach non-CLI users (accountants who would never type `npx`) without npm. Out of scope for first cut; revisit if there's actual non-developer demand. Signing certificate cost ($200-400/yr) is the gating non-technical decision, not the packaging itself.
+
+---
+
+## Phase 20 — Full code review follow-ups (review run 2026-10-05)
+
+A full review on 2026-10-05 covered the qbXML layer, the simulation store, and all tool files, each with probe scripts. #93 is the operator-requested capability that came out of it. #94 onward are the confirmed or high-confidence findings that remain, ordered by impact. Fixed in that session and not listed: the qb_raw_query injection (an element name could smuggle a write past read-only mode), XML-illegal control characters in values, exe detection (the registry `Path` value and 64-bit QBW.EXE), the conflict-text classifier, the graceful close targeting the wrong window, and qb_raw_query / qb_session_connect throwing instead of returning isError.
+
+- [ ] **93.** Close one company file and open another, plus per-file QuickBooks logins via a popup. _(Partial 2026-10-05.)_
+  - **Built:** `qb_company_open closeCurrentCompany`, `qb_company_credentials_edit` / `_list`, the DPAPI vault, `scripts/qb-login-autofill.ps1`, `scripts/qb-close-desktop.ps1`, and `qb_company_list depth` + `hasSavedLogin`. The popup was superseded the same day by the web page (#105).
+  - **Verified live on the dev box:** exe resolves through the registry; QB is launched on a `.qbw`; it is detected as running; graceful close succeeds twice (17-19s). Popup save/encrypt/keep-saved/mask was checked off-screen. Autofill was checked against a stand-in dialog.
+  - **Still to verify live with a password-protected file:**
+    - the real QB login dialog matches the autofill assumptions (ES_PASSWORD edit + OK button);
+    - the real BeginSession conflict text classifies as file-conflict;
+    - a full A→B switch through the tool attaches.
+- [ ] **94.** The parser turns numeric-looking text into numbers. Names, RefNumbers, zip codes and account numbers lose leading zeros, and "1e3" becomes 1000. Applies to both the live parser (`parser.ts:15-25`) and the sim request parser (`simulation-store.ts:56-62`). Fix: `parseTagValue:false`, plus an allowlist of numeric tags.
+- [ ] **95.** Add/Mod request bodies are serialized in insertion order and never checked against the XSD. Confirmed out of order: CustomerAdd (ParentRef / BillAddress), CheckAdd (RefNumber / TxnDate), DepositAdd + DepositLineAdd, InventoryAdjustment, InvoiceLineAdd in duplicate/convert, SalesOrder→Invoice convert, TimeTrackingAdd, SalesReceipt, VendorAdd/Mod, VehicleMileage, SalesTaxPaymentCheck. Fix: extend `SCHEMA_ORDER` to Add/Mod and reorder in the builder.
+- [ ] **96.** Wrong element names that real QB will reject:
+  - `qb_bill_pay` sends `VendorRef` instead of `PayeeEntityRef`.
+  - `qb_item_add` / `_update` send top-level Description/Price/Cost instead of `SalesOrPurchase`.
+  - `qb_account_add` sends `Description` instead of `Desc`.
+  - EmployeeAdd/Mod send `<Name>`.
+  - ItemLine sends `Memo` instead of `Desc`.
+  - `qb_credit_memo_apply` uses AppliedToTxnAdd on CreditMemo. Real QB applies credits through ReceivePayment `SetCredit`.
+  - `qb_payment_apply` with `applyTo:[]` emits a bare `<AppliedToTxnMod/>`.
+- [ ] **97.** Status handling. `statusSeverity="Warn"` responses are thrown away as "Unknown -1", including committed Adds, so a retry can create a duplicate. A stale EditSequence is 3200 in real QB, not 3170. 3120 and 500 have the wrong text.
+- [ ] **98.** Money and validation:
+  - No rounding to cents: `Amount = qty*cost` emits 0.30000000000000004, and sim balances leave float residue so `IsPaid` stays false.
+  - Negative, over-applied and cross-customer/vendor payments are accepted.
+  - Amounts with three or more decimals are accepted (a JE of 100.004 vs 100.00 posts).
+  - `maxReturned` accepts 0, negatives and fractions.
+- [ ] **99.** Simulation fidelity:
+  - Deleting a payment never reverses its application.
+  - A line edit on a paid bill or invoice wipes the payment and discount.
+  - Bill-payment vendor balance ignores PayeeEntityRef and discounts.
+  - ListDel and Add don't check references.
+  - EditSequence is only checked when supplied.
+  - Iterator + MaxReturned loses rows.
+  - NameFilter is case-sensitive.
+  - A date-only ToModifiedDate excludes that day.
+- [ ] **100.** The lookup cache is never invalidated after this server's own writes (new customers stay invisible for 5 minutes), and `maxReturned` calls poison the "unfiltered" cache.
+- [ ] **101.** Idempotency is not safe under concurrent retries: two in-flight calls with the same key both post. Cache the in-flight promise.
+- [ ] **102.** Reports:
+  - AR/AP aging ignores `asOfDate`.
+  - 1099 totals are accrual (bills by TxnDate) instead of cash-basis payments.
+  - Bank-rec live rows don't request TxnID/ModifiedTime.
+  - The sales-tax liability report reads a shape the live adapter doesn't produce, so it shows $0 without any error.
+  - `transaction_list_by_account` running balance is wrong when capped.
+  - The PayrollSummary / CustomDetail element order is unverified.
+- [ ] **103.** Query filters that are mutually exclusive get combined. `ListID` / `TxnID` / `RefNumber` plus ActiveStatus / MaxReturned / date filters, and ModifiedDate + TxnDate, are sent together. `transaction_memo_search` sends IncludeLineItems to Transfer / StatementCharge.
+- [ ] **104.** Misc:
+  - The QBXML debug logger doesn't redact sim JSON or AccountNumber/BankNumber.
+  - `qb_closing_date_set` echoes the password.
+  - The `workflows.ts:411` prompt uses a nonexistent `includeInactive` arg.
+  - Numeric character entities (`&#183;`) aren't decoded and get double-escaped on reuse.
+  - Payment is in the TxnDel list in builder/sim but not in manager; extract one shared constant.
+  - Some `*Ret` names are missing from `arrayElements`.
+  - The memo search expects `JournalLineRet`.
+- [ ] **105.** Local logins web page + remote tailnet agents with per-file authorization. _(Built 2026-10-05; partial until verified from a second tailnet device.)_
+  - **Web page:**
+    - It starts with the MCP process at `127.0.0.1:8765` and on the tailnet IP.
+    - Saved logins load pre-filled with an "already saved" notice, and saving overwrites the old login.
+    - DPAPI encryption happens via `scripts/qb-dpapi-protect.ps1`.
+  - **Remote agents:**
+    - MCP Streamable HTTP at `/mcp`, with callers identified by `tailscale whois`.
+    - Per-file authorization is pinned to address + node, and enforced on every tool (9009).
+    - The listing tools are filtered to the caller's files.
+  - The popup is removed.
+  - SKILL.md is updated for agents.
+  - **Verified on the dev box:**
+    - the page loads over loopback and the tailnet IP;
+    - a real DPAPI save writes no plaintext to disk;
+    - a real whois authorization of the Precision tower pins its StableID;
+    - MCP over HTTP works on both addresses (152 tools).
+  - **Still to verify:** an agent on another tailnet device  connects, is refused before it is authorized, and works after.
+- [ ] **106.** Control page redesign + crash recovery. _(Built 2026-10-05; partial until a real QuickBooks crash is observed.)_
+  - **Control page:** an Overview pipeline (agents → server → QuickBooks), Reconnect / Open / Disconnect / Force close buttons, an Access grid, an Activity timeline, and a Storage & security tab.
+  - **Recovery:** `qb_health`, `qb_session_recover`, automatic read recovery (9011 for writes), refusals while File Doctor runs, a dialog is open, or QB hangs (9010), and the persistent activity log.
+  - **Verified live:** health probe on QB Enterprise 24 (ready state, process, title); `qb_health` via MCP; page screenshots of every tab.
+  - **Not yet observed live:** the exact error QBXMLRP2 raises after QuickBooks really crashes. Test: with an agent connected, close QuickBooks with its X, then run a report. It should come back with `recoveryCount: 1` and the "Reconnected" activity entry.

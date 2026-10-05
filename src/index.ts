@@ -85,6 +85,10 @@ import { registerStatementChargeTools } from "./tools/statement-charges.js";
 import { registerVehicleMileageTools } from "./tools/vehicle-mileage.js";
 import { registerCustomFieldTools } from "./tools/custom-fields.js";
 import { registerCacheTools } from "./tools/cache.js";
+import { registerCompanyCredentialTools } from "./tools/company-credentials.js";
+import { registerHealthTools } from "./tools/health.js";
+import { installAuthorizationGuard, LOCAL_STDIO_CALLER, type CallerIdentity } from "./util/caller-authorization.js";
+import { getWebServerInfo, startWebServer, type WebServerHandle } from "./web/server.js";
 import { registerWorkflowPrompts } from "./prompts/workflows.js";
 import { getQbxmlLogger } from "./util/qbxml-logger.js";
 import { join } from "node:path";
@@ -109,7 +113,12 @@ const config: QBConnectionConfig = {
 // Server setup
 // ---------------------------------------------------------------------------
 
-const server = new McpServer(
+// One McpServer per caller: the stdio host gets one, and every HTTP MCP
+// session on the local web server gets its own, so the tool-authorization
+// guard can be bound to that caller's identity. All instances share the
+// single QBSessionManager below.
+function newMcpServer(): McpServer {
+  return new McpServer(
   {
     name: "quickbooks-desktop",
     version: "1.0.0",
@@ -162,8 +171,11 @@ const server = new McpServer(
       "  • qb_closing_date_get / qb_closing_date_set — Year-end-lock / closing-date state. qb_closing_date_get wraps PreferencesQueryRq — returns the company file's closing date (ISO YYYY-MM-DD, or null when unset) plus adjacent AccountingPreferences flags (isUsingAuditTrail, isUsingClassTracking, isUsingAccountNumbers, isRequiringAccounts). The qbXML SDK does NOT surface the closing-date password status at any version — this tool can only tell you whether a closing date exists, not whether it's password-protected. qb_closing_date_set is an INFORMATIONAL stub — the qbXML SDK has no write path for company preferences (PreferencesModRq / AccountingPreferencesModRq do not exist in the schema at any version through 16.0). It always fails with statusCode 9005 and returns explicit QB Desktop UI navigation steps (Edit → Preferences → Accounting → Company Preferences → Set Date/Password) so an agent thinking 'set the closing date' routes the user correctly instead of hallucinating a non-existent mutation.",
       "  • qb_engagement_profitability — Per-engagement (customer/job) profitability rollup over a date window (Phase 15 #70). Three fail-soft sections: revenue (Invoice + SalesReceipt − CreditMemo header totals scoped server-side via EntityFilter), time (TimeTracking entries POST-FILTERED by CustomerRef — QB's TimeTrackingQueryRq has no CustomerFilter; hours rolled up by worker and by service item, billable vs non-billable split), and reimbursable expenses (Bill / Check / CreditCardCharge ExpenseLineRet + ItemLineRet lines whose LINE-LEVEL CustomerRef tags this customer for job-costing — header CustomerRef is not used because Bill/Check/CCC headers don't carry one). Returns a derived summary (revenue / reimbursableExpenseCost / grossProfit / marginPct / billableHours / totalHours / revenuePerHour / billableRate) ONLY when every queried section is 'ok' — partial summaries silently misreport profitability, so an erroring or skipped section omits the summary block (caller must branch on sectionStatus). customerListId | customerName is REQUIRED (the engagement IS the customer; no match → 3120). fromDate / toDate are both REQUIRED — engagements have explicit windows, no defaults. Section toggles (includeRevenue / includeTime / includeReimbursableExpenses) default true. Pure composite over existing session primitives — no new wire types. Use for 'is this job profitable?', effective hourly rate, break-even after pass-throughs, monthly job-cost reviews.",
       "  • qb_client_packet — Tax-prep workpaper bundle (Phase 15 #71). Single composite call that rolls up Trial Balance + General Ledger + bank reconciliation drift + Payroll Summary (W-2 boxes) + Fixed Asset detail across one tax year (Jan 1 → Dec 31 of `taxYear`). Replaces the 5-7 separate tool calls a CPA fires at the start of every client return — the workflow run ~2,000 times per tax season. Pure composite over existing session primitives (queryEntity / queryTransactions / runReport / runCustomDetailReport / runPayrollSummaryReport / getHostInfo) — no new wire types. Each section is FAIL-SOFT: a single section's failure lands in `sections.<name>.error` with the `sectionStatus.<name>` flipping to 'error' or 'skipped', and the rest of the packet still returns. Only the initial AccountQueryRq failure fails the whole tool. GL fanout defaults to P&L-only scope (Income / Expense / COGS / OtherIncome / OtherExpense — the typical tax-prep ask); pass `glScope: 'AllAccounts'` for every GL-eligible account. Bank rec discrepancy fans out across every Bank + CreditCard account; per-account errors land in that account's entry without poisoning the others. Payroll has three skip states: edition === Pro → 9003, wire returns zero rows → 9004 (subscription likely inactive or no YTD activity), probe itself fails → error block. Fixed Asset detail returns per-account current Balance + opening/closing + every posting in the tax year (Form 4562 input). Optional `customerListId` / `customerName` surfaces the customer as a label header — does NOT filter the underlying reports (the .qbw file IS the client). Section toggles (`includeTrialBalance` / `includeGeneralLedger` / `includeBankReconDiscrepancy` / `includePayrollSummary` / `includeFixedAssetDetail`) all default true.",
-      "  • qb_company_open  — Switch the active QuickBooks company file mid-session. Closes the current session, swaps the configured `.qbw` path, and opens a new session against the new file. Live mode requires QB Desktop to have the target file open (QBXMLRP2 cannot open a file QB hasn't loaded) — OR pass launchIfClosed:true (Phase 19 #90) to auto-spawn QB Desktop with the .qbw as a process arg + poll for attach (~30s budget; exe detection via $QB_DESKTOP_EXE → registry → known paths). Simulation mode resets the in-memory store to fresh seed — real QB persists per-file, sim doesn't, so without the reseed the operator would see entities from the prior company on the 'new' one (deliberate sim-fidelity tradeoff per DECISIONS.md 2026-05-09); launchIfClosed is a no-op in sim. Failure modes when launchIfClosed:true cannot resolve: 9007 (different file already open / no executable found / launch timeout / spawn failure), 9008 (multi-user lock — wait for the other user). Use qb_company_list first to discover available `.qbw` paths.",
-      "  • qb_company_list  — List `.qbw` company files under $QB_COMPANY_ROOT (fallback: dirname($QB_COMPANY_FILE), or pass `root` arg). Pure filesystem op — identical in live and simulation. Returns [{companyFile, displayName, sizeBytes, modifiedAt}] sorted by modifiedAt desc. Pair with qb_company_open: the returned `companyFile` paths are valid input.",
+      "  • qb_company_open  — Switch the active QuickBooks company file mid-session. Closes the current session, swaps the configured `.qbw` path, and opens a new session against the new file. Live mode requires QB Desktop to have the target file open (QBXMLRP2 cannot open a file QB hasn't loaded) — OR pass launchIfClosed:true (Phase 19 #90) to auto-spawn QB Desktop with the .qbw as a process arg + poll for attach (~90s budget; exe detection via $QB_DESKTOP_EXE → registry `Path`/`InstallPath` → known paths). To move from one company file to another while QB Desktop has a DIFFERENT file open, pass closeCurrentCompany:true — QB is closed gracefully (never force-killed; a prompt such as an unsaved form aborts with 9007 reason 'close-failed'), relaunched on the requested file, its login window is filled from the operator's saved login (qb_company_credentials_edit), and the session attaches. A rejected saved login fails with 9007 reason 'login-rejected' (submitted once, never retried). Simulation mode resets the in-memory store to fresh seed — real QB persists per-file, sim doesn't, so without the reseed the operator would see entities from the prior company on the 'new' one (deliberate sim-fidelity tradeoff per DECISIONS.md 2026-05-09); launchIfClosed is a no-op in sim. Failure modes when launchIfClosed:true cannot resolve: 9007 (different file already open / no executable found / launch timeout / spawn failure), 9008 (multi-user lock — wait for the other user). Use qb_company_list first to discover available `.qbw` paths.",
+      "  • qb_company_credentials_edit / qb_company_credentials_list — Company-file logins live on a local web page the server runs (default http://127.0.0.1:8765/, also on this PC's tailnet address). The operator enters each .qbw's QuickBooks user name + password there once; saved logins reappear pre-filled, and saving a change overwrites the old one. qb_company_open uses the saved login itself to log into QuickBooks. Passwords are never returned to you. qb_company_credentials_edit returns (and for the local agent, opens) the page; qb_company_credentials_list shows which files have a saved login (username + hasPassword) and which tailnet devices are authorized. NEVER ask the operator to type a QuickBooks password into the chat — send them to the page.",
+      "  • qb_health / qb_session_recover — QuickBooks on the server computer sometimes crashes, freezes on a big report, stops on a dialog, or goes through File Doctor. When a request fails unexpectedly or a report won't pull, call qb_health FIRST: it says what QuickBooks is doing (ready / login / dialog / not-responding / file-doctor / crashed / not-running), shows dialog titles, and gives the next step. Reads already reconnect and retry once automatically after a crash. Writes are never auto-retried: statusCode 9011 means QuickBooks crashed mid-write and the server reconnected, so look the record up before retrying (with an idempotencyKey). qb_session_recover reconnects to the same company file (starting QuickBooks and logging in if needed). It refuses with 9010 while File Doctor runs, a dialog is open, or QuickBooks is frozen. Pass forceCloseHungQuickBooks:true only with the operator's OK.",
+      "  • Remote agents (other tailnet devices) connect to http://<this PC's tailnet IP>:8765/mcp. They may use only the company files the operator authorized for their device on the logins page (pinned to the device's tailnet address + node). Anything else fails with statusCode 9009 — call qb_company_list to see the files you may use, then qb_company_open one of them before other tools.",
+      "  • qb_company_list  — List `.qbw` company files under $QB_COMPANY_ROOT (fallback: dirname($QB_COMPANY_FILE), or pass `root` arg). Pure filesystem op — identical in live and simulation. Pass depth (1-6) to search sub-folders. Returns [{companyFile, displayName, sizeBytes, modifiedAt, hasSavedLogin}] sorted by modifiedAt desc. Pair with qb_company_open: the returned `companyFile` paths are valid input.",
       "  • qb_raw_query     — Direct QBXML queries for advanced use",
       "  • qb_session_*     — Session connect/disconnect/status. qb_session_connect accepts an optional readOnly:true flag that gates every mutation (*_add / *_update / *_delete / *_apply / *_pay / *_make_inactive / *_convert_to_invoice / batch_create) — those tools fail-fast with statusCode 9001 BEFORE any QBXML envelope is built. Reads (queries, reports, qb_raw_query) and qb_company_open / qb_company_list are unaffected. The flag toggles immediately on call (safe to flip mid-conversation without disconnecting); a fresh qb_session_connect() with no readOnly arg defaults to writable. qb_company_info surfaces the current readOnly state. qb_session_status returns a diagnostic snapshot — connection state, configured app identity (appName, appId, qbxmlVersion), readOnly gate, cached HostInfo (null when not yet fetched — never triggers a fetch), rolling transient-retry observability (lastTransientRetryAt / transientRetryCountLastHour / totalTransientRetries from #84's auto-reconnect path), and server version. Zero wire I/O by default. Pass probe:true to actively verify the live wire via a fresh HostQueryRq round trip (lightest available real call); probe result lands under `probe: {ok}` — fail-soft so the snapshot itself never returns isError. Pass includeClosingDate:true to fold PreferencesQueryRq into the snapshot under `closingDate`. Use this from orchestration callers retrying brittle workflows: a non-zero transientRetryCountLastHour means QB Desktop has been stalling recently and a longer backoff may be warranted.",
       "",
@@ -184,7 +196,8 @@ const server = new McpServer(
       "  5. For operations not covered by specific tools, use qb_raw_query.",
     ].join("\n"),
   }
-);
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Session manager (lazy-initialized, shared across all tools)
@@ -203,45 +216,57 @@ function getSessionManager(): QBSessionManager {
 // Register all tool modules
 // ---------------------------------------------------------------------------
 
-registerCustomerTools(server, getSessionManager);
-registerVendorTools(server, getSessionManager);
-registerAccountTools(server, getSessionManager);
-registerInvoiceTools(server, getSessionManager);
-registerBillTools(server, getSessionManager);
-registerItemTools(server, getSessionManager);
-registerPaymentTools(server, getSessionManager);
-registerEstimateTools(server, getSessionManager);
-registerSalesReceiptTools(server, getSessionManager);
-registerCreditMemoTools(server, getSessionManager);
-registerPurchaseOrderTools(server, getSessionManager);
-registerJournalEntryTools(server, getSessionManager);
-registerEmployeeTools(server, getSessionManager);
-registerListTools(server, getSessionManager);
-registerReportTools(server, getSessionManager);
-registerTransactionTools(server, getSessionManager);
-registerForm1099Tools(server, getSessionManager);
-registerReconciliationTools(server, getSessionManager);
-registerAttachmentTools(server, getSessionManager);
-registerPreferenceTools(server, getSessionManager);
-registerDepositTools(server, getSessionManager);
-registerCheckTools(server, getSessionManager);
-registerTransferTools(server, getSessionManager);
-registerClientPacketTools(server, getSessionManager);
-registerTimeTrackingTools(server, getSessionManager);
-registerEngagementProfitabilityTools(server, getSessionManager);
-registerSalesOrderTools(server, getSessionManager);
-registerSalesTaxTools(server, getSessionManager);
-registerInventoryAdjustmentTools(server, getSessionManager);
-registerStatementChargeTools(server, getSessionManager);
-registerVehicleMileageTools(server, getSessionManager);
-registerCustomFieldTools(server, getSessionManager);
-registerCacheTools(server, getSessionManager);
+export function createMcpServer(identity: CallerIdentity): McpServer {
+  const server = newMcpServer();
+  // Must run before any register*Tools call: it wraps server.tool so every
+  // handler checks the caller's per-company-file authorization (no-op for
+  // local callers).
+  installAuthorizationGuard(server, identity, getSessionManager, {
+    adminUrl: () => getWebServerInfo().pageUrls.find((u) => !u.includes("127.0.0.1")) ?? null,
+  });
+  registerCustomerTools(server, getSessionManager);
+  registerCompanyCredentialTools(server, getSessionManager, identity);
+  registerHealthTools(server, getSessionManager);
+  registerVendorTools(server, getSessionManager);
+  registerAccountTools(server, getSessionManager);
+  registerInvoiceTools(server, getSessionManager);
+  registerBillTools(server, getSessionManager);
+  registerItemTools(server, getSessionManager);
+  registerPaymentTools(server, getSessionManager);
+  registerEstimateTools(server, getSessionManager);
+  registerSalesReceiptTools(server, getSessionManager);
+  registerCreditMemoTools(server, getSessionManager);
+  registerPurchaseOrderTools(server, getSessionManager);
+  registerJournalEntryTools(server, getSessionManager);
+  registerEmployeeTools(server, getSessionManager);
+  registerListTools(server, getSessionManager);
+  registerReportTools(server, getSessionManager);
+  registerTransactionTools(server, getSessionManager);
+  registerForm1099Tools(server, getSessionManager);
+  registerReconciliationTools(server, getSessionManager);
+  registerAttachmentTools(server, getSessionManager);
+  registerPreferenceTools(server, getSessionManager);
+  registerDepositTools(server, getSessionManager);
+  registerCheckTools(server, getSessionManager);
+  registerTransferTools(server, getSessionManager);
+  registerClientPacketTools(server, getSessionManager);
+  registerTimeTrackingTools(server, getSessionManager);
+  registerEngagementProfitabilityTools(server, getSessionManager);
+  registerSalesOrderTools(server, getSessionManager);
+  registerSalesTaxTools(server, getSessionManager);
+  registerInventoryAdjustmentTools(server, getSessionManager);
+  registerStatementChargeTools(server, getSessionManager);
+  registerVehicleMileageTools(server, getSessionManager);
+  registerCustomFieldTools(server, getSessionManager);
+  registerCacheTools(server, getSessionManager);
 
-// Phase 18 #86 — workflow-bundle prompts surfaced via the MCP prompts/list +
-// prompts/get API. Bridges the operator's existing skill workflows
-// (credit-card-qb-batch / trial-balance-workup / cc-statement-validator)
-// to the post-Phase-11/12 tool surface, plus month-end-close + w2-prep.
-registerWorkflowPrompts(server);
+  // Phase 18 #86 — workflow-bundle prompts surfaced via the MCP prompts/list +
+  // prompts/get API. Bridges the operator's existing skill workflows
+  // (credit-card-qb-batch / trial-balance-workup / cc-statement-validator)
+  // to the post-Phase-11/12 tool surface, plus month-end-close + w2-prep.
+  registerWorkflowPrompts(server);
+  return server;
+}
 
 // ---------------------------------------------------------------------------
 // Start the server
@@ -259,6 +284,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   console.error(`\n[QB Session] Received ${signal}, closing QuickBooks session...`);
+  if (webServer) await webServer.close().catch(() => undefined);
   if (sessionManager) {
     try {
       await sessionManager.closeSession();
@@ -272,16 +298,41 @@ async function gracefulShutdown(signal: string): Promise<void> {
 process.on("SIGINT", () => { void gracefulShutdown("SIGINT"); });
 process.on("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
 
+let webServer: WebServerHandle | null = null;
+
 async function main(): Promise<void> {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const httpOnly = process.env.QB_HTTP_ONLY === "1";
+  if (!httpOnly) {
+    const transport = new StdioServerTransport();
+    await createMcpServer(LOCAL_STDIO_CALLER).connect(transport);
+  }
+  if (process.env.QB_WEB !== "0") {
+    try {
+      webServer = await startWebServer({
+        createMcpServer,
+        getSession: getSessionManager,
+        stdioConnected: !httpOnly,
+        bindTailnet: process.env.QB_WEB_TAILNET !== "0",
+        admins: (process.env.QB_WEB_ADMINS ?? "").split(",").filter((a) => a.trim()),
+      });
+    } catch (err) {
+      // Typically EADDRINUSE: another instance of this server already serves
+      // the page for the same credential store, so carry on without it.
+      console.error(`[QB Web] Logins page not started: ${(err as Error).message}`);
+      if (httpOnly) throw err;
+    }
+  }
   // Eagerly construct the session manager so the Mode banner reports the
   // actual resolved mode (which honors QB_SIMULATION overrides) rather than
   // duplicating the env-resolution logic here. Construction is cheap — it
   // reads env, picks a mode, and creates an empty SimulationStore. No QB
   // session opens until the first tool call.
   const sm = getSessionManager();
-  console.error("QuickBooks Desktop MCP Server running on stdio");
+  console.error(`QuickBooks Desktop MCP Server running${httpOnly ? " (HTTP only)" : " on stdio"}`);
+  if (webServer) {
+    console.error(`  Logins page: ${webServer.pageUrls.join("  ")}`);
+    console.error(`  Remote MCP endpoint: ${webServer.mcpUrls.join("  ")}`);
+  }
   console.error(`  Company file: ${config.companyFile || "(use currently open QB file)"}`);
   console.error(`  App name: ${config.appName}`);
   console.error(`  QBXML version: ${config.qbxmlVersion}`);

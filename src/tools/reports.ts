@@ -11,6 +11,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 import { formatToolError } from "../util/format-tool-error.js";
+import { findCompanyFiles, MAX_COMPANY_SEARCH_DEPTH, resolveCompanyRoot } from "../util/company-files.js";
+import { normalizeCompanyPath, readCredentialSummaries } from "../util/qb-credentials.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 import { normalizeClosingDate } from "./preferences.js";
 
@@ -901,17 +903,19 @@ export function registerReportTools(
   // state" — same in both modes. See DECISIONS.md 2026-05-09.
   server.tool(
     "qb_company_open",
-    "Switch the active QuickBooks Desktop company file. Closes the current session, swaps the configured company file path, and opens a new session against the new file. In live mode the file must either be the one currently open in QuickBooks Desktop or be openable by QBXMLRP2 (typically requires QB to have it open already — QBXMLRP2 won't open a file QB hasn't loaded). Pass launchIfClosed:true to auto-spawn QB Desktop with the .qbw as a process arg when no file is currently loaded (Phase 19 #90 — live-only; sim mode no-ops the flag). In simulation mode the in-memory store is reset to fresh seed (deliberate sim-fidelity tradeoff — real QB persists per-file, sim doesn't; see DECISIONS.md 2026-05-09).",
+    "Switch the active QuickBooks Desktop company file. Closes the current session, swaps the configured company file path, and opens a new session against the new file. In live mode the file must either be the one currently open in QuickBooks Desktop or be openable by QBXMLRP2 (typically requires QB to have it open already — QBXMLRP2 won't open a file QB hasn't loaded). Pass launchIfClosed:true to auto-spawn QB Desktop with the .qbw as a process arg when no file is currently loaded (Phase 19 #90 — live-only; sim mode no-ops the flag). To go from one company file to another when QB Desktop already has a DIFFERENT file open, pass closeCurrentCompany:true: the server gracefully closes QuickBooks (like clicking its X — never a force-kill; an unsaved form or other prompt stops the close and the tool reports it), relaunches QB on the requested file, fills in QB's login window from the operator's saved login for that file (see qb_company_credentials_edit), and attaches. In simulation mode the in-memory store is reset to fresh seed (deliberate sim-fidelity tradeoff — real QB persists per-file, sim doesn't; see DECISIONS.md 2026-05-09).",
     {
       companyFile: z.string().min(1).describe("Absolute or UNC path to the .qbw file (e.g. 'C:\\\\path\\\\to\\\\Acme.qbw' or '\\\\\\\\server\\\\share\\\\Acme.qbw'). Pass an empty string to fall back to 'whatever file QB Desktop has open' — but the schema rejects empty strings to force an explicit choice; if you want the currently-open file, just don't call this tool."),
+      closeCurrentCompany: z.boolean().optional().describe("Live mode only. If QuickBooks Desktop has a different company file open (or is running without the requested file attached), gracefully close QuickBooks and relaunch it on companyFile, then log in with the saved login for that file (qb_company_credentials_edit) and attach. Implies launchIfClosed:true. Default false. The close is graceful: if QuickBooks shows a prompt (unsaved form, backup reminder) it stays open and the tool fails with statusCode 9007 reason 'close-failed'. A saved login QuickBooks rejects fails with reason 'login-rejected' (submitted once, never retried). Response adds closedPreviousQuickBooks:true and loginAutofill: 'filled' | 'not-needed' | 'no-credentials' | 'no-login-window' | 'error'."),
       launchIfClosed: z.boolean().optional().describe("If true and live mode and the initial BeginSession reports no company file is loaded (or QB Desktop isn't running), spawn QB Desktop with the target .qbw and poll for attach (~30s budget across 5 exponential retries: 1s, 2s, 4s, 8s, 15s). Executable detection chain: $QB_DESKTOP_EXE → Windows registry (HKLM\\\\SOFTWARE\\\\Intuit\\\\QuickBooks\\\\*\\\\InstallPath) → known Program Files paths. Default false — explicit opt-in. In simulation mode this flag is a no-op (the store reseed already covers the 'open a new book' UX). Failure modes: statusCode 9007 if QB Desktop is already open with a DIFFERENT file (auto-swap not attempted — close it first), no executable is locatable, the spawn itself fails, or the poll budget expires without attach. statusCode 9008 if the .qbw is locked by another user in multi-user mode (retry not useful — wait for release). On success, the response includes launched:true plus launchSource ('env' | 'registry' | 'fallback'), launchExe (the resolved path), and launchPollAttempts."),
     },
-    async ({ companyFile, launchIfClosed }) => {
+    async ({ companyFile, launchIfClosed, closeCurrentCompany }) => {
       const session = getSession();
       const previousCompanyFile = session.getCompanyFile();
       try {
         const newSession = await session.switchCompanyFile(companyFile, {
           launchIfClosed: !!launchIfClosed,
+          closeCurrentCompany: !!closeCurrentCompany,
         });
         const launchInfo = session.getLastSwitchLaunchInfo();
         return {
@@ -935,6 +939,8 @@ export function registerReportTools(
                     launchPollAttempts: launchInfo.launchPollAttempts,
                   }
                 : {}),
+              ...(launchInfo.closedPreviousQuickBooks ? { closedPreviousQuickBooks: true } : {}),
+              ...(launchInfo.loginAutofill ? { loginAutofill: launchInfo.loginAutofill } : {}),
             }, null, 2),
           }],
         };
@@ -968,16 +974,13 @@ export function registerReportTools(
   // path they happen to know.
   server.tool(
     "qb_company_list",
-    "List QuickBooks company files (.qbw) under the configured root directory. Search root is taken from $QB_COMPANY_ROOT, falling back to dirname($QB_COMPANY_FILE). Returns [{companyFile, displayName, sizeBytes, modifiedAt}] sorted by modifiedAt desc. Pure filesystem operation — identical behavior in live and simulation mode. Use the returned `companyFile` paths as input to qb_company_open.",
+    "List QuickBooks company files (.qbw) under the configured root directory. Search root is taken from $QB_COMPANY_ROOT, falling back to dirname($QB_COMPANY_FILE). Pass depth (1-6) to also search sub-folders (client-per-folder layouts). Returns [{companyFile, displayName, sizeBytes, modifiedAt, hasSavedLogin}] sorted by modifiedAt desc; hasSavedLogin tells you whether qb_company_open can log into that file automatically. Pure filesystem operation — identical behavior in live and simulation mode. Use the returned `companyFile` paths as input to qb_company_open.",
     {
       root: z.string().optional().describe("Override the search root for this call (absolute path). Defaults to $QB_COMPANY_ROOT, then dirname($QB_COMPANY_FILE)."),
+      depth: z.number().int().min(0).max(MAX_COMPANY_SEARCH_DEPTH).optional().describe("Sub-folder levels to search below root (0 = root only, the default)."),
     },
-    async ({ root: rootOverride }) => {
-      const envRoot = process.env.QB_COMPANY_ROOT;
-      const fallbackRoot = process.env.QB_COMPANY_FILE
-        ? path.dirname(process.env.QB_COMPANY_FILE)
-        : null;
-      const root = rootOverride ?? envRoot ?? fallbackRoot;
+    async ({ root: rootOverride, depth }) => {
+      const root = resolveCompanyRoot(rootOverride);
 
       if (!root) {
         return {
@@ -994,23 +997,14 @@ export function registerReportTools(
       }
 
       try {
-        const entries = await fs.readdir(root, { withFileTypes: true });
-        const qbwEntries = entries.filter(
-          (e) => e.isFile() && e.name.toLowerCase().endsWith(".qbw")
-        );
-        const files = await Promise.all(
-          qbwEntries.map(async (e) => {
-            const full = path.join(root, e.name);
-            const stat = await fs.stat(full);
-            return {
-              companyFile: full,
-              displayName: path.basename(e.name, path.extname(e.name)),
-              sizeBytes: stat.size,
-              modifiedAt: stat.mtime.toISOString(),
-            };
-          })
-        );
-        files.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+        let savedKeys = new Set<string>();
+        try {
+          savedKeys = new Set(readCredentialSummaries().map((c) => normalizeCompanyPath(c.companyFile)));
+        } catch { /* unreadable vault → report hasSavedLogin:false everywhere */ }
+        const files = (await findCompanyFiles(root, depth ?? 0)).map((f) => ({
+          ...f,
+          hasSavedLogin: savedKeys.has(normalizeCompanyPath(f.companyFile)),
+        }));
         return {
           content: [{
             type: "text" as const,
@@ -3117,8 +3111,8 @@ export function registerReportTools(
     "qb_raw_query",
     "Execute a raw QBXML query against QuickBooks Desktop. For advanced users who need direct QBXML access.",
     {
-      entityType: z.string().describe(
-        "Entity type to query (e.g., Customer, Vendor, Account, Invoice, Bill, Item, Employee, Class, SalesReceipt, CreditMemo, PurchaseOrder, JournalEntry)"
+      entityType: z.string().regex(/^[A-Za-z][A-Za-z0-9]*$/, "entityType must be a bare qbXML entity name (letters/digits only, e.g. 'Customer')").describe(
+        "Entity type to query — bare name, letters/digits only; the tool appends 'QueryRq' (e.g., Customer, Vendor, Account, Invoice, Bill, Item, Employee, Class, SalesReceipt, CreditMemo, PurchaseOrder, JournalEntry)"
       ),
       filters: z.string().optional().describe(
         "JSON string of QBXML filters to apply (e.g., '{\"MaxReturned\": 10, \"ActiveStatus\": \"ActiveOnly\"}')"
@@ -3145,17 +3139,21 @@ export function registerReportTools(
         }
       }
 
-      const results = await session.queryEntity(entityType, parsedFilters);
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            entityType,
-            count: results.length,
-            results,
-          }, null, 2),
-        }],
-      };
+      try {
+        const results = await session.queryEntity(entityType, parsedFilters);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              entityType,
+              count: results.length,
+              results,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return formatToolError(err, { fallbackMessage: `${entityType}QueryRq failed` });
+      }
     }
   );
 
@@ -3171,7 +3169,12 @@ export function registerReportTools(
     async ({ readOnly }) => {
       const session = getSession();
       session.setReadOnly(readOnly === true);
-      const qbSession = await session.openSession();
+      let qbSession;
+      try {
+        qbSession = await session.openSession();
+      } catch (err) {
+        return formatToolError(err, { fallbackMessage: "Failed to open QuickBooks session" });
+      }
       return {
         content: [{
           type: "text" as const,

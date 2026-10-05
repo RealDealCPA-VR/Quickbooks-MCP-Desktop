@@ -17,6 +17,7 @@ import {
   classifyBeginSessionError,
   KNOWN_QB_DESKTOP_PATHS,
   parseRegistryQuery,
+  parseRegistryCandidates,
   QB_LAUNCH_POLL_MS,
   resolveQBDesktopExe,
 } from "../src/util/qb-desktop-launch.js";
@@ -248,12 +249,81 @@ describe("classifyBeginSessionError — bucket QBXMLRP2 BeginSession errors", ()
 // ---------------------------------------------------------------------------
 
 describe("QB_LAUNCH_POLL_MS — schedule contract", () => {
-  it("sums to 30000ms across 5 tiers (1s + 2s + 4s + 8s + 15s)", () => {
-    expect(QB_LAUNCH_POLL_MS).toEqual([1000, 2000, 4000, 8000, 15000]);
-    expect(QB_LAUNCH_POLL_MS.reduce((a, b) => a + b, 0)).toBe(30000);
+  it("sums to 90000ms across 8 tiers (QB Enterprise 24 cold open measured >30s on 2026-10-05)", () => {
+    expect(QB_LAUNCH_POLL_MS).toEqual([1000, 2000, 4000, 8000, 15000, 15000, 15000, 30000]);
+    expect(QB_LAUNCH_POLL_MS.reduce((a, b) => a + b, 0)).toBe(90000);
   });
 
   it("is frozen so tests can rely on the canonical schedule", () => {
     expect(Object.isFrozen(QB_LAUNCH_POLL_MS)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Registry "Path" value + candidate lists (2026-10-05 — the dev box's
+// Enterprise 24.0 install was invisible to the InstallPath-only parser)
+// ---------------------------------------------------------------------------
+
+describe("parseRegistryCandidates — real Intuit registry layout", () => {
+  // Verbatim shape of `reg query HKLM\SOFTWARE\Intuit\QuickBooks /s` on the dev box.
+  const observed = [
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\Intuit\\QuickBooks\\34.0\\belacct",
+    "    Product    REG_SZ    QuickBooks Enterprise Solutions: Accountant Edition 24.0",
+    "    CommonFilesPath    REG_SZ    C:\\Program Files\\Common Files\\Intuit\\QuickBooks\\",
+    "    Path    REG_SZ    C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 24.0\\qbw.exe",
+    "    DataPath    REG_SZ    C:\\ProgramData\\Intuit\\QuickBooks Enterprise Solutions 24.0\\",
+    "",
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\Intuit\\QuickBooks\\34.0\\server",
+    "    EnterpriseServerPath    REG_SZ    C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 24.0\\",
+    "",
+  ].join("\r\n");
+
+  it("takes the full exe from the Path value (and ignores CommonFilesPath / DataPath / EnterpriseServerPath)", () => {
+    expect(parseRegistryCandidates(observed)).toEqual([
+      "C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 24.0\\qbw.exe",
+    ]);
+  });
+
+  it("an InstallPath directory yields both qbw.exe and qbw32.exe candidates", () => {
+    const out = "    InstallPath    REG_SZ    C:\\QB\\\n";
+    const c = parseRegistryCandidates(out);
+    expect(c).toContain("C:\\QB\\qbw.exe");
+    expect(c).toContain("C:\\QB\\qbw32.exe");
+  });
+
+  it("newest (last) key comes first", () => {
+    const out = [
+      "    Path    REG_SZ    C:\\Old\\qbw32.exe",
+      "    Path    REG_SZ    C:\\New\\qbw.exe",
+    ].join("\n");
+    expect(parseRegistryCandidates(out)[0]).toBe("C:\\New\\qbw.exe");
+  });
+
+  it("resolver walks a registry candidate LIST and picks the first that exists", () => {
+    const resolved = resolveQBDesktopExe({
+      envExe: undefined,
+      fileExists: (p) => p === "C:\\B\\qbw.exe",
+      registryQuery: () => ["C:\\A\\qbw.exe", "C:\\B\\qbw.exe"],
+    });
+    expect(resolved).toEqual({ exe: "C:\\B\\qbw.exe", source: "registry" });
+  });
+
+  it("known-paths fallback covers 64-bit Enterprise 24.0 under Program Files", () => {
+    expect(KNOWN_QB_DESKTOP_PATHS).toContain(
+      "C:\\Program Files\\Intuit\\QuickBooks Enterprise Solutions 24.0\\qbw.exe",
+    );
+  });
+});
+
+describe("classifyBeginSessionError — Intuit SDK wording", () => {
+  it("'already open and it is different from the one requested' → file-conflict", () => {
+    expect(classifyBeginSessionError(
+      "A company data file is already open and it is different from the one requested.",
+    )).toBe("file-conflict");
+  });
+  it("'If QuickBooks is not running, a company file must be specified' → file-not-loaded", () => {
+    expect(classifyBeginSessionError(
+      "If QuickBooks is not running, a company file must be specified.",
+    )).toBe("file-not-loaded");
   });
 });

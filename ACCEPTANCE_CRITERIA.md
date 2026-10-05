@@ -8,6 +8,95 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 
 ---
 
+## Item 106 — Control page redesign + QuickBooks crash recovery _(Phase 20)_
+
+**Status:** partial. Everything is verified with fakes, plus live health and UI on QB Enterprise 24. A real QuickBooks crash has not been observed yet.
+
+**Behavioral criteria**:
+- [x] Overview shows agents → server → QuickBooks with live state:
+  - the QB health state and summary, the recommended action, and dialog titles;
+  - the server session (file, last request, last error, recoveries) and connected agents;
+  - auto-refresh every 5 s.
+- [x] The Reconnect / Open / Disconnect actions run as background jobs with visible progress and outcome.
+- [x] Force close appears only when QB is frozen or crashed, needs typed FORCE CLOSE, and the API refuses with 409 otherwise.
+- [x] The Access grid shows file × tailnet device. Clicking a cell grants or revokes, this computer is always allowed, offline and missing devices are marked, and the first column stays readable with 8+ devices.
+- [x] The Activity timeline is filterable, persisted to activity.log, and contains no secrets. It records login and access changes, switches, sessions, recoveries, refused remote calls, and agent connects.
+- [x] Storage & security shows the file paths, sizes and dates, the protection steps, a per-file stored-data table, and a redacted credentials.json.
+- [x] A READ hitting a QB crash reconnects to the same file and retries once. A WRITE gets 9011 with no retry. The idempotency cache survives.
+- [x] A modal QB dialog gives 9010 `dialog` naming the dialog.
+- [x] File Doctor running gives 9010 `file-doctor`, with no reopen.
+- [x] A hung QB is rechecked after 10 s. It is force-closed only with permission; otherwise 9010.
+- [x] With no session, QB closed and a saved login, the server launches QB itself (no unattended SDK open).
+- [x] qb_health and qb_session_recover are registered (154 tools). qb_health runs live: state=ready, the summary names the open company
+- [ ] LIVE: with an agent connected, close QuickBooks with its X, then run a report. It returns data, recoveryCount=1, and the activity shows 'Reconnected'.
+
+**Regression criteria**:
+- [x] 65 files / 1816 tests pass (QB_UI_TESTS=1), and the build is green.
+
+---
+
+## Item 105 — Local logins web page + remote tailnet agents with per-file authorization _(Phase 20)_
+
+**Status:** partial. Everything is verified locally and on the dev box's tailnet address. A second physical tailnet device has not been tested yet.
+
+**Behavioral criteria**:
+- [x] Starting the MCP server also serves the logins page on `127.0.0.1:8765` and this PC's tailnet IP, and never on 0.0.0.0. The startup banner prints both URLs. _(live smoke)_
+- [x] Saving file + user + password stores it on this PC (`%APPDATA%\quickbooks-desktop-mcp\credentials.json`) with the password DPAPI-encrypted. No plaintext is ever on disk. _(live, real DPAPI)_
+- [x] Revisiting the page, or typing or picking a saved file, shows "Already saved…" with the user name pre-filled and the password marked saved. _(screenshot)_
+- [x] Changing the user name or password and saving overwrites the old login in place: one entry, atomic replace. A blank password keeps the saved one. "Remove the saved password" clears it.
+- [x] Changes apply to the next tool call with no restart.
+- [x] Per-file "Authorize" accepts only real tailnet devices (verified by whois), stores address + node StableID + name + login, and can be revoked.
+- [x] A remote agent at `/mcp` is refused with 9009 on every tool for files it isn't authorized for (including the currently open file), and works after authorization.
+- [x] The same address presented by a different node is refused.
+- [x] A session can't be reused from another device.
+- [x] `qb_company_list` and `qb_company_credentials_list` show a remote agent only its files.
+- [x] Agents on the host (stdio, loopback, or self-tailnet HTTP) are unrestricted.
+- [x] No tool response or `/api/state` response contains a password or ciphertext.
+- [x] Page security:
+  - an unknown Host header gets 421;
+  - a cross-origin write gets 403;
+  - a write without `X-QB-Admin` or JSON gets 403/415;
+  - CORS preflight is never answered;
+  - CSP is `default-src 'none'`;
+  - another Tailscale user's device gets the 403 page.
+- [x] `qb_company_credentials_edit` returns the page URL (with `?file=`) and opens the browser only for the local agent.
+- [x] SKILL.md documents connecting, the logins page, opening and switching files, 9007 reasons, 9009, and what not to do.
+- [ ] LIVE: an MCP host on a second tailnet device connects to `http://<host tailnet IP>:8765/mcp`, gets 9009 before authorization, and works after.
+
+**Regression criteria**:
+- [x] 64 files / 1787 tests pass (`QB_UI_TESTS=1`) and `npm run build` passes. Stdio MCP still works, and the built-server stdio smoke test shows 152 tools.
+
+---
+
+## Item 93 — Close one company file and open another + per-file QuickBooks logins via popup _(Phase 20)_
+
+**Status:** partial. Simulation, unit tests and the dev-box mechanics are verified. Live login/attach with a password-protected file is still pending.
+
+**Behavioral criteria**:
+- [x] `qb_company_open({companyFile, closeCurrentCompany:true})` on a file-conflict resolves the exe BEFORE closing, closes QB gracefully, spawns QB on the new file, and attaches. The response includes `closedPreviousQuickBooks:true` and `loginAutofill`. _(unit: tests/company-switching.test.ts)_
+- [x] Without `closeCurrentCompany`, a file-conflict returns 9007 `file-conflict`, the message names `closeCurrentCompany:true`, and nothing is closed or spawned.
+- [x] A graceful close that stalls returns 9007 `close-failed`, names the visible QB windows, and spawns nothing. QB is never force-killed.
+- [x] A saved login that QB rejects returns 9007 `login-rejected` early. It is submitted once and never retried.
+- [x] When QB is running, the initial error is unrecognized, and no close is allowed, the tool polls attach-only and never spawns a second QB.
+- [x] `qb_company_credentials_edit` opens a popup listing saved logins, the `.qbw` files under the root (`depth`), and `companyFiles`. Password entry is masked and the plaintext is never rendered. A blank entry keeps the saved password. Rows without a user name are not saved. Passwords are DPAPI-encrypted. _(UI self-test, off-screen)_
+- [x] No tool response contains a password or the encrypted blob. `qb_company_credentials_list` and `qb_company_list` expose only `username`, `hasPassword` and `hasSavedLogin`.
+- [x] The autofill helper fills user and password exactly (including SendKeys metacharacters), presses OK, and reports `filled`. A dialog that stays open reports `rejected`. It also reports `no-credentials` and `no-login-window`. _(stand-in dialog)_
+- [x] Dev box (QB Enterprise 24.0): the exe resolves via the registry `Path` value and the doctor shows ✓. A launch on a `.qbw` is detected. Graceful close (WM_CLOSE to `MauiFrame`) exits QB in 17-19s on two consecutive runs.
+- [ ] LIVE: with a password-protected `.qbw` whose login is saved, `closeCurrentCompany:true` from another open file ends with `loginAutofill:"filled"` and a working `qb_company_info`.
+- [ ] LIVE: the real BeginSession wrong-file message classifies as `file-conflict`. Capture the text from the tool's `underlyingMessage`.
+
+**Regression criteria**:
+- [x] All 1769 tests pass (`QB_UI_TESTS=1` runs the window-based ones), and `npm run build` passes. Simulation `qb_company_open` still reseeds the store. Built-server stdio smoke test: 152 tools; switch A→B, raw_query, disconnect/reconnect all OK.
+
+**Verification commands**:
+```bash
+npm run build && npm test
+QB_UI_TESTS=1 npx vitest run tests/company-credentials.test.ts   # Windows; opens off-screen test windows
+node dist/cli/doctor.js
+```
+
+---
+
 ## Template
 
 ```markdown
