@@ -99,6 +99,17 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
   .banner.ok { background: var(--ok-bg); color: var(--ok); } .banner.warn { background: var(--warn-bg); color: var(--warn); }
   .banner.err { background: var(--bad-bg); color: var(--bad); } .banner.info { background: var(--info-bg); color: var(--info); }
   .hidden { display: none !important; }
+  .picker { border: 1px solid var(--border); border-radius: 10px; margin-top: 8px; background: var(--panel2); overflow: hidden; }
+  .picker .bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 8px; border-bottom: 1px solid var(--border); }
+  .picker .bar input { flex: 1 1 200px; min-width: 0; }
+  .picker .where { padding: 6px 10px 0; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+  .picker .list { max-height: 300px; overflow-y: auto; padding: 6px; }
+  .picker .item { display: flex; width: 100%; gap: 10px; align-items: center; text-align: left; border: none; border-radius: 7px; background: none; padding: 7px 9px; }
+  .picker .item:hover, .picker .item:focus-visible { background: var(--chip); }
+  .picker .item .n { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .picker .item .m { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .picker .item.qbw .n { font-weight: 600; color: var(--accent); }
+  .picker .ico { width: 18px; flex: none; text-align: center; color: var(--muted); }
   code { font: 12.5px ui-monospace, Consolas, monospace; background: var(--chip); padding: 1px 6px; border-radius: 5px; overflow-wrap: anywhere; }
   .muted { color: var(--muted); } .small { font-size: 12.5px; }
   .empty { color: var(--muted); font-style: italic; }
@@ -192,9 +203,23 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
       <form class="grid" id="loginForm" autocomplete="off">
         <div class="full">
           <label class="f" for="companyFile">Company file (.qbw)</label>
-          <input type="text" id="companyFile" list="fileOptions" placeholder="C:\Clients\Acme Bakery\Acme Bakery.qbw" spellcheck="false" required>
+          <div class="row" style="flex-wrap:nowrap">
+            <input type="text" id="companyFile" list="fileOptions" placeholder="C:\Clients\Acme Bakery\Acme Bakery.qbw" spellcheck="false" required>
+            <button type="button" id="browseBtn" aria-expanded="false" aria-controls="picker">Browse&hellip;</button>
+          </div>
           <datalist id="fileOptions"></datalist>
-          <div class="hint">Full path as this computer sees it. Pick from the list or paste a path.</div>
+          <div class="picker hidden" id="picker" role="region" aria-label="Choose a company file on this computer">
+            <div class="bar">
+              <button type="button" id="pkDrives">Drives</button>
+              <button type="button" id="pkUp" aria-label="Up one folder">Up</button>
+              <input type="text" id="pkPath" aria-label="Folder path" placeholder="Type or paste a folder, e.g. D:\Clients" spellcheck="false">
+              <button type="button" id="pkGo">Go</button>
+              <button type="button" id="pkClose" class="link">Close</button>
+            </div>
+            <div class="where" id="pkWhere"></div>
+            <div class="list" id="pkList"></div>
+          </div>
+          <div class="hint">Full path as this computer sees it. Use <b>Browse</b> to pick from this computer's drives and folders, choose from the list, or paste a path.</div>
         </div>
         <div>
           <label class="f" for="username">QuickBooks user name</label>
@@ -617,6 +642,76 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
     if (!addr || !f) { toast("Enter a tailnet address and choose a company file.", "warn"); return; }
     api("/api/authorizations", { companyFile: f, address: addr }).then(function () { $("extraAddr").value = ""; toast("Access granted."); load(); }).catch(function (e) { toast(e.message, "err"); });
   };
+  // ---- company-file picker: drives -> folders -> .qbw (POST /api/browse) ----
+  var pickerAt = null;
+  function sizeLabel(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB"; }
+  function pickItem(ico, name, meta, cls, onclick) {
+    var b = btn("", "item" + (cls ? " " + cls : ""), onclick);
+    b.appendChild(el("span", ico, "ico")); b.appendChild(el("span", name, "n"));
+    if (meta) b.appendChild(el("span", meta, "m"));
+    return b;
+  }
+  function showDrives() {
+    pickerAt = null; $("pkPath").value = ""; $("pkUp").disabled = true;
+    $("pkWhere").textContent = "Drives on the computer running QuickBooks";
+    var list = clear($("pkList")); list.appendChild(el("p", "Loading drives\u2026", "empty"));
+    api("/api/browse", { path: "" }).then(function (r) {
+      clear(list);
+      if (!r.drives.length) { list.appendChild(el("p", "No drives found.", "empty")); return; }
+      var kinds = { fixed: "Local disk", network: "Network drive", removable: "Removable", cdrom: "Disc drive", other: "Drive" };
+      r.drives.forEach(function (d) {
+        var meta = (d.label ? d.label + " \u00b7 " : "") + (kinds[d.kind] || "Drive") + (d.ready ? "" : " \u00b7 not ready");
+        list.appendChild(pickItem("\u25a4", d.path, meta, "", function () { browseTo(d.path); }));
+      });
+    }).catch(function (e) { clear(list).appendChild(el("p", e.message, "empty")); });
+  }
+  function browseTo(dir, quiet) {
+    var list = $("pkList");
+    return api("/api/browse", { path: dir }).then(function (r) {
+      pickerAt = r; $("pkPath").value = r.path; $("pkUp").disabled = false;
+      try { localStorage.setItem("qbmcp.browse", r.path); } catch (e) {}
+      $("pkWhere").textContent = r.files.length ? r.files.length + " company file" + (r.files.length === 1 ? "" : "s") + " here" : "No company files in this folder. Open a folder below.";
+      clear(list);
+      r.files.forEach(function (f) {
+        var saved = findSaved(f.path);
+        var meta = (saved && saved.username ? "login saved \u00b7 " : "") + sizeLabel(f.sizeBytes) + " \u00b7 " + fmt(f.modifiedAt);
+        list.appendChild(pickItem("\u25c6", f.name, meta, "qbw", function () { choosePicked(f.path); }));
+      });
+      r.folders.forEach(function (d) { list.appendChild(pickItem("\u25b8", d.name, "", "", function () { browseTo(d.path); })); });
+      if (!r.files.length && !r.folders.length) list.appendChild(el("p", "This folder is empty.", "empty"));
+      if (r.truncated) list.appendChild(el("p", "Only the first entries are shown. Type a more specific folder above.", "hint"));
+      list.scrollTop = 0;
+    }).catch(function (e) {
+      if (quiet) throw e;
+      toast(e.message, "err");
+    });
+  }
+  function choosePicked(p) {
+    $("companyFile").value = p; closePicker(); syncForm();
+    ($("username").value ? $("password") : $("username")).focus();
+  }
+  function closePicker() { $("picker").classList.add("hidden"); $("browseBtn").setAttribute("aria-expanded", "false"); }
+  function openPicker() {
+    $("picker").classList.remove("hidden"); $("browseBtn").setAttribute("aria-expanded", "true");
+    // Start where the typed file lives, else the last folder browsed, else the discovery root, else the drive list.
+    var typed = $("companyFile").value.trim(), last = null;
+    try { last = localStorage.getItem("qbmcp.browse"); } catch (e) {}
+    var starts = [];
+    if (/[\\/]/.test(typed)) starts.push(typed.replace(/[\\/][^\\/]*$/, "") || typed);
+    if (last) starts.push(last);
+    if (state && state.discoveryRoot) starts.push(state.discoveryRoot);
+    (function next() {
+      if (!starts.length) { showDrives(); return; }
+      browseTo(starts.shift(), true).catch(next);
+    })();
+  }
+  $("browseBtn").onclick = function () { if ($("picker").classList.contains("hidden")) openPicker(); else closePicker(); };
+  $("pkClose").onclick = closePicker;
+  $("pkDrives").onclick = showDrives;
+  $("pkUp").onclick = function () { if (pickerAt && pickerAt.parent) browseTo(pickerAt.parent); else showDrives(); };
+  $("pkGo").onclick = function () { var v = $("pkPath").value.trim(); if (v) browseTo(v); else showDrives(); };
+  $("pkPath").addEventListener("keydown", function (ev) { if (ev.key === "Enter") { ev.preventDefault(); $("pkGo").click(); } });
+  $("picker").addEventListener("keydown", function (ev) { if (ev.key === "Escape") { closePicker(); $("browseBtn").focus(); } });
   $("companyFile").addEventListener("input", syncForm);
   $("username").addEventListener("input", function () { this.dataset.touched = "1"; });
   $("togglePw").onclick = function () { var p = $("password"), s = p.type === "text"; p.type = s ? "password" : "text"; this.textContent = s ? "Show" : "Hide"; this.setAttribute("aria-label", s ? "Show password" : "Hide password"); };

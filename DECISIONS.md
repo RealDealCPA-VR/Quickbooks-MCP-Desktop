@@ -29,6 +29,25 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-10-06 — Company-file picker browses this computer's drives through the page API
+
+**Chosen:** A server-side folder browser (`POST /api/browse`) behind the existing page-admin gate. With no path it returns the drives; with a path it returns that folder's sub-folders and `.qbw` files only. The page renders it as an inline picker next to the Company file field.
+
+**Why:** The operator asked to pick company files by drive and folder instead of typing paths. The only choices before were saved logins and files under `QB_COMPANY_ROOT`. Paths must be as *this* computer (the one running QuickBooks) sees them, so the browser's own file dialog can't help: it never reveals full paths, and an admin may be on another tailnet device.
+
+**Alternatives rejected:**
+- `<input type="file">`: browsers hide the real path, and it shows the viewer's disk, not the QuickBooks PC's.
+- A native Windows folder dialog (PowerShell / WinForms): it appears on the QB PC's screen, not for a remote admin, and the project avoids putting windows on the operator's screen.
+- Widening `QB_COMPANY_ROOT` discovery to whole drives: slow, and it still can't reach a folder outside the root.
+
+**Tradeoffs / consequences:**
+- Page admins (this PC, the owner's tailnet devices, `QB_WEB_ADMINS`) can now see folder names on this PC. They could already add logins and grant access. Listings expose no other file names and no contents, and nothing is writable.
+- Drive enumeration shells out to PowerShell once per Drives click (8 s limit, then probing C:–Z:). Mapped drives are per Windows logon.
+
+**Revisit when:** the page gains admins who shouldn't see this PC's folder structure (then gate browsing to local callers or to `QB_COMPANY_ROOT`).
+
+---
+
 ## 2026-10-06 — QBXMLRP2 moves out of process; idle release; "ticket parameter is invalid" means QB is gone
 
 **Chosen:**

@@ -8,6 +8,20 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 
 ---
 
+## Item 108 — Company-file picker: browse drives and folders _(Phase 20)_
+
+**Status:** partial. Built and verified in simulation and the demo page; live Windows check pending.
+
+- [x] The Company files form has a **Browse…** button that opens an inline picker; picking a `.qbw` fills the path, closes the picker and shows "Already saved" when that file has a login.
+- [x] **Drives** lists this computer's drives with type (local / network / removable / disc), label, and "not ready" for empty or disconnected drives.
+- [x] Folders open on click; **Up** goes to the parent, and from a drive root to the drive list; a typed or pasted folder (incl. UNC) opens with Enter/Go.
+- [x] Listings show sub-folders and `.qbw` files only: never other file names or contents. `$` and dot folders and System Volume Information are hidden.
+- [x] `POST /api/browse` requires page admin + `X-QB-Admin` (403 otherwise); missing / non-folder / relative paths → 400 with a readable message.
+- [x] Tests: `tests/fs-browse.test.ts` + the web-server picker test; build green.
+- [ ] LIVE (Windows): the drive list shows every drive letter incl. mapped network drives; a disconnected network drive doesn't hang it (8 s limit); picking a real client `.qbw` then saving a login works.
+
+---
+
 ## Item 107 — QBXMLRP2 out of process + idle release _(Phase 20)_
 
 **Status:** done (live-verified 2026-10-06).

@@ -1,5 +1,12 @@
 # Handoff State
 
+> **Update 2026-10-06 (later): #108 company-file picker, built + sim/demo-verified, live check pending.**
+> - **What:** the Company files form gains a **Browse…** button. It opens an inline picker: this computer's drives (local, network, removable) → folders → `.qbw` files. Clicking a file fills the path. It starts at the typed file's folder, then the last folder browsed, then `QB_COMPANY_ROOT`, then the drive list.
+> - **Code:** [src/util/fs-browse.ts](src/util/fs-browse.ts) (`defaultDriveLister` uses PowerShell `[System.IO.DriveInfo]::GetDrives()` with an 8 s limit and falls back to probing C:–Z:; `browseDirectory` returns folders + `.qbw` only). `POST /api/browse` in [src/web/server.ts](src/web/server.ts) (`{path:""}` → drives) is admin-only like every `/api/*`. Picker UI in [src/web/admin-page.ts](src/web/admin-page.ts). `listDrives` is a new test seam.
+> - **Verified:** `npm run build` green; 67 files / 1821 passed. On Linux, 5 tests in com-isolation + qb-desktop-launch fail; they are Windows-only and fail identically on master. Demo page (`scripts/demo-control-page.mjs`) clicked through in headless Chrome: open → folder → pick file fills the form and recognizes the saved login; drive list; 520px width.
+> - **Verify live (Windows):** open the picker → **Drives** lists every drive letter incl. mapped network drives (with labels); a disconnected network drive shows "not ready" and doesn't hang the list; browse to a client folder and pick a `.qbw`. See ACCEPTANCE_CRITERIA Item 108.
+> - **Gotcha:** mapped drive letters are per Windows logon. If the server ever runs as a service under another account, the user's mapped drives won't appear. Type the UNC path (`\\server\share`) in the picker's path box instead.
+
 > **Update 2026-10-06: #107 done, #106 now fully live-verified.**
 > - QBXMLRP2 runs in a forked helper ([src/session/com-worker.ts](src/session/com-worker.ts) via [com-worker-client.ts](src/session/com-worker-client.ts)), so a QuickBooks crash can't segfault the server any more (it did on 2026-10-05).
 > - Per-call time limits. "The ticket parameter is invalid." is now recognized as QB-gone, plus a health-probe fallback for unknown wording.

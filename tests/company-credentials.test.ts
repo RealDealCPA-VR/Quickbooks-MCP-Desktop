@@ -391,6 +391,7 @@ describe("local web server", () => {
       identifyCaller: async (req) => callerFor(req),
       healthProbe: async () => ({ ok: true, quickbooks: [], fileDoctor: [], crashReporter: [] }),
       forceCloseQuickBooks: async () => true,
+      listDrives: async () => [{ path: "C:\\", label: "Windows", kind: "fixed", ready: true }],
       stdioConnected: true,
     });
   });
@@ -459,6 +460,24 @@ describe("local web server", () => {
     expect(JSON.parse(s3.text)).toMatchObject({ created: false, passwordChanged: true });
     expect(readStore(vault).entries).toHaveLength(1);
     expect(readStore(vault).entries[0].username).toBe("Clerk");
+  });
+
+  it("company-file picker: drives, then folders + .qbw only; bad paths 400; admin header required", async () => {
+    const drives = await req("POST", "/api/browse", { body: { path: "" }, headers: admin });
+    expect(drives.status).toBe(200);
+    expect(JSON.parse(drives.text)).toEqual({ drives: [{ path: "C:\\", label: "Windows", kind: "fixed", ready: true }] });
+
+    await fs.writeFile(path.join(root, "A", "readme.txt"), "");
+    const a = JSON.parse((await req("POST", "/api/browse", { body: { path: path.join(root, "A") }, headers: admin })).text);
+    expect(a.files.map((f: { name: string }) => f.name)).toEqual(["A.qbw"]);
+    const top = JSON.parse((await req("POST", "/api/browse", { body: { path: root }, headers: admin })).text);
+    expect(top.folders.map((f: { name: string }) => f.name)).toEqual(["A", "B"]);
+
+    const missing = await req("POST", "/api/browse", { body: { path: path.join(root, "missing") }, headers: admin });
+    expect(missing.status).toBe(400);
+    expect(JSON.parse(missing.text).error).toMatch(/Folder not found/);
+    expect((await req("POST", "/api/browse", { body: { path: root } })).status).toBe(403);
+    expect((await req("POST", "/api/browse", { body: { path: root }, headers: { ...admin, "x-test-caller": "other" } })).status).toBe(403);
   });
 
   it("bad input → 400 with a readable message", async () => {

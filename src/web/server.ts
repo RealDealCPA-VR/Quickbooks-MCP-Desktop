@@ -40,6 +40,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { QBSessionManager } from "../session/manager.js";
 import type { CallerIdentity } from "../util/caller-authorization.js";
 import { findCompanyFiles, resolveCompanyRoot } from "../util/company-files.js";
+import { BrowseError, browseDirectory, defaultDriveLister, type DriveLister } from "../util/fs-browse.js";
 import {
   addAuthorizedPeer,
   CredentialInputError,
@@ -92,6 +93,8 @@ export interface WebServerOptions {
   /** Test seams for QuickBooks health and the force-close action. */
   healthProbe?: HealthProbe;
   forceCloseQuickBooks?: () => Promise<boolean>;
+  /** Test seam: the drive list behind the company-file picker. */
+  listDrives?: DriveLister;
   /** Test seam: decide the caller identity instead of using the socket address + tailscale whois. */
   identifyCaller?: (req: http.IncomingMessage) => Promise<CallerIdentity | null>;
 }
@@ -385,6 +388,21 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
           detail: `by ${describeCallerShort(id)}`,
         });
         sendJson(res, 200, { ok: true, created: r.created, passwordChanged: r.passwordChanged, usernameChanged: r.usernameChanged, entry: r.entry });
+        return;
+      }
+      case "/api/browse": {
+        // Company-file picker: no path → this computer's drives; a path → its folders + .qbw files.
+        const dir = String(body.path ?? "").trim();
+        if (!dir) {
+          sendJson(res, 200, { drives: await (opts.listDrives ?? defaultDriveLister)() });
+          return;
+        }
+        try {
+          sendJson(res, 200, await browseDirectory(dir));
+        } catch (err) {
+          if (err instanceof BrowseError) throw new HttpError(400, err.message);
+          throw err;
+        }
         return;
       }
       case "/api/logins/delete": {

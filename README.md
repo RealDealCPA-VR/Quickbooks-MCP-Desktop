@@ -160,7 +160,7 @@ Whenever the server runs, it serves a control page at **http://127.0.0.1:8765/**
 | **Company files** | **Access** |
 |---|---|
 | <img src="docs/images/control-files.png" alt="Company files tab" width="440"> | <img src="docs/images/control-access.png" alt="Access grid: company files by tailnet device" width="440"> |
-| Add or change a file's QuickBooks login. Saved logins show *"Already saved, nothing to re-enter"*, and saving overwrites the old one. Files under `QB_COMPANY_ROOT` are discovered for you. | A company-file × tailnet-device grid. Click a cell to grant or revoke. "This computer" always has access. |
+| Add or change a file's QuickBooks login. Saved logins show *"Already saved, nothing to re-enter"*, and saving overwrites the old one. Files under `QB_COMPANY_ROOT` are discovered for you, and **Browse…** picks any `.qbw` by drive and folder. | A company-file × tailnet-device grid. Click a cell to grant or revoke. "This computer" always has access. |
 | **Storage & security** | **Activity** (dark mode) |
 | <img src="docs/images/control-storage.png" alt="Storage and security tab" width="440"> | <img src="docs/images/control-activity-dark.png" alt="Activity timeline in dark mode" width="440"> |
 | Where every file lives, how passwords are protected, what is stored for each company file, and the logins file with secrets hidden. | Every session, switch, login change, access change, refused call, crash and recovery, filterable, and kept across restarts. |

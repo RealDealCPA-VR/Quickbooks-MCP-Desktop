@@ -228,6 +228,7 @@ A full review on 2026-10-05 covered the qbXML layer, the simulation store, and a
   - Payment is in the TxnDel list in builder/sim but not in manager; extract one shared constant.
   - Some `*Ret` names are missing from `arrayElements`.
   - The memo search expects `JournalLineRet`.
+- [ ] **108.** Company-file picker: **Browse…** on the Company files form walks this computer's drives → folders → `.qbw` (`POST /api/browse`, folders + .qbw only). _(Partial 2026-10-06: built, sim/demo-verified; live drive list incl. mapped network drives still to check — ACCEPTANCE_CRITERIA Item 108.)_
 - [ ] **105.** Local logins web page + remote tailnet agents with per-file authorization. _(Built 2026-10-05; partial until verified from a second tailnet device.)_
   - **Web page:**
     - It starts with the MCP process at `127.0.0.1:8765` and on the tailnet IP.
