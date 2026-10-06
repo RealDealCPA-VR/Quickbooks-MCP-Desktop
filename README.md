@@ -147,7 +147,7 @@ The first time the server opens a company file, QuickBooks asks a QB **Admin** t
 > *"Switch to Blue Harbor Dental and show me AR aging."* → `qb_company_open` → `qb_ar_aging`
 > *"Is QuickBooks healthy?"* → `qb_health`
 
-Something not working? Run the doctor: `npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop quickbooks-desktop-mcp-doctor`. It checks Node, QuickBooks, the SDK, `winax` and your paths, with a fix for each ✗.
+Something not working? Run the doctor: `npx -y -p github:RealDealCPA-VR/Quickbooks-MCP-Desktop quickbooks-desktop-mcp-doctor`. It checks Node, QuickBooks, the SDK, `winax` and your paths, with a fix for each ✗.
 
 ---
 

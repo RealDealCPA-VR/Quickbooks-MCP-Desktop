@@ -652,7 +652,7 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
     }
     $("wsHow").open = !list.length;
     var cmd = clear($("wsCmd"));
-    if (hub.hubUrl) cmd.appendChild(copyRow("PowerShell:", '$env:QB_HUB_URL="' + hub.hubUrl + '"; npx -y ' + hub.connectorPackage + " quickbooks-desktop-mcp-connector"));
+    if (hub.hubUrl) cmd.appendChild(copyRow("PowerShell:", '$env:QB_HUB_URL="' + hub.hubUrl + '"; npx -y -p ' + hub.connectorPackage + " quickbooks-desktop-mcp-connector"));
     else cmd.appendChild(el("p", "This hub has no tailnet address, so workstations can't reach it. Check Tailscale on the hub.", "hint"));
   }
 

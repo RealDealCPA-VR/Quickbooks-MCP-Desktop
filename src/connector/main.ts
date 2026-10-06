@@ -3,7 +3,7 @@
  * quickbooks-desktop-mcp-connector: run on a QuickBooks workstation to make
  * its QuickBooks Desktop available to the hub (docs/CONNECTOR_DESIGN.md).
  *
- *   QB_HUB_URL=http://100.87.42.62:8765  npx -y github:RealDealCPA-VR/Quickbooks-MCP-Desktop quickbooks-desktop-mcp-connector
+ *   QB_HUB_URL=http://100.87.42.62:8765  npx -y -p github:RealDealCPA-VR/Quickbooks-MCP-Desktop quickbooks-desktop-mcp-connector
  *
  * It listens on this PC's tailnet address (QB_CONNECTOR_PORT, default 8766)
  * and checks in with the hub every 30 s. The hub lists the workstation as
