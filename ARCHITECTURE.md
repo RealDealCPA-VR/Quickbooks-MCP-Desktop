@@ -102,6 +102,14 @@ Same as read, but step 5 calls `buildAddRequest` / `buildModRequest` / `buildDel
 * `localQBHost` is this PC (the original behavior). `QBSessionManager(config, host = localQBHost)` takes its machine seams (`rpFactory`, `spawnImpl`, `isQBRunningImpl`, ...) from the host; `getHost()` exposes it.
 * **Rule:** the web page and tools reach the QuickBooks machine only through `session.getHost()`, never by importing `qb-desktop-launch` / `qb-health` / `company-files` / `fs-browse` directly. This is the seam where the remote connector plugs in (docs/CONNECTOR_DESIGN.md).
 
+### Hub mode + connector (added 2026-10-06)
+
+* **Hub** (`QB_HUB=1`, Docker in `deploy/hub/`): the always-on server on the office Linux box. Same MCP endpoint, tools, page and access guard; the session manager's host is `HubHost` ([src/hub/hub-host.ts](src/hub/hub-host.ts)), which forwards to the active workstation's `RemoteQBHost` ([src/session/remote-host.ts](src/session/remote-host.ts)).
+* **Workstations** ([src/hub/workstations.ts](src/hub/workstations.ts)): connectors check in at `POST /connector/register` every 30 s (owner's tailnet devices only); online = checked in within 75 s; active = chosen on the page, else the only online one. Stored in `workstations.json` (mode 600, holds connector secrets).
+* **Connector** ([src/connector/](src/connector/)): runs on a QuickBooks workstation in the user's logon session; HTTP JSON `/v1/...` ([protocol.ts](src/connector/protocol.ts)); answers only the hub's address + bearer secret; wraps `localQBHost`.
+* **Logins in hub mode** ([src/util/hub-vault.ts](src/util/hub-vault.ts)): AES-256-GCM, key file separate from the vault; decrypted only to send one autofill to a connector, which uses a one-time DPAPI temp vault for the existing autofill script.
+* **Errors:** 9012 `no-workstation` / `workstation-offline`. "connector not reachable" counts as QB-gone (reads recover once; writes never repeat).
+
 ### Out-of-process COM + idle release (added 2026-10-06)
 
 * **QBXMLRP2 runs in a helper process.** [src/session/com-worker.ts](src/session/com-worker.ts) is the ONLY code that loads `winax`.

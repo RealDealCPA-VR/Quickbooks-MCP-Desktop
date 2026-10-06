@@ -1,0 +1,33 @@
+# QuickBooks MCP hub on the office Linux box. Agents use http://<hub tailnet IP>:8765/mcp;
+# the control page is http://<hub tailnet IP>:8765/. Workstations run the connector.
+services:
+  quickbooks-mcp-hub:
+    build:
+      context: ../..
+      dockerfile: deploy/hub/Dockerfile
+    image: quickbooks-mcp-hub
+    container_name: quickbooks-mcp-hub
+    restart: unless-stopped
+    # Host network: the server binds 127.0.0.1 + this box's tailnet IP itself
+    # (never 0.0.0.0) and identifies callers with `tailscale whois`.
+    network_mode: host
+    environment:
+      QB_HUB: "1"
+      QB_HTTP_ONLY: "1"
+      QB_WEB_PORT: "8765"
+      QB_CREDENTIALS_FILE: /data/credentials.json
+      QB_ACTIVITY_LOG: /data/activity.log
+      # What the page tells workstations to run (pin a branch/tag while testing).
+      QB_CONNECTOR_PACKAGE: ${QB_CONNECTOR_PACKAGE:-github:RealDealCPA-VR/Quickbooks-MCP-Desktop}
+      # Optional: the file server share to list company files from, e.g. \\fileserver\books
+      QB_COMPANY_ROOT: ${QB_COMPANY_ROOT:-}
+    volumes:
+      - ./data:/data
+      - /usr/bin/tailscale:/usr/bin/tailscale:ro
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8765/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

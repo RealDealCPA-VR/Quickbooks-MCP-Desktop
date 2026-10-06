@@ -175,6 +175,16 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
 
   <section class="tab active" id="tab-overview">
     <div id="jobBox" class="banner info hidden" role="status"></div>
+    <div class="panel hidden" id="wsPanel">
+      <h2>Workstations</h2>
+      <p class="lead">QuickBooks runs on these PCs. A workstation appears here when its QuickBooks connector is running, and agents' QuickBooks requests go to the one marked <b>In use</b>.</p>
+      <div id="wsList"></div>
+      <details class="small" id="wsHow" style="margin-top:10px">
+        <summary><b>Enable QuickBooks on a workstation</b></summary>
+        <p class="hint">On the workstation (Windows, with QuickBooks Desktop, Tailscale and Node 20), run in PowerShell. Keep it running while the books should be available; it shows as offline when stopped.</p>
+        <div id="wsCmd"></div>
+      </details>
+    </div>
     <div class="panel">
       <div id="hero" class="hero tone-idle"><div class="icon" id="heroIcon">?</div><div><h3 id="heroTitle">Checking QuickBooks...</h3><p id="heroText" class="muted"></p><div class="facts" id="heroDialogs"></div></div></div>
       <div class="pipe" id="pipe"></div>
@@ -349,7 +359,10 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
 
   function renderTop() {
     var c = clear($("topChips")), me = state.me;
-    c.appendChild(chip(state.simulationMode ? "Simulation mode" : "Live QuickBooks", state.simulationMode ? "warn" : "ok"));
+    if (state.hub) {
+      var act = (state.hub.workstations || []).filter(function (w) { return w.active; })[0];
+      c.appendChild(chip(act ? "QuickBooks on " + act.name + (act.online ? "" : " (offline)") : "No workstation in use", act && act.online ? "ok" : "warn"));
+    } else c.appendChild(chip(state.simulationMode ? "Simulation mode" : "Live QuickBooks", state.simulationMode ? "warn" : "ok"));
     c.appendChild(chip(me.kind === "local" ? "You: this computer" : "You: " + me.nodeName + " (" + me.address + ")"));
     var u = chip("Updated just now"); u.id = "updChip"; c.appendChild(u);
     $("cntFiles").textContent = String((state.entries || []).length);
@@ -609,7 +622,42 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
     }) }, null, 2);
   }
 
+  function renderWorkstations() {
+    var hub = state.hub;
+    $("wsPanel").classList.toggle("hidden", !hub);
+    if (!hub) return;
+    var box = clear($("wsList")), list = hub.workstations || [];
+    if (!list.length) box.appendChild(el("p", "No workstation has enabled QuickBooks yet. Use the steps below on the PC that runs QuickBooks.", "empty"));
+    list.forEach(function (w) {
+      var f = el("div", null, "file"), left = el("div"), h = el("h3");
+      h.appendChild(dot(w.online ? "ok" : "bad")); h.appendChild(document.createTextNode(" " + w.name));
+      h.appendChild(chip(w.online ? "Available" : "Offline", w.online ? "ok" : "bad"));
+      if (w.active) h.appendChild(chip("In use", "info"));
+      left.appendChild(h);
+      left.appendChild(el("div", w.address + " \u00b7 connector " + (w.version || "?") + " \u00b7 last check-in " + ago(w.lastSeenAt), "path"));
+      f.appendChild(left);
+      var act = el("div", null, "row");
+      if (!w.active) act.appendChild(btn("Use for QuickBooks", w.online ? "primary" : "", function () {
+        if (!confirm("Send QuickBooks requests to " + w.name + "?\n\nAny open QuickBooks session on the current workstation is ended first.")) return;
+        api("/api/workstations/select", { id: w.id }).then(function () { toast("QuickBooks requests now go to " + w.name + "."); load(); }).catch(function (e) { toast(e.message, "err"); });
+      }));
+      act.appendChild(btn("Forget", "", function () {
+        if (!confirm("Forget " + w.name + "? It reappears the next time its connector runs.")) return;
+        api("/api/workstations/forget", { id: w.id }).then(load).catch(function (e) { toast(e.message, "err"); });
+      }));
+      f.appendChild(act); box.appendChild(f);
+    });
+    if (list.filter(function (w) { return w.online; }).length > 1 && !list.some(function (w) { return w.active; })) {
+      box.appendChild(el("p", "Several workstations are available: choose the one QuickBooks requests should use.", "hint"));
+    }
+    $("wsHow").open = !list.length;
+    var cmd = clear($("wsCmd"));
+    if (hub.hubUrl) cmd.appendChild(copyRow("PowerShell:", '$env:QB_HUB_URL="' + hub.hubUrl + '"; npx -y ' + hub.connectorPackage + " quickbooks-desktop-mcp-connector"));
+    else cmd.appendChild(el("p", "This hub has no tailnet address, so workstations can't reach it. Check Tailscale on the hub.", "hint"));
+  }
+
   function render() {
+    renderWorkstations();
     renderTop(); renderHero(); renderPipe(); renderJob(); renderTiles(); renderRecent(); renderConnections();
     renderSaved(); renderDiscovered(); renderSelects(); syncForm(); renderAccess(); renderActivity(); renderStorage();
   }

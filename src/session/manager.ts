@@ -254,7 +254,7 @@ export function isQuickBooksGoneError(err: unknown): boolean {
   // "The ticket parameter is invalid" (0x8004040D) is what QBXMLRP2 actually
   // returned after QuickBooks was ended in Task Manager mid-session
   // (observed live 2026-10-05).
-  return /0x800706ba|rpc server is unavailable|0x800706be|remote procedure call failed|0x80010108|disconnected from its clients|0x80080005|server execution failed|0x80040401|could not access quickbooks|could not start quickbooks|quickbooks is not running|no session is open|ticket parameter is invalid|0x8004040d|com helper exited|did not answer within/.test(msg);
+  return /0x800706ba|rpc server is unavailable|0x800706be|remote procedure call failed|0x80010108|disconnected from its clients|0x80080005|server execution failed|0x80040401|could not access quickbooks|could not start quickbooks|quickbooks is not running|no session is open|ticket parameter is invalid|0x8004040d|com helper exited|did not answer within|connector not reachable/.test(msg);
 }
 
 /** QB is up but a modal dialog blocks the SDK. A person must answer it. */

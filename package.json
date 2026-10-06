@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "bin": {
     "quickbooks-desktop-mcp": "dist/index.js",
-    "quickbooks-desktop-mcp-doctor": "dist/cli/doctor.js"
+    "quickbooks-desktop-mcp-doctor": "dist/cli/doctor.js",
+    "quickbooks-desktop-mcp-connector": "dist/connector/main.js"
   },
   "scripts": {
     "build": "tsc",

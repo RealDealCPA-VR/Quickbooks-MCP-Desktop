@@ -8,6 +8,22 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 
 ---
 
+## Item 110 — Hub + connector, single workstation _(Phase 21)_
+
+**Status:** partial. Built, deployed on the tower, tested end to end on Linux; the live Windows check is pending.
+
+- [x] Connector (`quickbooks-desktop-mcp-connector`, `src/connector/`): listens on 127.0.0.1 + the PC's tailnet IP (port 8766); answers only the hub's address (or loopback) with its bearer secret (401/403 otherwise); serves the QBHost methods, COM handles (open/call/dispose) and login autofill (one-time DPAPI temp vault, deleted after the fill).
+- [x] Check-in: the connector POSTs `/connector/register` every 30 s; the hub accepts only its owner's tailnet devices and validates port / secret / protocol. The record is pinned to the Tailscale node; secrets are never sent to the page.
+- [x] Hub (`QB_HUB=1`, `deploy/hub/`): always live; `HubHost` forwards to the active workstation (the chosen one, else the only online one); none → 9012 `no-workstation`; unreachable → 9012 `workstation-offline` (also treated as QB-gone for read recovery).
+- [x] Hub vault: logins saved on the page are AES-256-GCM (`hub1:`) with the key in a separate file (mode 600); plaintext goes to a connector only for one autofill.
+- [x] Control page: a **Workstations** panel (Available / Offline / In use, last check-in, Use for QuickBooks, Forget) and a copy-paste PowerShell line to enable a workstation; the top chip shows which workstation QuickBooks runs on.
+- [x] `tests/hub-connector.test.ts` (real connector + hub servers, fake QuickBooks): check-in, live query over the network, file pre-check, drives/browse (BrowseError → 400), vault + autofill hand-off, wrong secret, stopped connector → 9012, select/forget. Full suite 1835 passed (the 5 Windows-only failures, as on master).
+- [x] Deployed on the tower: hub container on :8765 (127.0.0.1 + tailnet only). A real connector process registered, showed Available / In use, Browse and MCP `qb_health` went through it. It was removed afterwards.
+- [ ] LIVE (Windows): on a QB workstation, run the page's PowerShell line → Available; save a login; agent → hub: `qb_company_open` (autofill fills the real login dialog), P&L, switch, crash recovery; stop the connector → Offline + 9012.
+- [ ] Mapped drive letters reported as UNC paths by the connector (company-file identity across workstations).
+
+---
+
 ## Item 109 — QBHost seam (hub + connector, Phase 1) _(Phase 21)_
 
 **Status:** partial. Built and verified in tests and simulation; live Windows smoke test pending.

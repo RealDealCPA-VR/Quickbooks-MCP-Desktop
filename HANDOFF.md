@@ -1,5 +1,13 @@
 # Handoff State
 
+> **Update 2026-10-06 (latest): #110 hub + connector built and deployed on the tower; live Windows check pending.** Branch `feat/connector-phase1`.
+> - **Hub:** `QB_HUB=1`, Docker in [deploy/hub/](deploy/hub/) (runs on the office Linux box, :8765, tailnet + loopback). Always up; the control page lists **Workstations** and gives the PowerShell line to enable one. `deploy/hub/.env` pins `QB_CONNECTOR_PACKAGE` to this branch until it merges.
+> - **Connector:** `quickbooks-desktop-mcp-connector` ([src/connector/](src/connector/)), port 8766; checks in every 30 s; serves QBHost + COM + autofill to the hub only.
+> - **Verified:** `tests/hub-connector.test.ts` (10) + full suite 1835 passed (5 Windows-only failures, as on master). On the tower: a real connector registered, showed Available / In use; Browse and MCP `qb_health` went through it; it was then removed.
+> - **Verify first (Windows, live):** ACCEPTANCE_CRITERIA Item 110: enable a workstation from the page's line, save a login, open a file through an agent (autofill on the real dialog), P&L, switch, stop the connector → Offline/9012.
+> - **Next:** the UNC mapping for mapped drive letters (#110 last box), then #111 (installer + at-logon task + firewall + `vr` login/grant import), #112 (several workstations at once).
+> - **Gotchas:** HubHost forwarders are `async` on purpose (no-workstation must reject, not throw). The connector's `requestTimeout = 0` and the hub client uses node:http: QuickBooks calls can take 10 min, past fetch/undici's 5-min headers limit.
+
 > **Update 2026-10-06 (latest): new direction, hub + connector. Phase 1 (#109) built, live smoke pending.**
 > - **Direction:** the operator wants the server on the office Linux box (hub) and only a thin connector on each QB workstation. Full design, operator answers and phases: [docs/CONNECTOR_DESIGN.md](docs/CONNECTOR_DESIGN.md). Decision logged in DECISIONS.md (reverses the qb-bridge rejection). Phase 21 in todo.md (#109-#112).
 > - **#109 built:** [src/session/qb-host.ts](src/session/qb-host.ts) (`QBHost`, `localQBHost`); the manager's machine seams default to the host and are awaited; the page and `qb_health` / `qb_company_list` use `session.getHost()`. Tests: `tests/qb-host.test.ts`; 68 files / 1825 passed (only the 5 Windows-only tests fail on Linux, as on master). Smoke in simulation over HTTP is fine.

@@ -39,6 +39,8 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 import type { QBSessionManager } from "../session/manager.js";
 import { localQBHost, type QBHost } from "../session/qb-host.js";
+import type { WorkstationRegistry } from "../hub/workstations.js";
+import { CONNECTOR_PROTOCOL } from "../connector/protocol.js";
 import type { CallerIdentity } from "../util/caller-authorization.js";
 import { resolveCompanyRoot } from "../util/company-files.js";
 import { BrowseError, type DriveLister } from "../util/fs-browse.js";
@@ -95,6 +97,8 @@ export interface WebServerOptions {
   forceCloseQuickBooks?: () => Promise<boolean>;
   /** Test seam: the drive list behind the company-file picker. */
   listDrives?: DriveLister;
+  /** Hub mode: the QuickBooks workstations whose connectors register here. */
+  workstations?: WorkstationRegistry;
   /** Test seam: decide the caller identity instead of using the socket address + tailscale whois. */
   identifyCaller?: (req: http.IncomingMessage) => Promise<CallerIdentity | null>;
 }
@@ -359,6 +363,15 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
       },
       job,
       admins: { ownerLogin: selfIdentity?.loginName ?? null, extra: admins },
+      hub: opts.workstations
+        ? {
+            workstations: opts.workstations.list(),
+            hostLabel: hostOf().label,
+            // What a workstation sets QB_HUB_URL to: this hub's tailnet address.
+            hubUrl: mcpUrls.find((u) => !u.includes("127.0.0.1"))?.replace(/\/mcp$/, "") ?? null,
+            connectorPackage: process.env.QB_CONNECTOR_PACKAGE?.trim() || "github:RealDealCPA-VR/Quickbooks-MCP-Desktop",
+          }
+        : null,
     };
   };
 
@@ -407,6 +420,31 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
           if (err instanceof BrowseError) throw new HttpError(400, err.message);
           throw err;
         }
+        return;
+      }
+      case "/api/workstations/select": {
+        const reg = opts.workstations;
+        if (!reg) throw new HttpError(404, "This server is not a hub.");
+        const wsId = body.id === null ? null : String(body.id ?? "");
+        if (wsId !== null && !reg.get(wsId)) throw new HttpError(404, "Unknown workstation.");
+        // Requests in flight belong to the old workstation's QuickBooks: end that session first.
+        try { await opts.getSession().closeSession(); } catch { /* it may already be gone */ }
+        reg.setActive(wsId);
+        const name = wsId ? reg.get(wsId)?.name : null;
+        recordActivity({ level: "info", category: "session", message: name ? `QuickBooks requests now go to ${name}` : "Workstation choice cleared (automatic)", detail: `by ${describeCallerShort(id)}` });
+        sendJson(res, 200, { ok: true, workstations: reg.list() });
+        return;
+      }
+      case "/api/workstations/forget": {
+        const reg = opts.workstations;
+        if (!reg) throw new HttpError(404, "This server is not a hub.");
+        const wsId = String(body.id ?? "");
+        const ws = reg.get(wsId);
+        if (!ws) throw new HttpError(404, "Unknown workstation.");
+        if (reg.active()?.id === wsId) { try { await opts.getSession().closeSession(); } catch { /* ignore */ } }
+        reg.remove(wsId);
+        recordActivity({ level: "warn", category: "access", message: `Forgot workstation ${ws.name}. It reappears if its connector runs again.`, detail: `by ${describeCallerShort(id)}` });
+        sendJson(res, 200, { ok: true });
         return;
       }
       case "/api/logins/delete": {
@@ -484,6 +522,30 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     }
   };
 
+  // ---- connector check-in (hub mode) -------------------------------------
+  // A workstation's connector POSTs here every 30 s. Only devices that may
+  // manage this hub (the owner's own tailnet devices) can register; the
+  // record is pinned to the device's Tailscale node.
+  const handleConnectorRegister = async (req: http.IncomingMessage, res: http.ServerResponse, id: CallerIdentity) => {
+    const reg = opts.workstations;
+    if (!reg) throw new HttpError(404, "This server is not a QuickBooks MCP hub.");
+    if (req.method !== "POST") throw new HttpError(405, "Method not allowed.");
+    if (!isAdmin(id)) throw new HttpError(403, "Only the hub owner's tailnet devices may register a QuickBooks workstation.");
+    const body = await readJson(req);
+    const port = Number(body.port);
+    const secret = String(body.secret ?? "");
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, "Invalid connector port.");
+    if (secret.length < 32 || secret.length > 200) throw new HttpError(400, "Invalid connector secret.");
+    if (Number(body.protocol) !== CONNECTOR_PROTOCOL) throw new HttpError(409, `Connector protocol ${String(body.protocol)} doesn't match the hub (${CONNECTOR_PROTOCOL}). Update the connector.`);
+    const clip = (v: unknown, n: number) => String(v ?? "").replace(/[\u0000-\u001f]/g, "").slice(0, n);
+    const rec = id.kind === "tailnet"
+      ? { id: id.nodeId, name: id.nodeName || clip(body.name, 64), address: id.address }
+      : { id: `local:${clip(body.name, 64) || "this-computer"}`, name: clip(body.name, 64) || "this computer", address: "127.0.0.1" };
+    const isNew = reg.register({ ...rec, port, secret, version: clip(body.version, 32), platform: clip(body.platform, 16) });
+    if (isNew) recordActivity({ level: "success", category: "session", message: `Workstation ${rec.name} enabled QuickBooks (connector ${clip(body.version, 32)})` });
+    sendJson(res, 200, { ok: true, name: rec.name });
+  };
+
   // ---- request router --------------------------------------------------
   const makeHandler = (boundPort: () => number, mcpUrls: () => string[]) =>
     async (req: http.IncomingMessage, res: http.ServerResponse) => {
@@ -496,6 +558,10 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
 
         if (pathname === "/mcp") {
           await handleMcp(req, res, id);
+          return;
+        }
+        if (pathname === "/connector/register") {
+          await handleConnectorRegister(req, res, id);
           return;
         }
         if (req.method === "OPTIONS") throw new HttpError(405, "Method not allowed.");

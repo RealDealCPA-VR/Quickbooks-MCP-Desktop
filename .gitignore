@@ -7,3 +7,6 @@ dist/
 # Live-capture diagnostic dumps from scripts/capture-pnl-shape.mjs and
 # similar — contain real company financial data, never commit.
 scripts/.*-dump.json
+
+# Hub runtime data (credentials vault, key, workstations): never commit.
+deploy/hub/data/

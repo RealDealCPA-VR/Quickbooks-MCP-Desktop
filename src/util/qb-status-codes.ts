@@ -89,6 +89,9 @@ const TABLE: Record<number, string> = {
   // 9010 / 9011 — synthetic. Crash recovery (QBSessionManager.recover / sendRequest).
   9010: "QuickBooks is unavailable and needs a person: File Doctor is repairing the file, a QuickBooks dialog is waiting for an answer, QuickBooks is frozen or crashed, or an automatic reconnect failed. Check qb_health for what is on screen.",
   9011: "QuickBooks crashed during a write; the server reconnected. The write may or may not have been saved, so look the record up before retrying (with an idempotencyKey).",
+  // 9012 — synthetic. Hub mode (docs/CONNECTOR_DESIGN.md): the QuickBooks
+  // workstation's connector can't be reached, or no workstation is available.
+  9012: "The QuickBooks workstation isn't available: its connector is not running, the PC is off, or no workstation is enabled. Enable the connector on a workstation (control page → Workstations) and retry.",
   9009: "This device is not authorized for that QuickBooks company file. The operator grants access per file and per tailnet device on the QuickBooks MCP logins page.",
 };
 

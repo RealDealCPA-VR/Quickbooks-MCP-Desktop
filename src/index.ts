@@ -48,6 +48,9 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { HubHost } from "./hub/hub-host.js";
+import { WorkstationRegistry } from "./hub/workstations.js";
+import { hubPasswordProtector } from "./util/hub-vault.js";
 
 import { QBSessionManager } from "./session/manager.js";
 import type { QBConnectionConfig } from "./types/qbxml.js";
@@ -205,9 +208,20 @@ function newMcpServer(): McpServer {
 
 let sessionManager: QBSessionManager | null = null;
 
+/**
+ * Hub mode (QB_HUB=1, docs/CONNECTOR_DESIGN.md): this server runs on the
+ * office server and drives QuickBooks on whichever workstation's connector
+ * is active. Always live; logins are kept in the hub vault.
+ */
+const hubMode = process.env.QB_HUB === "1";
+const workstations = hubMode ? new WorkstationRegistry() : null;
+if (hubMode) process.env.QB_SIMULATION = "false";
+
 function getSessionManager(): QBSessionManager {
   if (!sessionManager) {
-    sessionManager = new QBSessionManager(config);
+    sessionManager = workstations
+      ? new QBSessionManager(config, new HubHost(workstations))
+      : new QBSessionManager(config);
   }
   return sessionManager;
 }
@@ -314,6 +328,7 @@ async function main(): Promise<void> {
         stdioConnected: !httpOnly,
         bindTailnet: process.env.QB_WEB_TAILNET !== "0",
         admins: (process.env.QB_WEB_ADMINS ?? "").split(",").filter((a) => a.trim()),
+        ...(workstations ? { workstations, protect: hubPasswordProtector() } : {}),
       });
     } catch (err) {
       // Typically EADDRINUSE: another instance of this server already serves
@@ -336,7 +351,7 @@ async function main(): Promise<void> {
   console.error(`  Company file: ${config.companyFile || "(use currently open QB file)"}`);
   console.error(`  App name: ${config.appName}`);
   console.error(`  QBXML version: ${config.qbxmlVersion}`);
-  console.error(`  Mode: ${sm.isSimulation() ? "simulation" : "live"}`);
+  console.error(`  Mode: ${workstations ? "hub (QuickBooks on registered workstations)" : sm.isSimulation() ? "simulation" : "live"}`);
   const debugLogger = getQbxmlLogger();
   if (debugLogger) {
     console.error(`  QBXML debug log: enabled (${join(debugLogger.getLogDir(), "qbxml-YYYYMMDD.log")})`);
