@@ -126,7 +126,9 @@ QuickBooks Desktop on the operator's computer is not always stable. It can crash
 | `file-doctor` | File Doctor / Tool Hub is repairing the file | **Wait.** Never reopen a file mid-repair; `qb_session_recover` refuses (9010) until File Doctor is closed. Then recover |
 | `not-responding` | QuickBooks is frozen | Wait a minute (big reports freeze QuickBooks). If it stays frozen, **ask the operator** before `qb_session_recover({ forceCloseHungQuickBooks: true })`: it kills QuickBooks and loses any unsaved form |
 
-5. **statusCode 9010** means "QuickBooks needs a person". Its `reason` (`file-doctor`, `dialog`, `not-responding`, `crashed`, `recovery-failed`) and `recommendedAction` say what to tell the operator. Don't loop on it: one recover attempt after the operator acts is enough.
+5. **The server lets go of QuickBooks after 10 idle minutes** so the operator can close it. Your next request reconnects automatically (a few seconds, or about a minute if QuickBooks has to start). That isn't an error; don't report it as one.
+6. **No call hangs forever.** A QuickBooks call that runs past the time limit (10 min by default) is stopped and handled like a frozen QuickBooks.
+7. **statusCode 9010** means "QuickBooks needs a person". Its `reason` (`file-doctor`, `dialog`, `not-responding`, `crashed`, `recovery-failed`) and `recommendedAction` say what to tell the operator. Don't loop on it: one recover attempt after the operator acts is enough.
 
 The operator sees the same picture live on the logins page (Overview tab), and can press **Reconnect**, **Open in QuickBooks**, or **Force close** there.
 

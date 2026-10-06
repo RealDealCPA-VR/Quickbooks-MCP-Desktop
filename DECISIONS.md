@@ -29,6 +29,36 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-10-06 — QBXMLRP2 moves out of process; idle release; "ticket parameter is invalid" means QB is gone
+
+**Chosen:**
+- **COM isolation.** All QBXMLRP2 COM calls run in a forked helper process (one per live session) with per-call time limits. The server treats a helper exit or timeout as "QuickBooks went away".
+- **Crash detection.** `isQuickBooksGoneError` gains the text observed live after a real kill: "The ticket parameter is invalid." (0x8004040D), plus the helper's own exit and timeout messages.
+- **Unknown wording fallback.** For any other error wording, a fresh health probe that reports QuickBooks not running or crashed also triggers recovery.
+- **Idle release.** After 10 idle minutes the server ends its QuickBooks session.
+
+**Why (all observed live, 2026-10-05/06, QB Enterprise 24):**
+- Ending QuickBooks in Task Manager made the next COM call fail with "The ticket parameter is invalid.", which the first recovery release did not recognize.
+- A cold start after the kill then **segfaulted the in-process server** (exit 139). Every agent lost the server, and stdio hosts can't restart it.
+- While the server held a session, the operator couldn't close QuickBooks normally.
+
+**Verified after the change:**
+- The P&L recovered after a mid-session kill: an error, then a reconnect, then data in 36 s, with `recoveryCount` 1 and the server up throughout.
+- The idle release fired after 10 minutes.
+- A cold start through the helper returned the P&L in 84 s.
+
+**Alternatives rejected:**
+- **A supervisor that restarts the whole server:** it doesn't help stdio hosts (Claude Desktop can't re-attach), and every agent's session still drops.
+- **Catching the crash in-process:** a native segfault can't be caught in JS.
+- **Holding the session forever:** it blocks the operator from closing QuickBooks.
+
+**Tradeoffs:**
+- Each live session costs one extra Node process (~40 MB) and an IPC hop (sub-millisecond next to QBXMLRP2 latency).
+- A report that legitimately runs longer than 10 minutes needs `QB_COM_TIMEOUT_MS` raised.
+- After an idle release, the first request reconnects (a few seconds if QB is still open).
+
+---
+
 ## 2026-10-05 — Crash recovery: reads auto-recover, writes never auto-retry, File Doctor and hangs need a person
 
 **Chosen:**

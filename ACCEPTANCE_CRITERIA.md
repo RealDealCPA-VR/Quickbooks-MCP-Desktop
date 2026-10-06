@@ -8,6 +8,19 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 
 ---
 
+## Item 107 — QBXMLRP2 out of process + idle release _(Phase 20)_
+
+**Status:** done (live-verified 2026-10-06).
+
+- [x] All COM calls go through a forked helper (`dist/session/com-worker.js`, seen live as its own node.exe). A helper crash rejects pending calls and never takes the server down. _(fake-helper tests + live)_
+- [x] Each call has a time limit. A hung call stops the helper and is classified QB-gone, then health decides between frozen (9010) and reconnect.
+- [x] "The ticket parameter is invalid." and unknown errors that health confirms as QB-gone trigger recovery.
+- [x] Idle release: after 10 idle minutes the session ends ("Let go of QuickBooks…" in activity, observed live), and the next request reconnects. It never releases mid-request.
+- [x] LIVE: a cold start through the helper returned the P&L (84 s), and a mid-session kill recovered (36 s).
+- [x] 66 files / 1825 tests; build green.
+
+---
+
 ## Item 106 — Control page redesign + QuickBooks crash recovery _(Phase 20)_
 
 **Status:** partial. Everything is verified with fakes, plus live health and UI on QB Enterprise 24. A real QuickBooks crash has not been observed yet.
@@ -28,7 +41,7 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 - [x] A hung QB is rechecked after 10 s. It is force-closed only with permission; otherwise 9010.
 - [x] With no session, QB closed and a saved login, the server launches QB itself (no unattended SDK open).
 - [x] qb_health and qb_session_recover are registered (154 tools). qb_health runs live: state=ready, the summary names the open company
-- [ ] LIVE: with an agent connected, close QuickBooks with its X, then run a report. It returns data, recoveryCount=1, and the activity shows 'Reconnected'.
+- [x] LIVE (2026-10-06): QuickBooks ended in Task Manager while the server held a session. The next P&L got "The ticket parameter is invalid.", then recovery, then data in 36 s, recoveryCount=1, activity 'Reconnected', and the server stayed up. (Closing with the X isn't possible while a session is held; QB refuses. Hence Item 107's idle release.)
 
 **Regression criteria**:
 - [x] 65 files / 1816 tests pass (QB_UI_TESTS=1), and the build is green.

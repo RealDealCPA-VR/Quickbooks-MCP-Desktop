@@ -135,6 +135,21 @@ describe("automatic recovery on the request path", () => {
     expect(calls.open).toBe(1);
   });
 
+  it("the real post-crash error ('The ticket parameter is invalid.', observed live) triggers recovery", async () => {
+    const { mgr, calls } = makeManager({ wire: [new Error("The ticket parameter is invalid."), OK_XML] });
+    expect(await mgr.queryEntity("Customer", {})).toHaveLength(1);
+    expect(calls.open).toBe(2);
+    expect(mgr.getDiagnostics().recoveryCount).toBe(1);
+  });
+
+  it("unknown error wording + health says QuickBooks is gone → recovers anyway (safety net)", async () => {
+    const gone = interpretHealth(raw());
+    const ok = interpretHealth(raw({ quickbooks: [qbProc()] }));
+    const { mgr, calls } = makeManager({ wire: [new Error("Some new COM wording nobody has seen"), OK_XML], healths: [gone, ok], qbRunning: false });
+    expect(await mgr.queryEntity("Customer", {})).toHaveLength(1);
+    expect(calls.open).toBe(2);
+  });
+
   it("QBXML-level errors are untouched (no recovery)", async () => {
     const { mgr, calls } = makeManager({ wire: [new Error("QBXML 3120: object not found")] });
     await expect(mgr.queryEntity("Customer", {})).rejects.toThrow(/3120/);

@@ -96,6 +96,21 @@ Same as read, but step 5 calls `buildAddRequest` / `buildModRequest` / `buildDel
 * In simulation mode the "session" is a synthetic ticket; in live mode it's a real QBXMLRP2 ticket.
 * **Company switching (live).** `switchCompanyFile` closes the SDK session, then tries `BeginSession` on the new file. On failure, `attemptLaunchAndAttach` may (a) gracefully close QB Desktop (`closeCurrentCompany`; WM_CLOSE to the `MauiFrame` window via `scripts/qb-close-desktop.ps1`, never a kill), (b) spawn QB on the `.qbw`, (c) start `scripts/qb-login-autofill.ps1` to fill QB's login window from the vault, and (d) poll `openSession` on `QB_LAUNCH_POLL_MS` (90s). The exe is resolved before anything is closed. If QB is running and the caller didn't allow a close, it never spawns a second QB instance; it only polls.
 
+### Out-of-process COM + idle release (added 2026-10-06)
+
+* **QBXMLRP2 runs in a helper process.** [src/session/com-worker.ts](src/session/com-worker.ts) is the ONLY code that loads `winax`.
+  * The session manager talks to it through [com-worker-client.ts](src/session/com-worker-client.ts) (`WorkerRequestProcessor`): the same five methods (`OpenConnection2`, `BeginSession`, `ProcessRequest`, `EndSession`, `CloseConnection`), async, over Node IPC.
+  * There is one helper per live session, forked with the server's own Node (20).
+* **Why:** after QuickBooks was ended in Task Manager, a COM call segfaulted the whole MCP server (exit 139), live on 2026-10-05.
+  * Now a native crash kills only the helper. Pending calls reject with "QuickBooks COM helper exited…", which `isQuickBooksGoneError` classifies as QB-gone, so recovery forks a new helper.
+* **Time limits** per call (`COM_TIMEOUTS`): open 2 min, begin 5 min, process 10 min (`QB_COM_TIMEOUT_MS`).
+  * Past the limit, the helper is killed and the call fails with "did not answer within…".
+  * Recovery's health check then tells a frozen QB (9010) from a gone one.
+* **Idle release.** After `QB_IDLE_RELEASE_MINUTES` (default 10, 0 = never) with no requests, the manager ends the session.
+  * While a session is held, QuickBooks refuses to close ("another application is using it"), observed live.
+  * The next request reconnects through `ensureLiveSession`.
+* **Tests** fork `tests/fixtures/fake-com-worker.mjs`, which crashes or hangs on cue. Live verification is in ACCEPTANCE_CRITERIA Item 107.
+
 ### Crash recovery, health and activity (added 2026-10-05)
 
 * **Health** ([src/util/qb-health.ts](src/util/qb-health.ts) + `scripts/qb-health.ps1`, read-only).

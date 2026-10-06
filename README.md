@@ -9,7 +9,7 @@
 ![Node 20](https://img.shields.io/badge/node-20.x-339933?logo=node.js&logoColor=white)
 ![MCP](https://img.shields.io/badge/Model%20Context%20Protocol-server-6E56CF)
 ![Tools](https://img.shields.io/badge/tools-154-1f6feb)
-![Tests](https://img.shields.io/badge/tests-1816%20passing-1a7f37)
+![Tests](https://img.shields.io/badge/tests-1825%20passing-1a7f37)
 ![QuickBooks Desktop](https://img.shields.io/badge/QuickBooks%20Desktop-qbXML%2016.0-2CA01C)
 ![Live mode](https://img.shields.io/badge/live%20mode-Windows-0078D6)
 ![Simulation](https://img.shields.io/badge/simulation-any%20OS-555)
@@ -208,7 +208,11 @@ QuickBooks Desktop freezes on big reports, throws dialogs, crashes, and sometime
 | QuickBooks crashes **during a write** | Reconnects, but **does not repeat the write**: `9011` tells the agent to check first. Idempotency keys survive the reconnect |
 | A QuickBooks dialog is blocking | `9010 dialog` with the dialog's exact title, so the agent can tell you what to click |
 | **File Doctor** / Tool Hub is running | Waits: it never reopens a file mid-repair (`9010 file-doctor`) |
-| QuickBooks is frozen | Rechecks after 10 s; force-closes **only** if you (or an agent with your OK) allowed it |
+| QuickBooks is frozen | Every QuickBooks call has a time limit, so nothing hangs forever. Rechecks after 10 s; force-closes **only** if you (or an agent with your OK) allowed it |
+| QuickBooks takes the connection down with it | QuickBooks runs through a separate helper process, so a native crash kills only the helper, never the server. A fresh helper reconnects |
+| You want to close QuickBooks yourself | After 10 idle minutes the server lets go of QuickBooks, so it closes normally. The next request reconnects |
+
+**Proven against a real crash:** with QuickBooks Enterprise 24, QuickBooks was ended in Task Manager in the middle of a session. The next P&L request still came back, in 36 seconds, and the server never went down.
 
 Agents get `qb_health` (what QuickBooks is doing right now, and what to do) and `qb_session_recover` (re-engage). You get the same picture, plus buttons, on the control page.
 
@@ -261,6 +265,8 @@ Agents get `qb_health` (what QuickBooks is doing right now, and what to do) and 
 | `QB_WEB_ADMINS` | Extra Tailscale logins or addresses allowed to manage the page. | — |
 | `QB_HTTP_ONLY` | `"1"` = no stdio; serve only the page and `/mcp` (run as a service). | — |
 | `QB_AUTO_RECOVER` | `"0"` disables automatic reconnect-and-retry after crashes. | on |
+| `QB_IDLE_RELEASE_MINUTES` | Let go of QuickBooks after this many idle minutes, so you can close it normally (`0` = never). | `10` |
+| `QB_COM_TIMEOUT_MS` | Give up on a single QuickBooks request after this long; QuickBooks is treated as frozen. | `600000` (10 min) |
 | `QB_TAILSCALE_EXE` | Path to `tailscale.exe` if not on PATH. | auto |
 | `QB_CONNECTION_MODE` | `localOnly` · `remoteOnly` · `optimistic`. | `optimistic` |
 | `QB_DEBUG_QBXML` / `QB_DEBUG_LOG_PATH` | `"1"` logs every qbXML request and response (SSNs, tax IDs, account and card numbers redacted). | off · `./logs` |
@@ -307,7 +313,7 @@ Agents get `qb_health` (what QuickBooks is doing right now, and what to do) and 
 ```bash
 npm install
 npm run build          # tsc → dist/
-npm test               # vitest (1816 tests)
+npm test               # vitest (1825 tests)
 QB_UI_TESTS=1 npm test # + Windows UI tests (off-screen test windows)
 npm run dev            # tsx, simulation mode
 node scripts/demo-control-page.mjs   # control page with demo data

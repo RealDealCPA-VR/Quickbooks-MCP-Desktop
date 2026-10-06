@@ -43,7 +43,7 @@ import type {
   QBXMLRequest,
   QBXMLResponse,
 } from "../types/qbxml.js";
-import type { ComDispatchObject } from "winax";
+import { WorkerRequestProcessor, type QBRequestProcessor } from "./com-worker-client.js";
 import { SimulationStore } from "./simulation-store.js";
 import { QBLookupCache } from "./lookup-cache.js";
 import { getQbxmlLogger } from "../util/qbxml-logger.js";
@@ -259,7 +259,10 @@ export class QBRecoveredAfterWriteError extends Error {
  */
 export function isQuickBooksGoneError(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
-  return /0x800706ba|rpc server is unavailable|0x800706be|remote procedure call failed|0x80010108|disconnected from its clients|0x80080005|server execution failed|0x80040401|could not access quickbooks|could not start quickbooks|quickbooks is not running|no session is open/.test(msg);
+  // "The ticket parameter is invalid" (0x8004040D) is what QBXMLRP2 actually
+  // returned after QuickBooks was ended in Task Manager mid-session
+  // (observed live 2026-10-05).
+  return /0x800706ba|rpc server is unavailable|0x800706be|remote procedure call failed|0x80010108|disconnected from its clients|0x80080005|server execution failed|0x80040401|could not access quickbooks|could not start quickbooks|quickbooks is not running|no session is open|ticket parameter is invalid|0x8004040d|com helper exited|did not answer within/.test(msg);
 }
 
 /** QB is up but a modal dialog blocks the SDK. A person must answer it. */
@@ -709,7 +712,10 @@ export class QBSessionManager {
    * `openSession` and `closeSession` so the same connection processes every
    * request in a session. Null in simulation mode and after `closeSession`.
    */
-  private rp: ComDispatchObject | null = null;
+  private rp: QBRequestProcessor | null = null;
+
+  /** Creates the QBXMLRP2 handle for a new live session (an out-of-process COM helper). Tests override. */
+  private rpFactory: () => QBRequestProcessor = () => new WorkerRequestProcessor();
   /**
    * Read-only flag (Phase 10 #42). Set via `setReadOnly(true)` (typically on
    * `qb_session_connect({ readOnly: true })`); when true, every mutation
@@ -943,36 +949,21 @@ export class QBSessionManager {
       return this.session;
     }
 
-    // LIVE MODE — QBXMLRP2 COM automation via winax.
-    let winax: typeof import("winax");
-    try {
-      winax = await import("winax");
-    } catch (err) {
-      throw new Error(
-        "winax module not available. Run scripts/setup-qb-pc.ps1 from an elevated PowerShell " +
-        "to install Visual Studio Build Tools + Python and rebuild it, or set QB_SIMULATION=true. " +
-        `Underlying error: ${(err as Error).message}`
-      );
-    }
-    const ActiveXObject =
-      (winax as { Object?: typeof winax.Object }).Object ??
-      (winax as { default?: { Object?: typeof winax.Object } }).default?.Object;
-    if (!ActiveXObject) {
-      throw new Error(
-        "winax loaded but does not expose an `Object` constructor — incompatible winax version installed."
-      );
-    }
-
-    const rp = new ActiveXObject("QBXMLRP2.RequestProcessor");
+    // LIVE MODE — QBXMLRP2 COM automation, run in a separate helper process
+    // (com-worker.ts) so a native crash when QuickBooks dies can't take the
+    // whole MCP server down with it.
+    const rp = this.rpFactory();
 
     try {
-      rp.OpenConnection2(
+      await rp.OpenConnection2(
         this.config.appId ?? "",
         this.config.appName,
         RP2_CONNECTION_TYPE_LOCAL_QBD
       );
     } catch (err) {
       this.rp = null;
+      rp.dispose?.();
+      if (/winax module not available|winax loaded/i.test((err as Error).message)) throw err;
       throw new Error(
         `QBXMLRP2.OpenConnection2 failed: ${(err as Error).message}. ` +
         "Verify QuickBooks Desktop is installed and the QuickBooks SDK is registered " +
@@ -985,9 +976,10 @@ export class QBSessionManager {
       // companyFile === "" tells QBXMLRP2 to use whatever file is currently
       // open in QuickBooks Desktop. That's the better UX for an interactive
       // tool — operators usually have the file open already.
-      ticket = rp.BeginSession(this.config.companyFile ?? "", RP2_FILE_MODE_DONT_CARE);
+      ticket = String((await rp.BeginSession(this.config.companyFile ?? "", RP2_FILE_MODE_DONT_CARE)) ?? "");
     } catch (err) {
-      try { rp.CloseConnection(); } catch { /* swallow — we're already in error path */ }
+      try { await rp.CloseConnection(); } catch { /* swallow — we're already in error path */ }
+      rp.dispose?.();
       throw new Error(
         `QBXMLRP2.BeginSession failed: ${(err as Error).message}. ` +
         "First connection? QuickBooks should have shown an Application Certificate dialog — " +
@@ -996,7 +988,8 @@ export class QBSessionManager {
       );
     }
     if (!ticket) {
-      try { rp.CloseConnection(); } catch { /* swallow */ }
+      try { await rp.CloseConnection(); } catch { /* swallow */ }
+      rp.dispose?.();
       throw new Error("QBXMLRP2.BeginSession returned an empty ticket — connection refused without an error.");
     }
 
@@ -1008,6 +1001,7 @@ export class QBSessionManager {
     };
     console.error(`[QB Session] Live session opened: ticket=${ticket}`);
     recordActivity({ level: "success", category: "session", message: `Session opened on ${fileLabel(this.config.companyFile)}`, companyFile: this.config.companyFile });
+    this.scheduleIdleRelease();
     return this.session;
   }
 
@@ -1025,23 +1019,27 @@ export class QBSessionManager {
     // proceed than to leave the operator with a half-closed session that
     // blocks the next process from connecting.
     const ticket = this.session.ticket;
-    if (this.rp) {
+    const rp = this.rp;
+    // Clear state first so concurrent callers never reuse a closing session.
+    this.rp = null;
+    this.session = null;
+    if (rp) {
       try {
-        this.rp.EndSession(ticket);
+        await rp.EndSession(ticket);
       } catch (err) {
         console.error(
           `[QB Session] EndSession failed (continuing anyway): ${(err as Error).message}`
         );
       }
       try {
-        this.rp.CloseConnection();
+        await rp.CloseConnection();
       } catch (err) {
         console.error(
           `[QB Session] CloseConnection failed (continuing anyway): ${(err as Error).message}`
         );
       }
+      rp.dispose?.();
     }
-    this.rp = null;
     this.session = null;
     console.error(`[QB Session] Live session closed: ticket=${ticket}`);
     recordActivity({ level: "info", category: "session", message: `Disconnected from ${fileLabel(this.config.companyFile)}`, companyFile: this.config.companyFile });
@@ -1547,11 +1545,13 @@ export class QBSessionManager {
     }
 
     // Drop the dead ticket without touching the files.
-    if (this.rp && this.session) {
-      try { this.rp.EndSession(this.session.ticket); } catch { /* already dead */ }
+    const deadRp = this.rp;
+    if (deadRp && this.session) {
+      try { await deadRp.EndSession(this.session.ticket); } catch { /* already dead */ }
     }
-    if (this.rp) {
-      try { this.rp.CloseConnection(); } catch { /* already dead */ }
+    if (deadRp) {
+      try { await deadRp.CloseConnection(); } catch { /* already dead */ }
+      deadRp.dispose?.();
     }
     this.rp = null;
     this.session = null;
@@ -1581,6 +1581,8 @@ export class QBSessionManager {
     recoveryCount: number;
     autoRecover: boolean;
     operationInProgress: boolean;
+    idleReleaseMinutes: number;
+    lastIdleReleaseAt: string | null;
   } {
     return {
       connected: this.session !== null,
@@ -1592,6 +1594,8 @@ export class QBSessionManager {
       recoveryCount: this.recoveryCount,
       autoRecover: this.autoRecover,
       operationInProgress: this.opInFlight !== null,
+      idleReleaseMinutes: Math.round(this.idleReleaseMs / 60_000),
+      lastIdleReleaseAt: this.lastIdleReleaseAt?.toISOString() ?? null,
     };
   }
 
@@ -1707,6 +1711,65 @@ export class QBSessionManager {
    * case the log overhead is one null-check per request.
    */
   async sendRequest(qbxmlRequest: string): Promise<QBXMLResponse> {
+    this.inFlight += 1;
+    try {
+      return await this.sendRequestInner(qbxmlRequest);
+    } finally {
+      this.inFlight -= 1;
+      this.scheduleIdleRelease();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Idle release
+  // -------------------------------------------------------------------------
+
+  /**
+   * While this server holds a QBXMLRP2 session, QuickBooks refuses to close
+   * normally ("another application is using it"), observed live on
+   * 2026-10-05. So after QB_IDLE_RELEASE_MINUTES (default 10; 0 = never)
+   * without requests, end the session. QuickBooks stays open and can be
+   * closed, and the next request reconnects automatically.
+   */
+  private idleReleaseMs: number = (() => {
+    const raw = process.env.QB_IDLE_RELEASE_MINUTES;
+    const minutes = raw === undefined || raw.trim() === "" ? 10 : Number(raw);
+    return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 0;
+  })();
+  private idleTimer: NodeJS.Timeout | null = null;
+  private inFlight = 0;
+  private lastIdleReleaseAt: Date | null = null;
+
+  private scheduleIdleRelease(): void {
+    if (this.simulationMode || this.idleReleaseMs <= 0) return;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => { void this.releaseIfIdle(); }, this.idleReleaseMs);
+    this.idleTimer.unref?.();
+  }
+
+  /** Exposed for tests: release now if nothing is using the session. */
+  async releaseIfIdle(): Promise<boolean> {
+    this.idleTimer = null;
+    if (!this.session || this.inFlight > 0 || this.opInFlight) {
+      if (this.session) this.scheduleIdleRelease();
+      return false;
+    }
+    await this.runExclusive(async () => {
+      if (!this.session || this.inFlight > 0) return;
+      const minutes = Math.round(this.idleReleaseMs / 60_000);
+      recordActivity({
+        level: "info",
+        category: "session",
+        message: `Let go of QuickBooks after ${minutes} idle minute${minutes === 1 ? "" : "s"} so it can be closed normally; the next request reconnects`,
+        companyFile: this.config.companyFile,
+      });
+      this.lastIdleReleaseAt = new Date();
+      await this.closeSession();
+    });
+    return true;
+  }
+
+  private async sendRequestInner(qbxmlRequest: string): Promise<QBXMLResponse> {
     // A company switch / recovery in progress owns the session: wait for it.
     if (this.opInFlight) await this.opInFlight;
     this.lastRequestAt = new Date();
@@ -1749,7 +1812,15 @@ export class QBSessionManager {
         recordActivity({ level: "warn", category: "health", message: "A QuickBooks dialog is blocking requests", companyFile: this.config.companyFile, detail: health?.summary });
         throw new QBUnavailableError("dialog", health?.summary ?? "A QuickBooks dialog is blocking requests.", health?.recommendedAction ?? "Answer the dialog in QuickBooks, then retry.", this.lastError.message);
       }
-      if (!this.autoRecover || !isQuickBooksGoneError(err)) throw err;
+      if (!this.autoRecover) throw err;
+      // Known "QB went away" wording, or (safety net for wording we haven't
+      // seen yet) the health probe confirms QuickBooks is not running / crashed.
+      let gone = isQuickBooksGoneError(err);
+      if (!gone) {
+        const health = await this.healthImpl({ fresh: true }).catch(() => null);
+        gone = !!health && (health.state === "not-running" || health.state === "crashed");
+      }
+      if (!gone) throw err;
       const write = isWriteRequest(qbxmlRequest);
       recordActivity({ level: "error", category: "health", message: `QuickBooks stopped answering during a ${write ? "write" : "read"}`, companyFile: this.config.companyFile, detail: this.lastError.message });
       await this.recover({ trigger: this.lastError.message });
@@ -1820,7 +1891,7 @@ export class QBSessionManager {
 
       const marker = logger?.logRequest(qbxmlRequest, "live");
       try {
-        const responseXml: string = this.rp.ProcessRequest(this.session.ticket, qbxmlRequest);
+        const responseXml = String(await this.rp.ProcessRequest(this.session.ticket, qbxmlRequest));
         // Log the raw response XML BEFORE parsing — a parser throw is one of
         // the main reasons to enable this logger in the first place (the wire
         // bytes are the only useful artifact at that point).
@@ -1880,11 +1951,13 @@ export class QBSessionManager {
    * connection reset by design.
    */
   private async reconnectAfterTransientError(): Promise<void> {
-    if (this.rp) {
+    const rp = this.rp;
+    if (rp) {
       if (this.session) {
-        try { this.rp.EndSession(this.session.ticket); } catch { /* swallow — ticket likely already dead */ }
+        try { await rp.EndSession(this.session.ticket); } catch { /* swallow — ticket likely already dead */ }
       }
-      try { this.rp.CloseConnection(); } catch { /* swallow — connection likely already dropped */ }
+      try { await rp.CloseConnection(); } catch { /* swallow — connection likely already dropped */ }
+      rp.dispose?.();
     }
     this.rp = null;
     this.session = null;

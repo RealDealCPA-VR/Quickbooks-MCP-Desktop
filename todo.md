@@ -245,8 +245,9 @@ A full review on 2026-10-05 covered the qbXML layer, the simulation store, and a
     - a real whois authorization of the Precision tower pins its StableID;
     - MCP over HTTP works on both addresses (152 tools).
   - **Still to verify:** an agent on another tailnet device  connects, is refused before it is authorized, and works after.
-- [ ] **106.** Control page redesign + crash recovery. _(Built 2026-10-05; partial until a real QuickBooks crash is observed.)_
+- [x] **106.** Control page redesign + crash recovery. _(Built 2026-10-05; partial until a real QuickBooks crash is observed.)_
   - **Control page:** an Overview pipeline (agents → server → QuickBooks), Reconnect / Open / Disconnect / Force close buttons, an Access grid, an Activity timeline, and a Storage & security tab.
   - **Recovery:** `qb_health`, `qb_session_recover`, automatic read recovery (9011 for writes), refusals while File Doctor runs, a dialog is open, or QB hangs (9010), and the persistent activity log.
   - **Verified live:** health probe on QB Enterprise 24 (ready state, process, title); `qb_health` via MCP; page screenshots of every tab.
-  - **Not yet observed live:** the exact error QBXMLRP2 raises after QuickBooks really crashes. Test: with an agent connected, close QuickBooks with its X, then run a report. It should come back with `recoveryCount: 1` and the "Reconnected" activity entry.
+  - **Observed live 2026-10-06:** a mid-session kill gave "The ticket parameter is invalid.", then recovery, and the report returned. **Done.**
+- [x] **107.** QBXMLRP2 out of process (COM helper with time limits) + idle release after 10 minutes. _(Done 2026-10-06; live-verified: the server survived a mid-session QuickBooks kill, recovered, and the report returned.)_

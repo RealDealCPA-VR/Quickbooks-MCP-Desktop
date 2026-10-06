@@ -119,6 +119,10 @@ function makeFakeLiveManager() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const internal = sm as any;
   internal.simulationMode = false;
+  // These tests cover the transient-retry layer only. Crash recovery (and its
+  // real health probe, which reads this machine's QuickBooks state) has its
+  // own suite in crash-recovery.test.ts.
+  internal.autoRecover = false;
 
   const sleepDurations: number[] = [];
   internal.sleepImpl = async (ms: number) => {

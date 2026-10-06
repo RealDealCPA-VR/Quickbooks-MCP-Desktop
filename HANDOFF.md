@@ -1,5 +1,17 @@
 # Handoff State
 
+> **Update 2026-10-06: #107 done, #106 now fully live-verified.**
+> - QBXMLRP2 runs in a forked helper ([src/session/com-worker.ts](src/session/com-worker.ts) via [com-worker-client.ts](src/session/com-worker-client.ts)), so a QuickBooks crash can't segfault the server any more (it did on 2026-10-05).
+> - Per-call time limits. "The ticket parameter is invalid." is now recognized as QB-gone, plus a health-probe fallback for unknown wording.
+> - Idle release after `QB_IDLE_RELEASE_MINUTES` (default 10), so the operator can close QuickBooks.
+> - Live results:
+>   - mid-session kill → recovered, P&L returned in 36 s, server up;
+>   - idle release observed;
+>   - cold start through the helper → 84 s.
+> - Totals: 66 files / 1825 tests. Still open: #105 (an agent on a second tailnet device) and #93 (a password-protected file through the full switch, already mostly shown live).
+> - Test gotcha: suites that build a live-mode manager must stub `healthImpl` or set `autoRecover = false`. Otherwise the recovery safety net calls the REAL health probe and the result depends on whether QuickBooks is running on the machine.
+
+
 > **Update (later on 2026-10-05): #106 control page redesign + crash recovery.**
 > - **Control page:** a 5-tab page: Overview pipeline + actions, Company files, Access grid, Activity, Storage & security.
 > - **Health:** `qb_health`, built on [src/util/qb-health.ts](src/util/qb-health.ts) + `scripts/qb-health.ps1`.

@@ -361,7 +361,8 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
     p.appendChild(node("This server", s.operationInProgress ? "info" : s.connected ? "ok" : "", s.operationInProgress ? "Working..." : s.connected ? "Connected to QuickBooks" : "Not connected", [
       "Company file: " + (s.companyFile ? base(s.companyFile) : "whatever QuickBooks has open"),
       "Last request: " + ago(s.lastRequestAt),
-      "Reconnect after crashes: " + (s.autoRecover ? "automatic" : "off") + (s.recoveryCount ? " (" + s.recoveryCount + " so far)" : "")
+      "Reconnect after crashes: " + (s.autoRecover ? "automatic" : "off") + (s.recoveryCount ? " (" + s.recoveryCount + " so far)" : ""),
+      s.idleReleaseMinutes ? "Lets go of QuickBooks after " + s.idleReleaseMinutes + " idle min, so you can close it" + (s.lastIdleReleaseAt ? " (last " + ago(s.lastIdleReleaseAt) + ")" : "") : "Holds QuickBooks until disconnected"
     ]));
     p.appendChild(el("div", "\u2192", "arrow"));
     var t = HEALTH[h.state] || HEALTH.unsupported, ql = [h.openCompanyTitle ? "Open: " + h.openCompanyTitle : "No company file open"];
