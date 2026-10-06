@@ -38,9 +38,10 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 import type { QBSessionManager } from "../session/manager.js";
+import { localQBHost, type QBHost } from "../session/qb-host.js";
 import type { CallerIdentity } from "../util/caller-authorization.js";
-import { findCompanyFiles, resolveCompanyRoot } from "../util/company-files.js";
-import { BrowseError, browseDirectory, defaultDriveLister, type DriveLister } from "../util/fs-browse.js";
+import { resolveCompanyRoot } from "../util/company-files.js";
+import { BrowseError, type DriveLister } from "../util/fs-browse.js";
 import {
   addAuthorizedPeer,
   CredentialInputError,
@@ -67,7 +68,6 @@ import { ADMIN_PAGE_HTML, FORBIDDEN_PAGE_HTML } from "./admin-page.js";
 import { fileLabel } from "../session/manager.js";
 import { getActivity, getActivityLogPath, recordActivity } from "../util/activity-log.js";
 import { getQuickBooksHealth, type HealthProbe } from "../util/qb-health.js";
-import { defaultForceCloseQBDesktop } from "../util/qb-desktop-launch.js";
 import { existsSync, statSync } from "node:fs";
 
 export const DEFAULT_WEB_PORT = 8765;
@@ -317,6 +317,10 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
   };
 
   // ---- admin API -------------------------------------------------------
+  /** The machine that runs QuickBooks, as the session sees it; this PC if the session can't be built. */
+  const hostOf = (): QBHost => {
+    try { return opts.getSession().getHost(); } catch { return localQBHost; }
+  };
   const stateFor = async (id: CallerIdentity, mcpUrls: string[]) => {
     const vp = vaultPath();
     const entries = readCredentialSummaries(vp);
@@ -324,7 +328,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     let discovered: Array<{ companyFile: string; displayName: string }> = [];
     if (root) {
       try {
-        discovered = (await findCompanyFiles(root, 3)).map((f) => ({ companyFile: f.companyFile, displayName: f.displayName }));
+        discovered = (await hostOf().findCompanyFiles(root, 3)).map((f) => ({ companyFile: f.companyFile, displayName: f.displayName }));
       } catch { /* unreadable root → none */ }
     }
     const peers = (await tailnetPeers(run)).map((p) => ({ ...p, isSelf: selfAddresses.includes(p.address) }));
@@ -341,7 +345,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
       activeCompanyFile: session?.getCompanyFile() ?? "",
       simulationMode: session?.isSimulation() ?? true,
       session: session ? session.getDiagnostics() : null,
-      health: await getQuickBooksHealth(opts.healthProbe ? { probe: opts.healthProbe } : {}),
+      health: await (opts.healthProbe ? getQuickBooksHealth({ probe: opts.healthProbe }) : hostOf().health()),
       activity: getActivity(150),
       storage: storageInfo(vp),
       agents: {
@@ -394,11 +398,11 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
         // Company-file picker: no path → this computer's drives; a path → its folders + .qbw files.
         const dir = String(body.path ?? "").trim();
         if (!dir) {
-          sendJson(res, 200, { drives: await (opts.listDrives ?? defaultDriveLister)() });
+          sendJson(res, 200, { drives: await (opts.listDrives ?? (() => hostOf().listDrives()))() });
           return;
         }
         try {
-          sendJson(res, 200, await browseDirectory(dir));
+          sendJson(res, 200, await hostOf().browse(dir));
         } catch (err) {
           if (err instanceof BrowseError) throw new HttpError(400, err.message);
           throw err;
@@ -461,14 +465,14 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
       }
       case "/api/quickbooks/force-close": {
         if (body.confirm !== "FORCE CLOSE") throw new HttpError(400, 'Type FORCE CLOSE to confirm.');
-        const health = await getQuickBooksHealth(opts.healthProbe ? { probe: opts.healthProbe } : { fresh: true });
+        const health = await (opts.healthProbe ? getQuickBooksHealth({ probe: opts.healthProbe }) : hostOf().health({ fresh: true }));
         if (health.state !== "not-responding" && health.state !== "crashed" && body.evenIfResponding !== true) {
           throw new HttpError(409, `QuickBooks is not frozen (${health.summary}). Close it normally instead.`);
         }
         const j = startJob("force-close", "Force-closing QuickBooks", async () => {
           recordActivity({ level: "warn", category: "recovery", message: "Force-closed QuickBooks from the logins page", detail: `by ${describeCallerShort(id)}; state was ${health.state}` });
           try { await opts.getSession().closeSession(); } catch { /* QB is gone anyway */ }
-          const ok = await (opts.forceCloseQuickBooks ?? defaultForceCloseQBDesktop)();
+          const ok = await (opts.forceCloseQuickBooks ?? (() => hostOf().forceClose()))();
           if (!ok) throw new Error("QuickBooks is still running. Close it in Task Manager.");
           return "QuickBooks was force-closed. Press Reconnect (or let the next agent request) to reopen the company file.";
         });

@@ -43,30 +43,22 @@ import type {
   QBXMLRequest,
   QBXMLResponse,
 } from "../types/qbxml.js";
-import { WorkerRequestProcessor, type QBRequestProcessor } from "./com-worker-client.js";
+import type { QBRequestProcessor } from "./com-worker-client.js";
+import { localQBHost, type QBHost } from "./qb-host.js";
 import { SimulationStore } from "./simulation-store.js";
 import { QBLookupCache } from "./lookup-cache.js";
 import { getQbxmlLogger } from "../util/qbxml-logger.js";
 import {
   classifyBeginSessionError,
-  defaultCloseQBDesktop,
-  defaultForceCloseQBDesktop,
-  defaultFileExists,
-  defaultIsQBDesktopRunning,
-  defaultLaunchQBDesktop,
-  defaultRegistryQuery,
   QB_LAUNCH_POLL_MS,
-  resolveQBDesktopExe,
   type QBCloseResult,
   type QBExeResolution,
   type QBExeSource,
 } from "../util/qb-desktop-launch.js";
 import { recordActivity } from "../util/activity-log.js";
-import { getQuickBooksHealth, type QBHealth } from "../util/qb-health.js";
+import type { QBHealth } from "../util/qb-health.js";
 import {
-  findCredentialSummary,
   normalizeCompanyPath,
-  startLoginAutofill,
   type LoginAutofillHandle,
   type LoginAutofillResult,
   type LoginAutofillStatus,
@@ -715,7 +707,7 @@ export class QBSessionManager {
   private rp: QBRequestProcessor | null = null;
 
   /** Creates the QBXMLRP2 handle for a new live session (an out-of-process COM helper). Tests override. */
-  private rpFactory: () => QBRequestProcessor = () => new WorkerRequestProcessor();
+  private rpFactory: () => QBRequestProcessor = () => this.host.createRequestProcessor();
   /**
    * Read-only flag (Phase 10 #42). Set via `setReadOnly(true)` (typically on
    * `qb_session_connect({ readOnly: true })`); when true, every mutation
@@ -798,7 +790,7 @@ export class QBSessionManager {
    * us at least confirm "the orchestrator called spawn with the right exe
    * and .qbw path" deterministically.
    */
-  private spawnImpl: (exe: string, companyFile: string) => void = defaultLaunchQBDesktop;
+  private spawnImpl: (exe: string, companyFile: string) => void | Promise<void> = (exe, companyFile) => this.host.launch(exe, companyFile);
 
   /**
    * QB Desktop executable resolver (Phase 19 #90). Walks the env-var /
@@ -807,12 +799,7 @@ export class QBSessionManager {
    * override via `(sm as any).exeResolverImpl = stub` to drive every
    * branch without touching the real registry or filesystem.
    */
-  private exeResolverImpl: () => QBExeResolution | null = () =>
-    resolveQBDesktopExe({
-      envExe: process.env.QB_DESKTOP_EXE,
-      fileExists: defaultFileExists,
-      registryQuery: defaultRegistryQuery,
-    });
+  private exeResolverImpl: () => QBExeResolution | null | Promise<QBExeResolution | null> = () => this.host.resolveExe();
 
   /**
    * Metadata from the most recent `switchCompanyFile` call (Phase 19 #90).
@@ -832,22 +819,16 @@ export class QBSessionManager {
    * never start a second QB instance on top of one that is still loading,
    * sitting at a login prompt, or showing "No Company Open". Tests override.
    */
-  private isQBRunningImpl: () => boolean = defaultIsQBDesktopRunning;
+  private isQBRunningImpl: () => boolean | Promise<boolean> = () => this.host.isQuickBooksRunning();
 
   /** Is a QuickBooks user name saved for this .qbw on the logins page? Tests override. */
-  private hasSavedLoginImpl: (companyFile: string) => boolean = (companyFile) => {
-    try {
-      return !!findCredentialSummary(companyFile)?.username;
-    } catch {
-      return false;
-    }
-  };
+  private hasSavedLoginImpl: (companyFile: string) => boolean | Promise<boolean> = (companyFile) => this.host.hasSavedLogin(companyFile);
 
   /** QuickBooks health snapshot (crash recovery + diagnostics). Tests override. */
-  private healthImpl: (opts?: { fresh?: boolean }) => Promise<QBHealth> = (opts) => getQuickBooksHealth(opts);
+  private healthImpl: (opts?: { fresh?: boolean }) => Promise<QBHealth> = (opts) => this.host.health(opts);
 
   /** Force-kill QuickBooks: only for a hung QB, and only when the caller explicitly allows it. Tests override. */
-  private forceCloseImpl: () => Promise<boolean> = defaultForceCloseQBDesktop;
+  private forceCloseImpl: () => Promise<boolean> = () => this.host.forceClose();
 
   /** Re-open after a crash and retry reads automatically. QB_AUTO_RECOVER=0 disables it. */
   private autoRecover: boolean = process.env.QB_AUTO_RECOVER !== "0";
@@ -871,20 +852,20 @@ export class QBSessionManager {
   }
 
   /** Does the requested .qbw exist? Live-mode pre-check in switchCompanyFile. Tests override. */
-  private fileExistsImpl: (p: string) => boolean = defaultFileExists;
+  private fileExistsImpl: (p: string) => boolean | Promise<boolean> = (p) => this.host.fileExists(p);
 
   /**
    * Gracefully close QB Desktop (WM_CLOSE, never a force-kill). Used only
    * when the caller passes closeCurrentCompany: true. Tests override.
    */
-  private closeQBImpl: () => Promise<QBCloseResult> = () => defaultCloseQBDesktop();
+  private closeQBImpl: () => Promise<QBCloseResult> = () => this.host.closeGracefully();
 
   /**
    * Start the login-dialog autofill helper for a .qbw. Returns null when
    * no login is saved for that file. Tests override.
    */
-  private loginAutofillImpl: (companyFile: string) => LoginAutofillHandle | null = (companyFile) =>
-    startLoginAutofill({ companyFile });
+  private loginAutofillImpl: (companyFile: string) => LoginAutofillHandle | null | Promise<LoginAutofillHandle | null> = (companyFile) =>
+    this.host.startLoginAutofill(companyFile);
 
   /**
    * Epoch-millisecond timestamps of every transient-retry firing in
@@ -918,8 +899,12 @@ export class QBSessionManager {
    */
   private totalTransientRetries: number = 0;
 
-  constructor(config: QBConnectionConfig) {
+  /** The machine that runs QuickBooks: this PC by default (docs/CONNECTOR_DESIGN.md). */
+  private readonly host: QBHost;
+
+  constructor(config: QBConnectionConfig, host: QBHost = localQBHost) {
     this.config = config;
+    this.host = host;
     this.simulationMode = resolveSimulationMode(process.env, process.platform);
     this.store = new SimulationStore();
     this.lookupCache = new QBLookupCache(config.companyFile);
@@ -1155,7 +1140,7 @@ export class QBSessionManager {
     // Live: refuse a path that doesn't exist BEFORE touching the current
     // session or QB Desktop. Otherwise a typo closes the operator's open
     // company and launches QB on nothing (observed live 2026-10-05).
-    if (!this.simulationMode && companyFile && !this.fileExistsImpl(companyFile)) {
+    if (!this.simulationMode && companyFile && !(await this.fileExistsImpl(companyFile))) {
       throw new QBLaunchError(
         "file-not-found",
         `Company file not found: ${companyFile}. Nothing was closed. Check the path (qb_company_list shows the files this server can see).`,
@@ -1210,13 +1195,13 @@ export class QBSessionManager {
     //     try an unattended open that can't use a password.
     let closedEarly = false;
     if (!this.simulationMode && launchIfClosed) {
-      const running = this.isQBRunningImpl();
+      const running = await this.isQBRunningImpl();
       const switchingAway =
         running &&
         !!options.closeCurrentCompany &&
         hadSession &&
         normalizeCompanyPath(previousFile || ".") !== normalizeCompanyPath(companyFile);
-      const savedLogin = this.hasSavedLoginImpl(companyFile);
+      const savedLogin = await this.hasSavedLoginImpl(companyFile);
       if (savedLogin && (switchingAway || !running)) {
         return this.closeSpawnAndPoll(
           companyFile,
@@ -1322,7 +1307,7 @@ export class QBSessionManager {
       // Defensive — `classifyBeginSessionError` is closed over the four
       // discriminants above, but TypeScript narrows on the `if` chain.
       throw initialError;
-    } else if (this.isQBRunningImpl()) {
+    } else if (await this.isQBRunningImpl()) {
       // QB is up but BeginSession failed without a recognized conflict: it
       // may still be loading, sitting at a login prompt, or showing "No
       // Company Open". Spawning a second QBW.EXE on top of that is not a
@@ -1349,7 +1334,7 @@ export class QBSessionManager {
     alreadyClosed = false,
   ): Promise<QBSession> {
     const initialMsg = initialError instanceof Error ? initialError.message : String(initialError);
-    const resolved = this.exeResolverImpl();
+    const resolved = await this.exeResolverImpl();
     if (!resolved) {
       throw new QBLaunchError(
         "no-executable",
@@ -1366,7 +1351,7 @@ export class QBSessionManager {
     }
 
     try {
-      this.spawnImpl(resolved.exe, companyFile);
+      await this.spawnImpl(resolved.exe, companyFile);
     } catch (spawnErr) {
       const spawnMsg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
       throw new QBLaunchError(
@@ -1393,7 +1378,7 @@ export class QBSessionManager {
   ): Promise<QBSession> {
     let autofill: LoginAutofillHandle | null = null;
     try {
-      autofill = this.loginAutofillImpl(companyFile);
+      autofill = await this.loginAutofillImpl(companyFile);
     } catch {
       autofill = null;
     }
@@ -1610,6 +1595,11 @@ export class QBSessionManager {
    * `launchSource` + `launchExe` + `launchPollAttempts` when the
    * auto-launch path fired.
    */
+  /** The machine that runs QuickBooks for this session (web page + tools reach it through here). */
+  getHost(): QBHost {
+    return this.host;
+  }
+
   getLastSwitchLaunchInfo(): SwitchLaunchInfo {
     return this.lastSwitchLaunchInfo;
   }
@@ -1839,7 +1829,7 @@ export class QBSessionManager {
   private async ensureLiveSession(): Promise<QBSession> {
     if (this.session) return this.session;
     const file = this.config.companyFile;
-    if (file && !this.isQBRunningImpl() && this.hasSavedLoginImpl(file)) {
+    if (file && !(await this.isQBRunningImpl()) && (await this.hasSavedLoginImpl(file))) {
       return this.switchCompanyFileInner(file, { launchIfClosed: true, preserveIdempotency: true });
     }
     return this.openSession();

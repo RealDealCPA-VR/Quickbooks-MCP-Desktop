@@ -29,6 +29,27 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-10-06 — Hub + QuickBooks Connector replaces "everything on the QB PC" (reverses the 2025 qb-bridge rejection)
+
+**Chosen:** Split the server. The **hub** (office Linux box, Docker) owns MCP, tools, session logic, access control, the control page and a hub-held login vault. A thin **connector** on each QuickBooks workstation owns only what must run there: COM, QB launch/close/force-close, health, autofill, and file discovery/browse/drives. The full design and phases are in `docs/CONNECTOR_DESIGN.md`. Phase 1 (this entry's code): the `QBHost` seam with `localQBHost`, no behavior change.
+
+**Why:** The operator wants one always-on server that every agent and workstation reaches over the tailnet, with workstations that only "connect the books". The books are on a file server and several workstations are coming (a dedicated one plus the operator's). The original rejection of a separate `qb-bridge` ("adds an installer, a service... for one COM call") assumed a single PC; that premise no longer holds.
+
+**Alternatives rejected:**
+- Keep the full server on one Windows PC and make it always-on: still one machine per set of books, agents bound to it, and logins re-entered per PC.
+- A tower reverse proxy in front of a workstation server: every workstation still needs the full server, and per-device identity would have to be forwarded and trusted.
+- Per-workstation DPAPI vaults: every login typed on every workstation. Kept only as a fallback option.
+
+**Tradeoffs / consequences:**
+- New network hop (about 20 ms per call on the tailnet) and a new failure mode (workstation offline → 9012).
+- The hub can decrypt saved logins (AES-GCM, key separate from the vault on the hub). Accepted for a tailnet-only office server.
+- The connector must run in the user's logon session (at-logon task), not as a Windows service: autofill needs QB's window, and mapped drives are per logon.
+- The local, everything-on-one-PC mode stays supported through `localQBHost`.
+
+**Revisit when:** QuickBooks or Intuit ships a network-capable SDK transport, or the office moves to QuickBooks Online.
+
+---
+
 ## 2026-10-06 — Company-file picker browses this computer's drives through the page API
 
 **Chosen:** A server-side folder browser (`POST /api/browse`) behind the existing page-admin gate. With no path it returns the drives; with a path it returns that folder's sub-folders and `.qbw` files only. The page renders it as an inline picker next to the Company file field.

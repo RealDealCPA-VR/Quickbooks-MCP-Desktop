@@ -8,6 +8,19 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 
 ---
 
+## Item 109 — QBHost seam (hub + connector, Phase 1) _(Phase 21)_
+
+**Status:** partial. Built and verified in tests and simulation; live Windows smoke test pending.
+
+- [x] `src/session/qb-host.ts` defines `QBHost`; `localQBHost` wraps exactly the previous functions.
+- [x] `QBSessionManager(config, host = localQBHost)`: every machine seam defaults to the host; `getHost()`; the 5 previously sync seams are awaited (sync test stubs still work).
+- [x] The web page (state discovery, health, drives, browse, force-close) and `qb_health` / `qb_company_list` go through the session's host; the page falls back to `localQBHost` if the session can't be built.
+- [x] `tests/qb-host.test.ts`: an injected async host is used for the COM handle, the file-exists pre-check and the page's drives/browse. Full suite 1825 passed (only the 5 Windows-only tests fail on Linux, as on master).
+- [x] Smoke (simulation, HTTP): 154 tools, `qb_health`, `qb_pnl_report`, `/api/browse`.
+- [ ] LIVE (Windows, QB_LIVE=1): open a company file, run a P&L, switch files with `closeCurrentCompany`, Browse → Drives. Same results as before the refactor.
+
+---
+
 ## Item 108 — Company-file picker: browse drives and folders _(Phase 20)_
 
 **Status:** partial. Built and verified in simulation and the demo page; live Windows check pending.

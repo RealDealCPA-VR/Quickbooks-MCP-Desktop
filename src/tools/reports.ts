@@ -11,7 +11,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 import { formatToolError } from "../util/format-tool-error.js";
-import { findCompanyFiles, MAX_COMPANY_SEARCH_DEPTH, resolveCompanyRoot } from "../util/company-files.js";
+import { MAX_COMPANY_SEARCH_DEPTH, resolveCompanyRoot } from "../util/company-files.js";
 import { normalizeCompanyPath, readCredentialSummaries } from "../util/qb-credentials.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 import { normalizeClosingDate } from "./preferences.js";
@@ -1001,7 +1001,7 @@ export function registerReportTools(
         try {
           savedKeys = new Set(readCredentialSummaries().map((c) => normalizeCompanyPath(c.companyFile)));
         } catch { /* unreadable vault → report hasSavedLogin:false everywhere */ }
-        const files = (await findCompanyFiles(root, depth ?? 0)).map((f) => ({
+        const files = (await getSession().getHost().findCompanyFiles(root, depth ?? 0)).map((f) => ({
           ...f,
           hasSavedLogin: savedKeys.has(normalizeCompanyPath(f.companyFile)),
         }));

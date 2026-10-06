@@ -252,3 +252,13 @@ A full review on 2026-10-05 covered the qbXML layer, the simulation store, and a
   - **Verified live:** health probe on QB Enterprise 24 (ready state, process, title); `qb_health` via MCP; page screenshots of every tab.
   - **Observed live 2026-10-06:** a mid-session kill gave "The ticket parameter is invalid.", then recovery, and the report returned. **Done.**
 - [x] **107.** QBXMLRP2 out of process (COM helper with time limits) + idle release after 10 minutes. _(Done 2026-10-06; live-verified: the server survived a mid-session QuickBooks kill, recovered, and the report returned.)_
+
+## Phase 21 — Hub + QuickBooks Connector (design: docs/CONNECTOR_DESIGN.md)
+
+The operator's target (2026-10-06): one always-on server on the office Linux box (the hub, reached over the tailnet), and each QuickBooks workstation running only a thin connector. Books live on a separate file server; agents run on the workstations; one workstation first, then a dedicated workstation plus the operator's own.
+
+- [ ] **109.** `QBHost` interface + `localQBHost`. The manager, web page and `qb_health` / `qb_company_list` reach the QuickBooks machine only through the session's host; the 5 sync seams are awaited. No behavior change. _(Partial 2026-10-06: built, 1825 tests, smoke-tested in simulation; live smoke on Windows pending — ACCEPTANCE_CRITERIA Item 109.)_
+- [ ] **110.** Connector (`quickbooks-desktop-mcp-connector`: tailnet-only HTTP `/v1`, hub-pinned + token) + `RemoteQBHost`; hub-held login vault (AES-GCM) with just-in-time autofill; UNC identity for company files (mapped letter → UNC on the connector); 9012 workstation-offline; hub in Docker on the tower. Single workstation.
+- [ ] **111.** Pairing: the control page's **Workstations** tab + a one-line installer (Node 20, connector, at-logon task, tailnet-only firewall rule); `vr` migration (import its DPAPI logins + grants); the Command Center points agents to the hub.
+- [ ] **112.** Several workstations at once: one session manager per workstation; routing to the agent's own PC, else the default workstation; `workstation` arg on `qb_company_open`; 9008 names the lock holder.
+

@@ -13,7 +13,6 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { getActivity } from "../util/activity-log.js";
 import { formatToolError } from "../util/format-tool-error.js";
-import { getQuickBooksHealth } from "../util/qb-health.js";
 import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 
 function errorResult(err: unknown, fallback: string) {
@@ -48,7 +47,7 @@ export function registerHealthTools(server: McpServer, getSession: () => QBSessi
     async ({ activityLimit }) => {
       try {
         const session = getSession();
-        const health = await getQuickBooksHealth({ fresh: true });
+        const health = await session.getHost().health({ fresh: true });
         return {
           content: [{
             type: "text" as const,

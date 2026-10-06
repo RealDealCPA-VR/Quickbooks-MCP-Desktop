@@ -96,6 +96,12 @@ Same as read, but step 5 calls `buildAddRequest` / `buildModRequest` / `buildDel
 * In simulation mode the "session" is a synthetic ticket; in live mode it's a real QBXMLRP2 ticket.
 * **Company switching (live).** `switchCompanyFile` closes the SDK session, then tries `BeginSession` on the new file. On failure, `attemptLaunchAndAttach` may (a) gracefully close QB Desktop (`closeCurrentCompany`; WM_CLOSE to the `MauiFrame` window via `scripts/qb-close-desktop.ps1`, never a kill), (b) spawn QB on the `.qbw`, (c) start `scripts/qb-login-autofill.ps1` to fill QB's login window from the vault, and (d) poll `openSession` on `QB_LAUNCH_POLL_MS` (90s). The exe is resolved before anything is closed. If QB is running and the caller didn't allow a close, it never spawns a second QB instance; it only polls.
 
+### QBHost: the QuickBooks machine behind one interface (added 2026-10-06)
+
+* [src/session/qb-host.ts](src/session/qb-host.ts) defines `QBHost`: the COM handle factory, QB running / exe / launch / graceful close / force close, health, file exists, `.qbw` discovery, drives, browse, saved-login check and login autofill. All of it is async.
+* `localQBHost` is this PC (the original behavior). `QBSessionManager(config, host = localQBHost)` takes its machine seams (`rpFactory`, `spawnImpl`, `isQBRunningImpl`, ...) from the host; `getHost()` exposes it.
+* **Rule:** the web page and tools reach the QuickBooks machine only through `session.getHost()`, never by importing `qb-desktop-launch` / `qb-health` / `company-files` / `fs-browse` directly. This is the seam where the remote connector plugs in (docs/CONNECTOR_DESIGN.md).
+
 ### Out-of-process COM + idle release (added 2026-10-06)
 
 * **QBXMLRP2 runs in a helper process.** [src/session/com-worker.ts](src/session/com-worker.ts) is the ONLY code that loads `winax`.

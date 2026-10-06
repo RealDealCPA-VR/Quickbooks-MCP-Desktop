@@ -1,5 +1,12 @@
 # Handoff State
 
+> **Update 2026-10-06 (latest): new direction, hub + connector. Phase 1 (#109) built, live smoke pending.**
+> - **Direction:** the operator wants the server on the office Linux box (hub) and only a thin connector on each QB workstation. Full design, operator answers and phases: [docs/CONNECTOR_DESIGN.md](docs/CONNECTOR_DESIGN.md). Decision logged in DECISIONS.md (reverses the qb-bridge rejection). Phase 21 in todo.md (#109-#112).
+> - **#109 built:** [src/session/qb-host.ts](src/session/qb-host.ts) (`QBHost`, `localQBHost`); the manager's machine seams default to the host and are awaited; the page and `qb_health` / `qb_company_list` use `session.getHost()`. Tests: `tests/qb-host.test.ts`; 68 files / 1825 passed (only the 5 Windows-only tests fail on Linux, as on master). Smoke in simulation over HTTP is fine.
+> - **Verify first (Windows, live):** ACCEPTANCE_CRITERIA Item 109: open a file, P&L, switch, Browse → Drives. Same behavior as before.
+> - **Next task:** #110, the connector + `RemoteQBHost` + hub-held vault + UNC identity + 9012, single workstation.
+> - **Gotcha:** existing tests replace the manager seams with sync functions via `(mgr as any).xImpl = ...`. Keep every call site `await`-ing the seam so both sync stubs and the async host work.
+
 > **Update 2026-10-06 (later): #108 company-file picker, built + sim/demo-verified, live check pending.**
 > - **What:** the Company files form gains a **Browse…** button. It opens an inline picker: this computer's drives (local, network, removable) → folders → `.qbw` files. Clicking a file fills the path. It starts at the typed file's folder, then the last folder browsed, then `QB_COMPANY_ROOT`, then the drive list.
 > - **Code:** [src/util/fs-browse.ts](src/util/fs-browse.ts) (`defaultDriveLister` uses PowerShell `[System.IO.DriveInfo]::GetDrives()` with an 8 s limit and falls back to probing C:–Z:; `browseDirectory` returns folders + `.qbw` only). `POST /api/browse` in [src/web/server.ts](src/web/server.ts) (`{path:""}` → drives) is admin-only like every `/api/*`. Picker UI in [src/web/admin-page.ts](src/web/admin-page.ts). `listDrives` is a new test seam.
