@@ -91,6 +91,9 @@ const ALWAYS_ALLOWED = new Set([
   "qb_company_list",
   "qb_company_credentials_list",
   "qb_company_credentials_edit",
+  // Hub: routing only, no books data (another workstation's open file is filtered in the tool).
+  "qb_workstation_list",
+  "qb_workstation_use",
 ]);
 
 export function authorizeToolCall(

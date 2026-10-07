@@ -1220,7 +1220,18 @@ export class QBSessionManager {
     try {
       return await this.openSession();
     } catch (err) {
-      if (!launchIfClosed) throw err;
+      if (!launchIfClosed) {
+        // A file held by another user (or another workstation) is 9008 whether
+        // or not a launch was requested, so callers can act on it.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!this.simulationMode && classifyBeginSessionError(msg) === "multi-user-lock") {
+          throw new QBMultiUserLockError(
+            "QuickBooks company file is in use by another user or workstation. Wait for it to be released, or open it where it is already open.",
+            msg,
+          );
+        }
+        throw err;
+      }
       // Sim mode: openSession can't fail in sim (it just synthesizes a ticket),
       // so reaching this branch in sim mode is a hard error from the manager
       // internals, not a missing-file situation. Bubble the original error

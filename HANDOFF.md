@@ -1,5 +1,11 @@
 # Handoff State
 
+> **Update 2026-10-07 (later): #112 open items closed (live check pending).**
+> - `qb_company_open({ workstation })`, `qb_workstation_list`, `qb_workstation_use` ([src/tools/workstations.ts](src/tools/workstations.ts)); the choice is per agent connection (`HubSessions.contextFor`).
+> - 9008 now carries `heldBy` (hub session with the exact file, else QuickBooks' title bar on another workstation).
+> - Fix: "in use by another user" without `launchIfClosed` is 9008, not -1.
+> - SKILL.md / TOOLS.md / README updated. 69 files / 1847 passed (the 5 Windows-only failures, as before).
+
 > **Update 2026-10-07: hub + connector made production-shaped (#110-#112), merged to master.**
 > - **Several workstations at once** ([src/hub/sessions.ts](src/hub/sessions.ts)): per-workstation sessions; agents on a workstation use their own PC; others use the default.
 > - **File server:** connectors report mapped drives as UNC ([src/connector/unc-host.ts](src/connector/unc-host.ts), `toUncPath`).

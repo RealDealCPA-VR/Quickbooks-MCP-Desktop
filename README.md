@@ -4,7 +4,7 @@
 
 ### Give AI agents safe, supervised hands on QuickBooks Desktop.
 
-**154 tools** across the whole ledger · **multi-company switching with automatic login** · a **live control page** · **remote agents over Tailscale** with per-file access · **crash recovery** built for real-world desktops
+**154 tools** across the whole ledger · **multi-company switching with automatic login** · a **live control page** · **remote agents over Tailscale** with per-file access · an **office hub** for many QuickBooks workstations · **crash recovery** built for real-world desktops
 
 ![Node 20](https://img.shields.io/badge/node-20.x-339933?logo=node.js&logoColor=white)
 ![MCP](https://img.shields.io/badge/Model%20Context%20Protocol-server-6E56CF)
@@ -217,6 +217,7 @@ irm http://<server tailnet IP>:8765/connector/install.ps1 | iex
 - **Several workstations at once.** Each keeps its own QuickBooks session. An agent on a workstation uses **that PC's** QuickBooks; other agents use the **default** workstation.
 - **File-server aware.** Mapped drives are reported as their UNC share, so `Q:\Acme\Acme.qbw` on one PC and `R:\Acme\Acme.qbw` on another are the same company file, with one login and one set of grants.
 - **Logins saved once.** They're kept on the hub (AES-256-GCM) and handed to a workstation only to fill QuickBooks' login window. **Import saved logins** copies an existing PC's logins and grants into the hub.
+- **Agents can pick a workstation.** `qb_workstation_list` / `qb_workstation_use`, or `qb_company_open({ companyFile, workstation })`. A file already open elsewhere returns 9008 with `heldBy` naming that workstation.
 - Agents connect to the hub: `{ "type": "http", "url": "http://<server tailnet IP>:8765/mcp" }`. Status `9012` means no workstation is available.
 
 Design and trade-offs: [docs/CONNECTOR_DESIGN.md](docs/CONNECTOR_DESIGN.md).

@@ -103,6 +103,17 @@ qb_company_info()                        // confirm you're in the right book
 | `9008` | File locked by another user (multi-user) | Wait. Don't retry in a loop |
 | `9009` | **Your device isn't authorized for that file** (or no specific file is selected yet) | `qb_company_list` to see your files, then `qb_company_open` one of them. For another file, ask the operator to authorize your device on the logins page. Never try to work around it |
 
+### On a hub: which workstation's QuickBooks you are using
+
+When the server is an office **hub** (QuickBooks runs on workstations that run the connector), two extra tools exist:
+
+- `qb_workstation_list`: every workstation (online, default, `usedByYou`, `ownPc`, the open company file) and which one your requests go to.
+- `qb_workstation_use({ workstation })`: send your requests to that workstation for the rest of your connection; `'default'` returns to automatic routing.
+
+Automatic routing: your own PC's QuickBooks when your PC is an online workstation, otherwise the default workstation. Each workstation has its own open company file.
+
+The books live on a file server, so the same company file can be opened from any workstation, but only one at a time unless QuickBooks is in multi-user mode. If `qb_company_open` returns **9008** with `heldBy`, that workstation already has the file open: retry with `qb_company_open({ companyFile, workstation: heldBy })` rather than waiting. Company files are UNC paths (`\\server\share\...`): use them exactly as `qb_company_list` returns them.
+
 ### When QuickBooks crashes, freezes, or File Doctor runs
 
 QuickBooks Desktop on the operator's computer is not always stable. It can crash, freeze on a big report, stop on a dialog, or hand off to **File Doctor**. Build around that:
@@ -234,10 +245,11 @@ The server returns a structured error shape on every failure: `{ success: false,
 | 9005 | QBXML SDK has no write path for this | Document the manual UI step instead |
 | 9006 | Dry-run not supported in this mode | Composite outlier — run for real or refactor |
 | 9007 | Company-file open/switch failed (`reason`: file-conflict, close-failed, login-rejected, launch-timeout, launch-spawn-failed, no-executable) | See **Opening a company file** |
-| 9008 | Company file locked by another user (multi-user) | Wait for release; don't loop |
+| 9008 | Company file in use by another user or workstation | On a hub, read `heldBy` and retry `qb_company_open` with `workstation` set to it; otherwise wait for release; don't loop |
 | 9009 | This device isn't authorized for that company file (remote agents) | `qb_company_list` → open an authorized file, or ask the operator to authorize it |
 | 9010 | QuickBooks needs a person (`reason`: file-doctor, dialog, not-responding, crashed, recovery-failed) | `qb_health`, tell the operator what's on screen, then `qb_session_recover` once |
 | 9011 | QuickBooks crashed during a WRITE; the server reconnected | Look the record up before retrying; retry with the same `idempotencyKey` |
+| 9012 | Hub: the workstation isn't available (`reason`: no-workstation, workstation-offline, unknown-workstation, not-a-hub) | `qb_workstation_list`; pick an online one with `qb_workstation_use`, or tell the operator to start that PC's connector |
 | -1   | QBXML parse error | Usually schema-order — read `hint` field |
 
 When `hint` is present, it carries `kind` + `field` + `schemaOrder` candidates. Use it before retrying.

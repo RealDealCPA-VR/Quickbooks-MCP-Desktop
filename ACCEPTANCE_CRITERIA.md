@@ -10,13 +10,16 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 
 ## Item 112 — Several workstations at once _(Phase 21)_
 
-**Status:** partial (core built and tested; two items open).
+**Status:** partial: built and tested on Linux; live two-workstation check pending.
 
 - [x] `HubSessions` (src/hub/sessions.ts): one QBSessionManager per workstation; an agent on an online workstation uses its own; everyone else (other devices, hub-local callers, the page) uses the default (chosen, else the only one online); its own workstation offline → default.
 - [x] Page: **Default** chip and **Make default**; each workstation shows its open company file; changing the default closes nothing.
 - [x] Tests: two real connectors, two agents, concurrent queries land on the right workstation; offline fallback; nothing available → 9012.
-- [ ] `qb_company_open` optional `workstation` argument.
-- [ ] 9008 names the workstation holding the file, when the hub knows.
+- [x] `qb_company_open({ workstation })` + `qb_workstation_use` / `qb_workstation_list` (per agent connection; 'default' undoes; unknown name → 9012 `unknown-workstation` listing the real names; outside a hub → 9012 `not-a-hub`). The reply always says which workstation handled it.
+- [x] 9008 → `heldBy` + `heldByEvidence` + `recommendedAction`: a hub session on another workstation with that exact file, else QuickBooks' title bar on another online workstation matching the file name.
+- [x] Fix: a "file in use by another user" BeginSession error is 9008 even without `launchIfClosed` (it was a raw -1 before).
+- [x] Tests: in-memory MCP client against two real connectors (lock → heldBy → retry there → list/use), title-bar evidence, not-a-hub; the lock classification without launch. Full suite 1847 passed.
+- [ ] LIVE: two Windows workstations sharing a file-server .qbw; a second agent gets 9008 + heldBy and succeeds with `workstation`.
 
 ---
 

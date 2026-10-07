@@ -13,6 +13,7 @@ import { qbStatusCodeMessage } from "../util/qb-status-codes.js";
 import { formatToolError } from "../util/format-tool-error.js";
 import { MAX_COMPANY_SEARCH_DEPTH, resolveCompanyRoot } from "../util/company-files.js";
 import { normalizeCompanyPath, readCredentialSummaries } from "../util/qb-credentials.js";
+import type { WorkstationContext } from "../hub/sessions.js";
 import { ISO_DATE_RE } from "../util/validators.js";
 import { normalizeClosingDate } from "./preferences.js";
 
@@ -805,7 +806,9 @@ export function extractOriginalTxnAmount(
 
 export function registerReportTools(
   server: McpServer,
-  getSession: () => QBSessionManager
+  getSession: () => QBSessionManager,
+  /** Hub mode: this agent connection's workstation choice (hub/sessions.ts). */
+  workstations?: WorkstationContext,
 ): void {
   // -----------------------------------------------------------------------
   // Company info
@@ -907,10 +910,24 @@ export function registerReportTools(
     {
       companyFile: z.string().min(1).describe("Absolute or UNC path to the .qbw file (e.g. 'C:\\\\path\\\\to\\\\Acme.qbw' or '\\\\\\\\server\\\\share\\\\Acme.qbw'). Pass an empty string to fall back to 'whatever file QB Desktop has open' — but the schema rejects empty strings to force an explicit choice; if you want the currently-open file, just don't call this tool."),
       closeCurrentCompany: z.boolean().optional().describe("Live mode only. If QuickBooks Desktop has a different company file open (or is running without the requested file attached), gracefully close QuickBooks and relaunch it on companyFile, then log in with the saved login for that file (qb_company_credentials_edit) and attach. Implies launchIfClosed:true. Default false. The close is graceful: if QuickBooks shows a prompt (unsaved form, backup reminder) it stays open and the tool fails with statusCode 9007 reason 'close-failed'. A saved login QuickBooks rejects fails with reason 'login-rejected' (submitted once, never retried). Response adds closedPreviousQuickBooks:true and loginAutofill: 'filled' | 'not-needed' | 'no-credentials' | 'no-login-window' | 'error'."),
+      workstation: z.string().optional().describe("Hub only: the workstation (name from qb_workstation_list) whose QuickBooks should open the file. The choice sticks for this agent connection until changed ('default' returns to automatic: your own PC if it is a workstation, else the default one). Use it when the file is already open on another workstation (a 9008 lock reply names it in heldBy)."),
       launchIfClosed: z.boolean().optional().describe("If true and live mode and the initial BeginSession reports no company file is loaded (or QB Desktop isn't running), spawn QB Desktop with the target .qbw and poll for attach (~30s budget across 5 exponential retries: 1s, 2s, 4s, 8s, 15s). Executable detection chain: $QB_DESKTOP_EXE → Windows registry (HKLM\\\\SOFTWARE\\\\Intuit\\\\QuickBooks\\\\*\\\\InstallPath) → known Program Files paths. Default false — explicit opt-in. In simulation mode this flag is a no-op (the store reseed already covers the 'open a new book' UX). Failure modes: statusCode 9007 if QB Desktop is already open with a DIFFERENT file (auto-swap not attempted — close it first), no executable is locatable, the spawn itself fails, or the poll budget expires without attach. statusCode 9008 if the .qbw is locked by another user in multi-user mode (retry not useful — wait for release). On success, the response includes launched:true plus launchSource ('env' | 'registry' | 'fallback'), launchExe (the resolved path), and launchPollAttempts."),
     },
-    async ({ companyFile, launchIfClosed, closeCurrentCompany }) => {
+    async ({ companyFile, launchIfClosed, closeCurrentCompany, workstation }) => {
+      if (workstation !== undefined) {
+        const fail = (statusMessage: string, reason: string) => ({
+          content: [{ type: "text" as const, text: JSON.stringify({ success: false, statusCode: 9012, reason, statusMessage, attemptedCompanyFile: companyFile }) }],
+          isError: true,
+        });
+        if (!workstations) return fail("The workstation argument applies only when this server is a QuickBooks MCP hub. Here QuickBooks runs on this computer.", "not-a-hub");
+        try {
+          workstations.use(workstation);
+        } catch (err) {
+          return fail((err as Error).message, "unknown-workstation");
+        }
+      }
       const session = getSession();
+      const onWorkstation = workstations ? { workstation: workstations.current().name } : {};
       const previousCompanyFile = session.getCompanyFile();
       try {
         const newSession = await session.switchCompanyFile(companyFile, {
@@ -923,6 +940,7 @@ export function registerReportTools(
             type: "text" as const,
             text: JSON.stringify({
               success: true,
+              ...onWorkstation,
               previousCompanyFile,
               companyFile: newSession.companyFile,
               ticket: newSession.ticket,
@@ -945,8 +963,20 @@ export function registerReportTools(
           }],
         };
       } catch (err) {
-        const e = err as { message?: string; statusCode?: number; reason?: string; underlyingMessage?: string };
+        const e = err as { message?: string; statusCode?: number; reason?: string; underlyingMessage?: string; recommendedAction?: string };
         const humanReadable = qbStatusCodeMessage(e.statusCode ?? -1);
+        // Hub: a 9008 lock usually means another workstation has the file open. Say which.
+        let lock: Record<string, unknown> = {};
+        if (e.statusCode === 9008 && workstations) {
+          const holder = await workstations.findHolder(companyFile).catch(() => null);
+          if (holder) {
+            lock = {
+              heldBy: holder.workstation,
+              heldByEvidence: holder.evidence === "session" ? "an agent session on that workstation has this file open" : "QuickBooks on that workstation shows a matching company",
+              recommendedAction: `Open it on the workstation that has it: qb_company_open({ companyFile, workstation: "${holder.workstation}" }). Or close it there first.`,
+            };
+          }
+        }
         return {
           content: [{
             type: "text" as const,
@@ -956,8 +986,11 @@ export function registerReportTools(
               statusMessage: e.message ?? "Failed to open company file",
               previousCompanyFile,
               attemptedCompanyFile: companyFile,
+              ...onWorkstation,
               ...(e.reason ? { reason: e.reason } : {}),
               ...(e.underlyingMessage ? { underlyingMessage: e.underlyingMessage } : {}),
+              ...(e.recommendedAction ? { recommendedAction: e.recommendedAction } : {}),
+              ...lock,
               ...(humanReadable ? { humanReadable } : {}),
             }),
           }],

@@ -113,3 +113,20 @@ describe("web page reaches the machine through the session's host", () => {
     }
   });
 });
+
+describe("a locked company file is 9008 even without launchIfClosed", () => {
+  it("BeginSession 'in use by another user' → QBMultiUserLockError; other errors pass through", async () => {
+    const lockedRp = (msg: string): QBRequestProcessor => ({
+      OpenConnection2: async () => undefined,
+      BeginSession: async () => { throw new Error(msg); },
+      ProcessRequest: async () => "",
+      EndSession: async () => undefined,
+      CloseConnection: async () => undefined,
+    });
+    const { host } = recordingHost({ fileExists: async () => true, createRequestProcessor: () => lockedRp("The file is in use by another user.") });
+    await expect(liveManager(host).switchCompanyFile("\\\\files\\books\\A.qbw"))
+      .rejects.toMatchObject({ name: "QBMultiUserLockError", statusCode: 9008 });
+    const { host: other } = recordingHost({ fileExists: async () => true, createRequestProcessor: () => lockedRp("Something else broke.") });
+    await expect(liveManager(other).switchCompanyFile("\\\\files\\books\\A.qbw")).rejects.toThrow(/Something else broke/);
+  });
+});

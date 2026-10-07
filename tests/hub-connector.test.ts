@@ -379,3 +379,105 @@ describe("one-line workstation installer", () => {
     expect((await get(`http://127.0.0.1:${web.port}/connector/install.ps1`)).status).toBe(404);
   });
 });
+
+describe("choosing a workstation and who holds a locked file", () => {
+  const LOCKED = "\\\\files\\books\\Acme Real.qbw";
+
+  async function rig() {
+    const { HubSessions } = await import("../src/hub/sessions.js");
+    const { registerReportTools } = await import("../src/tools/reports.js");
+    const { registerWorkstationTools } = await import("../src/tools/workstations.js");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const a = fakeWorkstation();
+    const b = fakeWorkstation();
+    // On my-pc, QuickBooks reports the shared file as in use elsewhere.
+    a.host.createRequestProcessor = () => ({
+      OpenConnection2: async () => undefined,
+      BeginSession: async (file: string) => { if (file.endsWith("Real.qbw")) throw new Error("The file is in use by another user."); return "T"; },
+      ProcessRequest: async () => CUSTOMER_XML,
+      EndSession: async () => undefined,
+      CloseConnection: async () => undefined,
+    });
+    const ca = await startConnectorServer({ port: 0, secret: SECRET, hubAddresses: [], listenHosts: ["127.0.0.1"], version: "t", host: a.host, autofill: a.autofill });
+    const cb = await startConnectorServer({ port: 0, secret: SECRET, hubAddresses: [], listenHosts: ["127.0.0.1"], version: "t", host: b.host, autofill: b.autofill });
+    const reg = new WorkstationRegistry(path.join(tmp, "choose.json"));
+    reg.register({ id: "node-a", name: "my-pc", address: "127.0.0.1", port: ca.port, secret: SECRET, version: "t", platform: "win32" });
+    reg.register({ id: "node-b", name: "books-pc", address: "127.0.0.1", port: cb.port, secret: SECRET, version: "t", platform: "win32" });
+    reg.setActive("node-a");
+    const hub = new HubSessions(reg, { companyFile: "", appName: "vitest-choose", qbxmlVersion: "16.0" });
+    const identity = { kind: "local" as const, via: "loopback" as const };
+    const ctx = hub.contextFor(identity);
+    const server = new McpServer({ name: "hub", version: "1" });
+    registerReportTools(server, ctx.session, ctx);
+    registerWorkstationTools(server, ctx, identity);
+    const client = new Client({ name: "agent", version: "1" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    await client.connect(ct);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await client.callTool({ name, arguments: args });
+      return { isError: !!r.isError, json: JSON.parse((r.content as Array<{ text: string }>)[0].text) };
+    };
+    return { a, b, ca, cb, hub, call, close: async () => { await client.close(); await ca.close(); await cb.close(); } };
+  }
+
+  beforeEach(() => { process.env.QB_SIMULATION = "false"; });
+  afterEach(() => { delete process.env.QB_SIMULATION; });
+
+  it("a 9008 names the workstation that has the file open; workstation: retries there", async () => {
+    const r = await rig();
+    try {
+      await r.hub.forWorkstation("node-b").switchCompanyFile(LOCKED);
+      const locked = await r.call("qb_company_open", { companyFile: LOCKED });
+      expect(locked.isError).toBe(true);
+      expect(locked.json).toMatchObject({ statusCode: 9008, workstation: "my-pc", heldBy: "books-pc" });
+      expect(locked.json.recommendedAction).toContain('workstation: "books-pc"');
+
+      const there = await r.call("qb_company_open", { companyFile: LOCKED, workstation: "books-pc" });
+      expect(there.isError).toBe(false);
+      expect(there.json).toMatchObject({ success: true, workstation: "books-pc", companyFile: LOCKED });
+
+      const list = await r.call("qb_workstation_list", {});
+      expect(list.json).toMatchObject({ usingWorkstation: "books-pc", chosenExplicitly: true });
+      expect(list.json.workstations.find((w: any) => w.name === "books-pc")).toMatchObject({ usedByYou: true, isDefault: false, openCompanyFile: LOCKED });
+
+      expect((await r.call("qb_workstation_use", { workstation: "default" })).json).toMatchObject({ usingWorkstation: "my-pc", chosenExplicitly: false });
+      const bad = await r.call("qb_workstation_use", { workstation: "nope" });
+      expect(bad).toMatchObject({ isError: true, json: { statusCode: 9012, reason: "unknown-workstation" } });
+      expect(bad.json.statusMessage).toContain("books-pc");
+    } finally {
+      await r.close();
+    }
+  });
+
+  it("without a hub session, QuickBooks' title bar on another workstation identifies the holder", async () => {
+    const r = await rig();
+    try {
+      const ready = await r.b.host.health();
+      r.b.host.health = async () => ({ ...ready, openCompanyTitle: "Acme Real" });
+      const locked = await r.call("qb_company_open", { companyFile: LOCKED });
+      expect(locked.json).toMatchObject({ statusCode: 9008, heldBy: "books-pc" });
+      expect(locked.json.heldByEvidence).toContain("matching company");
+    } finally {
+      await r.close();
+    }
+  });
+
+  it("outside a hub the workstation argument is refused clearly", async () => {
+    const { registerReportTools } = await import("../src/tools/reports.js");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const mgr = new QBSessionManager({ companyFile: "", appName: "v", qbxmlVersion: "16.0" });
+    const server = new McpServer({ name: "solo", version: "1" });
+    registerReportTools(server, () => mgr);
+    const client = new Client({ name: "agent", version: "1" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    await client.connect(ct);
+    const r = await client.callTool({ name: "qb_company_open", arguments: { companyFile: LOCKED, workstation: "books-pc" } });
+    expect(r.isError).toBe(true);
+    expect(JSON.parse((r.content as Array<{ text: string }>)[0].text)).toMatchObject({ statusCode: 9012, reason: "not-a-hub" });
+    await client.close();
+  });
+});

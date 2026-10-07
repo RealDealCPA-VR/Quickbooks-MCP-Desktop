@@ -4,7 +4,7 @@ Every tool the QuickBooks Desktop MCP server exposes, grouped by area. Agents ge
 
 ← Back to the [README](../README.md)
 
-## All tools (154)
+## All tools (154, plus 2 on a hub)
 
 ### Customers
 | Tool | Description |
@@ -445,3 +445,10 @@ All prompt arguments are optional with sensible defaults (prior calendar month f
 | `/trial_balance_workup` | Pulls trial balance + cross-checks (BS Assets = Liab+Equity reconcile, AR/AP totals match aging reports, P&L netIncome plug). Bridges the `trial-balance-workup` skill from manual CSV export to direct MCP query. Optional args: `asOfDate` (default today) / `basis` (default Accrual). Specifies the workpaper output table shape. |
 | `/cc_statement_validator` | Three-way reconciliation of a credit-card statement against QB's CC account state — balance match, line-by-line match, discrepancy scan, clear-on-match. Bridges the `cc-statement-validator` skill. Optional args: `creditCardAccountName` / `statementEndingBalance` / `statementEndingDate`. |
 | `/w2_prep` | January W-2 prep via `qb_w2_summary` + `qb_employee_list` + reconciliation against P&L wage totals + balance-sheet withholding liability. Optional args: `taxYear` (default last completed year) / `employeeFullName` (single-employee scope). Surfaces a per-employee filing checklist; calls out 9003 / 9004 status codes for edition / subscription rejections. Subject to QB Payroll subscription availability. |
+
+### Hub workstations (hub only)
+
+| Tool | What it does |
+|---|---|
+| `qb_workstation_list` | The QuickBooks workstations behind the hub: online/offline, default, which one your requests use (`usedByYou`), whether it's your own PC, and its open company file (shown only if your device may use that file). |
+| `qb_workstation_use` | `workstation`: a name from the list, or `'default'`. Sends this connection's QuickBooks requests there until changed. `qb_company_open` also takes `workstation`, and a 9008 reply names the holder in `heldBy`. |
