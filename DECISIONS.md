@@ -29,6 +29,32 @@ Skip trivial choices. Log when a future session would otherwise re-debate the sa
 
 ---
 
+## 2026-10-07 — Workstation installer: Startup folder + restart loop, package served by the hub; routing to the agent's own PC
+
+**Chosen:**
+- **Installer** `irm <hub>/connector/install.ps1 | iex`. A private Node 20 in `%LOCALAPPDATA%\QuickBooksMcpConnector`. The connector is installed from the hub's own `npm pack` (`/connector/package.tgz`). It starts from a Startup-folder VBS that runs a hidden `run.cmd` restart loop. A firewall rule allows TCP 8766 from 100.64.0.0/10 only.
+- **Routing:** one session per workstation; an agent on a workstation uses its own PC's QuickBooks, everyone else uses the default.
+
+**Why:**
+- Station setup had to survive reboots and not depend on git, GitHub or the PC's own Node version (winax needs Node 20).
+- A Scheduled Task "at logon" can need admin, and a Windows service can't reach QuickBooks' window or the user's mapped drives. The Startup folder runs in the user's session with no admin, and the cmd loop restarts on crashes.
+- Serving the package from the hub keeps every connector on the hub's exact build.
+- Routing by the agent's own PC matches how the office works (agents run on the workstations) and lets two workstations work at once.
+
+**Alternatives rejected:**
+- `npx github:...` each start: it needs git and a network fetch, and it builds from source on every station.
+- Task Scheduler / a Windows service: the admin and session-0 problems above.
+- One shared session that switches workstations: two workstations couldn't work at once.
+
+**Tradeoffs / consequences:**
+- The connector runs only while a user is logged on to the workstation.
+- The firewall step needs one UAC prompt; if it's declined, the hub can't reach the PC.
+- A file open on two workstations hits QuickBooks' own locking (9008).
+
+**Revisit when:** a workstation must serve QuickBooks with nobody logged on.
+
+---
+
 ## 2026-10-06 — Hub + QuickBooks Connector replaces "everything on the QB PC" (reverses the 2025 qb-bridge rejection)
 
 **Chosen:** Split the server. The **hub** (office Linux box, Docker) owns MCP, tools, session logic, access control, the control page and a hub-held login vault. A thin **connector** on each QuickBooks workstation owns only what must run there: COM, QB launch/close/force-close, health, autofill, and file discovery/browse/drives. The full design and phases are in `docs/CONNECTOR_DESIGN.md`. Phase 1 (this entry's code): the `QBHost` seam with `localQBHost`, no behavior change.

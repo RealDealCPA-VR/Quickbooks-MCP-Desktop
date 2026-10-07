@@ -19,7 +19,8 @@ import { HubHost, NoWorkstationError } from "../src/hub/hub-host.js";
 import { WorkstationRegistry, WORKSTATION_ONLINE_MS } from "../src/hub/workstations.js";
 import { hubDecrypt, hubEncrypt, hubPasswordProtector, loadOrCreateHubKey } from "../src/util/hub-vault.js";
 import { startWebServer, type WebServerHandle } from "../src/web/server.js";
-import type { LoginAutofillResult } from "../src/util/qb-credentials.js";
+import { readStore, type LoginAutofillResult } from "../src/util/qb-credentials.js";
+import { makeLoginExporter, type ExportedLogin } from "../src/connector/login-export.js";
 
 const SECRET = "s".repeat(43);
 const CUSTOMER_XML = `<?xml version="1.0" ?>
@@ -88,10 +89,10 @@ afterEach(async () => {
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
-async function startPair() {
+async function startPair(connectorExtras: { exportLogins?: () => Promise<ExportedLogin[]> } = {}) {
   const ws = fakeWorkstation();
   connector = await startConnectorServer({
-    port: 0, secret: SECRET, hubAddresses: [], listenHosts: ["127.0.0.1"], version: "test", host: ws.host, autofill: ws.autofill,
+    port: 0, secret: SECRET, hubAddresses: [], listenHosts: ["127.0.0.1"], version: "test", host: ws.host, autofill: ws.autofill, ...connectorExtras,
   });
   const registry = new WorkstationRegistry(path.join(tmp, "workstations.json"));
   const mgr = new QBSessionManager({ companyFile: "", appName: "vitest-hub", qbxmlVersion: "16.0" }, new HubHost(registry));
@@ -107,6 +108,7 @@ async function startPair() {
     identifyCaller: async () => ({ kind: "local", via: "loopback" }),
     workstations: registry,
     protect: hubPasswordProtector(),
+    connectorPackagePath: path.join(tmp, "quickbooks-desktop-mcp-1.0.0.tgz"),
   });
   const hub = `http://127.0.0.1:${web.port}`;
   const register = () => postJson<{ ok: boolean; name: string }>(`${hub}/connector/register`,
@@ -239,5 +241,141 @@ describe("hub ↔ connector", () => {
     expect((await api("/api/workstations/select", { id: "nope" })).status).toBe(404);
     expect((await api("/api/workstations/forget", { id: "n-books" })).status).toBe(200);
     expect(registry.list().map((w) => w.name)).toEqual(["QB-PC-1"]);
+  });
+});
+
+describe("several workstations at once (HubSessions routing)", () => {
+  it("agents use their own PC's QuickBooks; others use the default; each workstation has its own session", async () => {
+    const { HubSessions } = await import("../src/hub/sessions.js");
+    const a = fakeWorkstation();
+    const b = fakeWorkstation();
+    const ca = await startConnectorServer({ port: 0, secret: SECRET, hubAddresses: [], listenHosts: ["127.0.0.1"], version: "t", host: a.host, autofill: a.autofill });
+    const cb = await startConnectorServer({ port: 0, secret: SECRET, hubAddresses: [], listenHosts: ["127.0.0.1"], version: "t", host: b.host, autofill: b.autofill });
+    try {
+      const reg = new WorkstationRegistry(path.join(tmp, "multi.json"));
+      reg.register({ id: "node-a", name: "my-pc", address: "127.0.0.1", port: ca.port, secret: SECRET, version: "t", platform: "win32" });
+      reg.register({ id: "node-b", name: "books-pc", address: "127.0.0.1", port: cb.port, secret: SECRET, version: "t", platform: "win32" });
+      reg.setActive("node-b");
+      const hub = new HubSessions(reg, { companyFile: "", appName: "vitest-multi", qbxmlVersion: "16.0" });
+      const agentOnA = { kind: "tailnet" as const, address: "100.64.0.10", nodeId: "node-a", nodeName: "my-pc", loginName: "me@x" };
+      const laptop = { kind: "tailnet" as const, address: "100.64.0.11", nodeId: "node-laptop", nodeName: "laptop", loginName: "me@x" };
+      const local = { kind: "local" as const, via: "loopback" as const };
+      expect(hub.routeFor(agentOnA)).toBe("node-a");
+      expect(hub.routeFor(laptop)).toBe("node-b");
+      expect(hub.routeFor(local)).toBe("node-b");
+
+      for (const m of [hub.forCaller(agentOnA), hub.forCaller(laptop)]) (m as unknown as { simulationMode: boolean }).simulationMode = false;
+      expect(hub.forCaller(agentOnA)).not.toBe(hub.forCaller(laptop));
+      expect(hub.forPage()).toBe(hub.forCaller(laptop));
+      await Promise.all([hub.forCaller(agentOnA).queryEntity("Customer"), hub.forCaller(laptop).queryEntity("Customer")]);
+      expect(a.calls).toContain("ProcessRequest CustomerQuery");
+      expect(b.calls).toContain("ProcessRequest CustomerQuery");
+      expect(hub.describe("node-a")).toEqual({ connected: true, companyFile: "" });
+
+      // my-pc goes offline → its agents fall back to the default workstation.
+      const stale = new WorkstationRegistry(path.join(tmp, "multi.json"), () => Date.now() + WORKSTATION_ONLINE_MS + 1);
+      const hub2 = new HubSessions(stale, { companyFile: "", appName: "vitest-multi", qbxmlVersion: "16.0" });
+      expect(hub2.routeFor(agentOnA)).toBe("node-b");
+    } finally {
+      await ca.close();
+      await cb.close();
+    }
+  });
+
+  it("no default and nothing online → the no-workstation session (9012)", async () => {
+    const { HubSessions } = await import("../src/hub/sessions.js");
+    const hub = new HubSessions(new WorkstationRegistry(path.join(tmp, "empty.json")), { companyFile: "", appName: "v", qbxmlVersion: "16.0" });
+    expect(hub.routeFor({ kind: "local", via: "loopback" })).toBeNull();
+    await expect(hub.forPage().getHost().isQuickBooksRunning()).rejects.toMatchObject({ statusCode: 9012 });
+  });
+});
+
+describe("importing a workstation's saved logins", () => {
+  it("the exporter decrypts on the PC, reports UNC paths and flags unreadable passwords", async () => {
+    const vaultPath = path.join(tmp, "pc-vault.json");
+    await fs.writeFile(vaultPath, JSON.stringify({ version: 2, entries: [
+      { companyFile: "Q:\\Acme\\Acme.qbw", username: "Admin", password: "BLOB-1", updatedAt: "", authorizedPeers: [{ address: "100.64.0.5", nodeId: "nLAP", nodeName: "laptop", addedAt: "" }] },
+      { companyFile: "C:\\Local\\Old.qbw", username: "Clerk", password: "BLOB-BAD", updatedAt: "", authorizedPeers: [] },
+      { companyFile: "C:\\Local\\NoPw.qbw", username: "Owner", password: "", updatedAt: "", authorizedPeers: [] },
+    ] }));
+    const exporter = makeLoginExporter({
+      vaultPath,
+      listDrives: async () => [{ path: "Q:\\", label: "", kind: "network", ready: true, unc: "\\\\files\\books" }],
+      unprotect: async (blobs) => blobs.map((b) => (b === "BLOB-1" ? "pw-one" : "")),
+    });
+    expect(await exporter()).toEqual([
+      { companyFile: "\\\\files\\books\\Acme\\Acme.qbw", username: "Admin", password: "pw-one", authorizedPeers: [expect.objectContaining({ nodeId: "nLAP" })] },
+      { companyFile: "C:\\Local\\Old.qbw", username: "Clerk", password: "", unreadable: true, authorizedPeers: [] },
+      { companyFile: "C:\\Local\\NoPw.qbw", username: "Owner", password: "", authorizedPeers: [] },
+    ]);
+  });
+
+  it("the page's import re-encrypts on the hub, carries grants, and grants the source workstation", async () => {
+    const unc = "\\\\files\\books\\Acme\\Acme.qbw";
+    const { api, registry } = await startPair({
+      exportLogins: async () => [
+        { companyFile: unc, username: "Admin", password: "pw-one", authorizedPeers: [{ address: "100.64.0.5", nodeId: "nLAP", nodeName: "laptop", addedAt: "" }] },
+        { companyFile: "C:\\Local\\Old.qbw", username: "Clerk", password: "", unreadable: true, authorizedPeers: [] },
+        { companyFile: "not-a-path", username: "x", password: "y", authorizedPeers: [] },
+      ],
+    });
+    // The record's address is how the hub reaches the connector, so it's loopback in this test
+    // (and loopback is never granted, unlike a real workstation's tailnet address).
+    registry.register({ id: "nVR", name: "vr", address: "127.0.0.1", port: connector!.port, secret: SECRET, version: "t", platform: "win32" });
+    const r = await api("/api/workstations/import-logins", { id: "nVR" });
+    expect(r.status).toBe(200);
+    expect(r.json).toMatchObject({ workstation: "vr", logins: 2 });
+    expect(r.json.skipped.map((x: any) => x.companyFile)).toEqual(["C:\\Local\\Old.qbw", "not-a-path"]);
+    const store = readStore(process.env.QB_CREDENTIALS_FILE!);
+    const acme = store.entries.find((e) => e.companyFile === unc)!;
+    expect(acme.password.startsWith("hub1:")).toBe(true);
+    expect(hubDecrypt(acme.password, loadOrCreateHubKey(process.env.QB_HUB_KEY_FILE!))).toBe("pw-one");
+    expect(acme.authorizedPeers.map((p) => p.nodeName)).toEqual(["laptop"]); // loopback source is not granted
+    expect(JSON.stringify(store)).not.toContain("pw-one");
+    expect((await api("/api/workstations/import-logins", { id: "nope" })).status).toBe(404);
+  });
+});
+
+describe("one-line workstation installer", () => {
+  const get = (url: string) =>
+    new Promise<{ status: number; type: string; body: Buffer }>((resolve, reject) => {
+      http.get(url, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, type: String(res.headers["content-type"]), body: Buffer.concat(chunks) }));
+      }).on("error", reject);
+    });
+
+  it("serves an ASCII, CRLF PowerShell script pointing at the hub, and the connector package", async () => {
+    await startPair();
+    const hub = `http://127.0.0.1:${web!.port}`;
+    const script = await get(`${hub}/connector/install.ps1`);
+    expect(script.status).toBe(200);
+    expect(script.type).toContain("text/plain");
+    const text = script.body.toString("latin1");
+    expect(script.body.some((b) => b > 127)).toBe(false);
+    expect(text).toContain("\r\n");
+    expect(text).toContain(`$Hub = 'http://127.0.0.1:${web!.port}'`);
+    expect(text).toContain("$Port = 8766");
+    expect(text).toContain("/connector/package.tgz");
+    expect(text).not.toMatch(/__HUB__|__PORT__|__DIR__/);
+
+    expect((await get(`${hub}/connector/package.tgz`)).status).toBe(404); // not built yet
+    await fs.writeFile(path.join(tmp, "quickbooks-desktop-mcp-1.0.0.tgz"), Buffer.from([0x1f, 0x8b, 1, 2, 3]));
+    const pkg = await get(`${hub}/connector/package.tgz`);
+    expect(pkg.status).toBe(200);
+    expect(pkg.type).toBe("application/gzip");
+    expect([...pkg.body]).toEqual([0x1f, 0x8b, 1, 2, 3]);
+  });
+
+  it("a server that isn't a hub doesn't offer them", async () => {
+    const mgr = new QBSessionManager({ companyFile: "", appName: "v", qbxmlVersion: "16.0" });
+    web = await startWebServer({
+      port: 0, listenHosts: ["127.0.0.1"], bindTailnet: false,
+      createMcpServer: () => new McpServer({ name: "t", version: "1" }),
+      getSession: () => mgr, tailscale: async () => "",
+      identifyCaller: async () => ({ kind: "local", via: "loopback" }),
+    });
+    expect((await get(`http://127.0.0.1:${web.port}/connector/install.ps1`)).status).toBe(404);
   });
 });

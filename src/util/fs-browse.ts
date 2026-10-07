@@ -19,6 +19,8 @@ export interface DriveEntry {
   kind: "fixed" | "network" | "removable" | "cdrom" | "other";
   /** False for an empty card reader / disc drive or a disconnected network drive. */
   ready: boolean;
+  /** For a mapped network drive: the share it points to, e.g. "\\\\fileserver\\books". */
+  unc?: string;
 }
 
 export interface BrowseListing {
@@ -42,12 +44,15 @@ const DRIVE_LIST_TIMEOUT_MS = 8000;
 /** Folders Windows keeps at drive roots that never hold company files. */
 const HIDDEN_FOLDERS = new Set(["system volume information", "recovery", "config.msi"]);
 
-// One line per drive: "C:\|Fixed|True|Windows". Pure ASCII (PowerShell 5.1).
-// A disconnected network drive can stall IsReady, hence the outer time limit.
+// One line per drive: "C:\|Fixed|True||Windows", or for a mapped drive
+// "Q:\|Network|True|\\fileserver\books|Books". Pure ASCII (PowerShell 5.1).
+// The UNC root comes from Get-PSDrive's DisplayRoot (no admin needed). A
+// disconnected network drive can stall IsReady, hence the outer time limit.
 const PS_LIST_DRIVES =
   "[System.IO.DriveInfo]::GetDrives() | ForEach-Object { " +
-  "$l = ''; $r = $false; try { $r = $_.IsReady; if ($r) { $l = $_.VolumeLabel } } catch {} ; " +
-  "'{0}|{1}|{2}|{3}' -f $_.Name, $_.DriveType, $r, $l }";
+  "$l = ''; $r = $false; $u = ''; try { $r = $_.IsReady; if ($r) { $l = $_.VolumeLabel } } catch {} ; " +
+  "try { $u = (Get-PSDrive -Name $_.Name.Substring(0,1) -ErrorAction Stop).DisplayRoot } catch {} ; " +
+  "'{0}|{1}|{2}|{3}|{4}' -f $_.Name, $_.DriveType, $r, $u, $l }";
 
 export function parseDriveLines(out: string): DriveEntry[] {
   const kinds: Record<string, DriveEntry["kind"]> = {
@@ -58,14 +63,30 @@ export function parseDriveLines(out: string): DriveEntry[] {
     .map((line) => line.trim())
     .filter((line) => /^[A-Za-z]:\\\|/.test(line))
     .map((line) => {
-      const [root, type, ready, ...label] = line.split("|");
+      const [root, type, ready, unc, ...label] = line.split("|");
+      const share = (unc ?? "").trim().replace(/\\+$/, "");
       return {
         path: root.toUpperCase(),
         label: label.join("|").trim(),
         kind: kinds[type.trim().toLowerCase()] ?? "other",
         ready: ready.trim().toLowerCase() === "true",
+        ...(share.startsWith("\\\\") ? { unc: share } : {}),
       };
     });
+}
+
+/**
+ * Rewrite a path on a mapped drive to its UNC form ("Q:\\Acme\\Acme.qbw" →
+ * "\\\\fileserver\\books\\Acme\\Acme.qbw"). Company files on a file server
+ * then have one identity on every workstation, whatever letter each PC
+ * mapped. Other paths are returned unchanged.
+ */
+export function toUncPath(p: string, drives: DriveEntry[]): string {
+  const m = /^([A-Za-z]):(?:\\(.*))?$/.exec(String(p ?? "").trim());
+  if (!m) return p;
+  const d = drives.find((x) => x.unc && x.path.toUpperCase() === `${m[1].toUpperCase()}:\\`);
+  if (!d?.unc) return p;
+  return m[2] ? `${d.unc}\\${m[2]}` : `${d.unc}\\`;
 }
 
 /** Fallback when PowerShell is unavailable: probe C:..Z: (A:/B: are floppy letters). */

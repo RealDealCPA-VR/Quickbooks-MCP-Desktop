@@ -177,11 +177,11 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
     <div id="jobBox" class="banner info hidden" role="status"></div>
     <div class="panel hidden" id="wsPanel">
       <h2>Workstations</h2>
-      <p class="lead">QuickBooks runs on these PCs. A workstation appears here when its QuickBooks connector is running, and agents' QuickBooks requests go to the one marked <b>In use</b>.</p>
+      <p class="lead">QuickBooks runs on these PCs. A workstation appears here while its QuickBooks connector runs. Agents on a workstation use <b>its own</b> QuickBooks; every other agent, and this page, uses the <b>Default</b> one. Each workstation keeps its own open company file.</p>
       <div id="wsList"></div>
       <details class="small" id="wsHow" style="margin-top:10px">
         <summary><b>Enable QuickBooks on a workstation</b></summary>
-        <p class="hint">On the workstation (Windows, with QuickBooks Desktop, Tailscale and Node 20), run in PowerShell. Keep it running while the books should be available; it shows as offline when stopped.</p>
+        <p class="hint">On the workstation (Windows, with QuickBooks Desktop and Tailscale), paste this into PowerShell. It installs a private Node.js 20 and the connector from this hub, starts it at every logon, and opens the firewall to the tailnet only (Windows asks for admin once). Run it again any time to update.</p>
         <div id="wsCmd"></div>
       </details>
     </div>
@@ -361,7 +361,7 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
     var c = clear($("topChips")), me = state.me;
     if (state.hub) {
       var act = (state.hub.workstations || []).filter(function (w) { return w.active; })[0];
-      c.appendChild(chip(act ? "QuickBooks on " + act.name + (act.online ? "" : " (offline)") : "No workstation in use", act && act.online ? "ok" : "warn"));
+      c.appendChild(chip(act ? "Default workstation: " + act.name + (act.online ? "" : " (offline)") : "No default workstation", act && act.online ? "ok" : "warn"));
     } else c.appendChild(chip(state.simulationMode ? "Simulation mode" : "Live QuickBooks", state.simulationMode ? "warn" : "ok"));
     c.appendChild(chip(me.kind === "local" ? "You: this computer" : "You: " + me.nodeName + " (" + me.address + ")"));
     var u = chip("Updated just now"); u.id = "updChip"; c.appendChild(u);
@@ -632,14 +632,22 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
       var f = el("div", null, "file"), left = el("div"), h = el("h3");
       h.appendChild(dot(w.online ? "ok" : "bad")); h.appendChild(document.createTextNode(" " + w.name));
       h.appendChild(chip(w.online ? "Available" : "Offline", w.online ? "ok" : "bad"));
-      if (w.active) h.appendChild(chip("In use", "info"));
+      if (w.active) h.appendChild(chip("Default", "info"));
+      if (w.session && w.session.connected) h.appendChild(chip("Open: " + (base(w.session.companyFile) || "current file"), "ok"));
       left.appendChild(h);
       left.appendChild(el("div", w.address + " \u00b7 connector " + (w.version || "?") + " \u00b7 last check-in " + ago(w.lastSeenAt), "path"));
       f.appendChild(left);
       var act = el("div", null, "row");
-      if (!w.active) act.appendChild(btn("Use for QuickBooks", w.online ? "primary" : "", function () {
-        if (!confirm("Send QuickBooks requests to " + w.name + "?\n\nAny open QuickBooks session on the current workstation is ended first.")) return;
-        api("/api/workstations/select", { id: w.id }).then(function () { toast("QuickBooks requests now go to " + w.name + "."); load(); }).catch(function (e) { toast(e.message, "err"); });
+      if (!w.active) act.appendChild(btn("Make default", w.online ? "primary" : "", function () {
+        api("/api/workstations/select", { id: w.id }).then(function () { toast(w.name + " is now the default workstation."); load(); }).catch(function (e) { toast(e.message, "err"); });
+      }));
+      if (w.online) act.appendChild(btn("Import saved logins", "", function () {
+        if (!confirm("Copy the QuickBooks logins saved on " + w.name + " into the hub?\n\nPasswords are re-encrypted on the hub. Device access for those files comes along, and " + w.name + " itself is given access to each file.")) return;
+        api("/api/workstations/import-logins", { id: w.id }).then(function (r) {
+          var msg = "Imported " + r.logins + " login(s) and " + r.grants + " device grant(s) from " + r.workstation + ".";
+          if (r.skipped.length) msg += " " + r.skipped.length + " need attention: " + r.skipped.map(function (x) { return base(x.companyFile) + " (" + x.reason + ")"; }).join("; ");
+          toast(msg, r.skipped.length ? "warn" : "ok"); load();
+        }).catch(function (e) { toast(e.message, "err"); });
       }));
       act.appendChild(btn("Forget", "", function () {
         if (!confirm("Forget " + w.name + "? It reappears the next time its connector runs.")) return;
@@ -648,11 +656,16 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
       f.appendChild(act); box.appendChild(f);
     });
     if (list.filter(function (w) { return w.online; }).length > 1 && !list.some(function (w) { return w.active; })) {
-      box.appendChild(el("p", "Several workstations are available: choose the one QuickBooks requests should use.", "hint"));
+      box.appendChild(el("p", "Several workstations are available: choose the default for agents that aren't on a workstation (and for this page).", "hint"));
     }
     $("wsHow").open = !list.length;
     var cmd = clear($("wsCmd"));
-    if (hub.hubUrl) cmd.appendChild(copyRow("PowerShell:", '$env:QB_HUB_URL="' + hub.hubUrl + '"; npx -y -p ' + hub.connectorPackage + " quickbooks-desktop-mcp-connector"));
+    if (hub.hubUrl) {
+      cmd.appendChild(copyRow("Install / update:", "irm " + hub.hubUrl + "/connector/install.ps1 | iex"));
+      cmd.appendChild(copyRow("Remove:", "$env:QB_CONNECTOR_UNINSTALL='1'; irm " + hub.hubUrl + "/connector/install.ps1 | iex"));
+      cmd.appendChild(el("p", "Without installing (runs only while the window stays open, needs Node 20):", "hint"));
+      cmd.appendChild(copyRow("Manual:", '$env:QB_HUB_URL="' + hub.hubUrl + '"; npx -y -p ' + hub.connectorPackage + " quickbooks-desktop-mcp-connector"));
+    }
     else cmd.appendChild(el("p", "This hub has no tailnet address, so workstations can't reach it. Check Tailscale on the hub.", "hint"));
   }
 
@@ -708,7 +721,7 @@ export const ADMIN_PAGE_HTML = String.raw`<!doctype html>
       if (!r.drives.length) { list.appendChild(el("p", "No drives found.", "empty")); return; }
       var kinds = { fixed: "Local disk", network: "Network drive", removable: "Removable", cdrom: "Disc drive", other: "Drive" };
       r.drives.forEach(function (d) {
-        var meta = (d.label ? d.label + " \u00b7 " : "") + (kinds[d.kind] || "Drive") + (d.ready ? "" : " \u00b7 not ready");
+        var meta = (d.label ? d.label + " \u00b7 " : "") + (d.unc ? d.unc + " \u00b7 " : "") + (kinds[d.kind] || "Drive") + (d.ready ? "" : " \u00b7 not ready");
         list.appendChild(pickItem("\u25a4", d.path, meta, "", function () { browseTo(d.path); }));
       });
     }).catch(function (e) { clear(list).appendChild(el("p", e.message, "empty")); });

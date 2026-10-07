@@ -9,6 +9,12 @@
     "quickbooks-desktop-mcp-doctor": "dist/cli/doctor.js",
     "quickbooks-desktop-mcp-connector": "dist/connector/main.js"
   },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "SKILL.md"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

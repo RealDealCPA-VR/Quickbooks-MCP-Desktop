@@ -7,15 +7,18 @@ import path from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { BrowseError, browseDirectory, parseDriveLines } from "../src/util/fs-browse.js";
+import { BrowseError, browseDirectory, parseDriveLines, toUncPath } from "../src/util/fs-browse.js";
+import { withUncPaths } from "../src/connector/unc-host.js";
+import { localQBHost } from "../src/session/qb-host.js";
 
 describe("parseDriveLines (PowerShell DriveInfo output)", () => {
   it("maps root, type, readiness and label; skips noise lines", () => {
     const out = [
-      "C:\\|Fixed|True|Windows",
-      "D:\\|Fixed|True|",
-      "E:\\|CDRom|False|",
-      "Z:\\|Network|True|Clients|Share",
+      "C:\\|Fixed|True||Windows",
+      "D:\\|Fixed|True||",
+      "E:\\|CDRom|False||",
+      "Z:\\|Network|True|\\\\files\\books|Clients|Share",
+      "Y:\\|Network|False|\\\\files\\archive\\|",
       "",
       "WARNING: something unrelated",
     ].join("\r\n");
@@ -23,7 +26,8 @@ describe("parseDriveLines (PowerShell DriveInfo output)", () => {
       { path: "C:\\", label: "Windows", kind: "fixed", ready: true },
       { path: "D:\\", label: "", kind: "fixed", ready: true },
       { path: "E:\\", label: "", kind: "cdrom", ready: false },
-      { path: "Z:\\", label: "Clients|Share", kind: "network", ready: true },
+      { path: "Z:\\", label: "Clients|Share", kind: "network", ready: true, unc: "\\\\files\\books" },
+      { path: "Y:\\", label: "", kind: "network", ready: false, unc: "\\\\files\\archive" },
     ]);
   });
   it("unknown drive types become 'other'", () => {
@@ -67,5 +71,34 @@ describe("browseDirectory", () => {
     await expect(browseDirectory("")).rejects.toThrow(/full folder path/);
     await expect(browseDirectory(path.join(root, "nope"))).rejects.toThrow(/Folder not found/);
     await expect(browseDirectory(path.join(root, "acme.qbw"))).rejects.toThrow(/Not a folder/);
+  });
+});
+
+describe("UNC identity for files on a file server", () => {
+  const drives = [
+    { path: "C:\\", label: "", kind: "fixed" as const, ready: true },
+    { path: "Q:\\", label: "Books", kind: "network" as const, ready: true, unc: "\\\\files\\books" },
+  ];
+  it("mapped letters become the share path; other paths are unchanged", () => {
+    expect(toUncPath("Q:\\Acme\\Acme.qbw", drives)).toBe("\\\\files\\books\\Acme\\Acme.qbw");
+    expect(toUncPath("q:\\", drives)).toBe("\\\\files\\books\\");
+    expect(toUncPath("Q:", drives)).toBe("\\\\files\\books\\");
+    expect(toUncPath("C:\\Clients\\A.qbw", drives)).toBe("C:\\Clients\\A.qbw");
+    expect(toUncPath("\\\\files\\books\\A.qbw", drives)).toBe("\\\\files\\books\\A.qbw");
+  });
+  it("the connector's host browses and discovers through the UNC path", async () => {
+    const seen: string[] = [];
+    const host = withUncPaths({
+      ...localQBHost,
+      listDrives: async () => drives,
+      browse: async (dir) => { seen.push(`browse ${dir}`); return { path: dir, parent: null, folders: [], files: [], truncated: false }; },
+      fileExists: async (p) => { seen.push(`exists ${p}`); return true; },
+      findCompanyFiles: async (root) => { seen.push(`find ${root}`); return [{ companyFile: "Q:\\Acme\\Acme.qbw", displayName: "Acme", sizeBytes: 1, modifiedAt: "" }]; },
+    });
+    expect((await host.browse("Q:\\Acme")).path).toBe("\\\\files\\books\\Acme");
+    await host.fileExists("Q:\\Acme\\Acme.qbw");
+    const found = await host.findCompanyFiles("Q:\\", 2);
+    expect(found[0].companyFile).toBe("\\\\files\\books\\Acme\\Acme.qbw");
+    expect(seen).toEqual(["browse \\\\files\\books\\Acme", "exists \\\\files\\books\\Acme\\Acme.qbw", "find \\\\files\\books\\"]);
   });
 });

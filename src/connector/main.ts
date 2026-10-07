@@ -21,6 +21,8 @@ import { fileURLToPath } from "node:url";
 import { tailnetSelfAddresses } from "../util/tailnet.js";
 import { CONNECTOR_HEARTBEAT_MS, CONNECTOR_PROTOCOL, DEFAULT_CONNECTOR_PORT, postJson } from "./protocol.js";
 import { startConnectorServer } from "./server.js";
+import { withUncPaths } from "./unc-host.js";
+import { localQBHost } from "../session/qb-host.js";
 
 function configPath(): string {
   if (process.env.QB_CONNECTOR_CONFIG?.trim()) return process.env.QB_CONNECTOR_CONFIG;
@@ -69,7 +71,8 @@ async function main(): Promise<void> {
   }
   const secret = loadOrCreateSecret(configPath());
   const version = packageVersion();
-  const server = await startConnectorServer({ port, secret, hubAddresses, listenHosts: ["127.0.0.1", ...self], version });
+  // Mapped drive letters are reported as their file-server (UNC) paths.
+  const server = await startConnectorServer({ port, secret, hubAddresses, listenHosts: ["127.0.0.1", ...self], version, host: withUncPaths(localQBHost) });
 
   console.error(`QuickBooks connector ${version} on ${os.hostname()}`);
   console.error(`  Listening: ${server.urls.join("  ")}`);

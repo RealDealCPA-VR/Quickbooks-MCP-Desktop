@@ -251,7 +251,7 @@ describe("credential store", () => {
   });
 
   it("helper scripts exist and are pure ASCII (Windows PowerShell 5.1 misreads BOM-less UTF-8)", async () => {
-    for (const s of ["qb-dpapi-protect.ps1", "qb-login-autofill.ps1", "qb-close-desktop.ps1"]) {
+    for (const s of ["qb-dpapi-protect.ps1", "qb-dpapi-unprotect.ps1", "qb-login-autofill.ps1", "qb-close-desktop.ps1"]) {
       await expect(fs.access(resolveScriptPath(s))).resolves.toBeUndefined();
       expect(readFileSync(resolveScriptPath(s)).some((b) => b > 127)).toBe(false);
     }

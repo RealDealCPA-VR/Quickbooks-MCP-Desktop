@@ -1,5 +1,14 @@
 # Handoff State
 
+> **Update 2026-10-07: hub + connector made production-shaped (#110-#112), merged to master.**
+> - **Several workstations at once** ([src/hub/sessions.ts](src/hub/sessions.ts)): per-workstation sessions; agents on a workstation use their own PC; others use the default.
+> - **File server:** connectors report mapped drives as UNC ([src/connector/unc-host.ts](src/connector/unc-host.ts), `toUncPath`).
+> - **Import saved logins** ([src/hub/import-logins.ts](src/hub/import-logins.ts), [src/connector/login-export.ts](src/connector/login-export.ts), `scripts/qb-dpapi-unprotect.ps1`).
+> - **One-line installer** ([src/hub/installer.ts](src/hub/installer.ts)): `/connector/install.ps1` + `/connector/package.tgz` (packed in the hub image).
+> - **Verified:** 69 files / 1843 passed (the 5 Windows-only failures, as before); all .ps1 files parse in pwsh; on the tower, the hub served the installer and package, and a connector installed from that package registered.
+> - **Verify first (Windows, live):** ACCEPTANCE_CRITERIA Items 111, 110, 109 (in that order): install line → Available → login import / save → agent opens a file (autofill) → P&L → second workstation → each agent hits its own PC.
+> - **Next:** #112 leftovers (`workstation` arg, 9008 holder), then live fixes from the Windows run.
+
 > **Update 2026-10-06 (latest): #110 hub + connector built and deployed on the tower; live Windows check pending.** Branch `feat/connector-phase1`.
 > - **Hub:** `QB_HUB=1`, Docker in [deploy/hub/](deploy/hub/) (runs on the office Linux box, :8765, tailnet + loopback). Always up; the control page lists **Workstations** and gives the PowerShell line to enable one. `deploy/hub/.env` pins `QB_CONNECTOR_PACKAGE` to this branch until it merges.
 > - **Connector:** `quickbooks-desktop-mcp-connector` ([src/connector/](src/connector/)), port 8766; checks in every 30 s; serves QBHost + COM + autofill to the hub only.

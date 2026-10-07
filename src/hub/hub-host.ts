@@ -34,6 +34,12 @@ export class NoWorkstationError extends Error {
 export interface HubHostOptions {
   vaultPath?: () => string;
   keyPath?: () => string;
+  /**
+   * Bind this host to one workstation (one QuickBooks session per
+   * workstation, see hub/sessions.ts). Undefined = follow the registry's
+   * active workstation; null = no workstation (every call is 9012).
+   */
+  pin?: string | null;
 }
 
 export class HubHost implements QBHost {
@@ -41,8 +47,13 @@ export class HubHost implements QBHost {
 
   constructor(private readonly registry: WorkstationRegistry, private readonly opts: HubHostOptions = {}) {}
 
+  private target(): WorkstationRecord | null {
+    if (this.opts.pin === undefined) return this.registry.active();
+    return this.opts.pin === null ? null : this.registry.get(this.opts.pin);
+  }
+
   get label(): string {
-    return this.registry.active()?.name ?? "no workstation";
+    return this.target()?.name ?? "no workstation";
   }
 
   private vaultPath(): string {
@@ -78,7 +89,7 @@ export class HubHost implements QBHost {
 
   /** The active workstation's host, or NoWorkstationError. */
   current(): RemoteQBHost {
-    const ws = this.registry.active();
+    const ws = this.target();
     if (!ws) throw new NoWorkstationError();
     return this.remoteFor(ws);
   }

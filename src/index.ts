@@ -48,7 +48,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { HubHost } from "./hub/hub-host.js";
+import { HubSessions } from "./hub/sessions.js";
 import { WorkstationRegistry } from "./hub/workstations.js";
 import { hubPasswordProtector } from "./util/hub-vault.js";
 
@@ -94,7 +94,9 @@ import { installAuthorizationGuard, LOCAL_STDIO_CALLER, type CallerIdentity } fr
 import { getWebServerInfo, startWebServer, type WebServerHandle } from "./web/server.js";
 import { registerWorkflowPrompts } from "./prompts/workflows.js";
 import { getQbxmlLogger } from "./util/qbxml-logger.js";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -214,15 +216,30 @@ let sessionManager: QBSessionManager | null = null;
  * is active. Always live; logins are kept in the hub vault.
  */
 const hubMode = process.env.QB_HUB === "1";
-const workstations = hubMode ? new WorkstationRegistry() : null;
 if (hubMode) process.env.QB_SIMULATION = "false";
+const workstations = hubMode ? new WorkstationRegistry() : null;
+/** Hub mode: one QuickBooks session per workstation; callers are routed to theirs. */
+const hubSessions = workstations ? new HubSessions(workstations, config) : null;
 
-function getSessionManager(): QBSessionManager {
-  if (!sessionManager) {
-    sessionManager = workstations
-      ? new QBSessionManager(config, new HubHost(workstations))
-      : new QBSessionManager(config);
+/**
+ * Hub mode: the connector package workstations install (/connector/package.tgz).
+ * QB_CONNECTOR_TARBALL, else the npm pack the hub image puts in <app>/pkg.
+ */
+function connectorPackagePath(): string | undefined {
+  if (process.env.QB_CONNECTOR_TARBALL?.trim()) return process.env.QB_CONNECTOR_TARBALL;
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "pkg");
+  try {
+    const f = readdirSync(dir).find((n) => n.endsWith(".tgz"));
+    return f ? join(dir, f) : undefined;
+  } catch {
+    return undefined;
   }
+}
+
+/** The session the control page (and the startup banner) uses. */
+function getSessionManager(): QBSessionManager {
+  if (hubSessions) return hubSessions.forPage();
+  if (!sessionManager) sessionManager = new QBSessionManager(config);
   return sessionManager;
 }
 
@@ -231,48 +248,50 @@ function getSessionManager(): QBSessionManager {
 // ---------------------------------------------------------------------------
 
 export function createMcpServer(identity: CallerIdentity): McpServer {
+  // Hub mode routes each caller to its own workstation's QuickBooks (hub/sessions.ts).
+  const getSession = hubSessions ? () => hubSessions.forCaller(identity) : getSessionManager;
   const server = newMcpServer();
   // Must run before any register*Tools call: it wraps server.tool so every
   // handler checks the caller's per-company-file authorization (no-op for
   // local callers).
-  installAuthorizationGuard(server, identity, getSessionManager, {
+  installAuthorizationGuard(server, identity, getSession, {
     adminUrl: () => getWebServerInfo().pageUrls.find((u) => !u.includes("127.0.0.1")) ?? null,
   });
-  registerCustomerTools(server, getSessionManager);
-  registerCompanyCredentialTools(server, getSessionManager, identity);
-  registerHealthTools(server, getSessionManager);
-  registerVendorTools(server, getSessionManager);
-  registerAccountTools(server, getSessionManager);
-  registerInvoiceTools(server, getSessionManager);
-  registerBillTools(server, getSessionManager);
-  registerItemTools(server, getSessionManager);
-  registerPaymentTools(server, getSessionManager);
-  registerEstimateTools(server, getSessionManager);
-  registerSalesReceiptTools(server, getSessionManager);
-  registerCreditMemoTools(server, getSessionManager);
-  registerPurchaseOrderTools(server, getSessionManager);
-  registerJournalEntryTools(server, getSessionManager);
-  registerEmployeeTools(server, getSessionManager);
-  registerListTools(server, getSessionManager);
-  registerReportTools(server, getSessionManager);
-  registerTransactionTools(server, getSessionManager);
-  registerForm1099Tools(server, getSessionManager);
-  registerReconciliationTools(server, getSessionManager);
-  registerAttachmentTools(server, getSessionManager);
-  registerPreferenceTools(server, getSessionManager);
-  registerDepositTools(server, getSessionManager);
-  registerCheckTools(server, getSessionManager);
-  registerTransferTools(server, getSessionManager);
-  registerClientPacketTools(server, getSessionManager);
-  registerTimeTrackingTools(server, getSessionManager);
-  registerEngagementProfitabilityTools(server, getSessionManager);
-  registerSalesOrderTools(server, getSessionManager);
-  registerSalesTaxTools(server, getSessionManager);
-  registerInventoryAdjustmentTools(server, getSessionManager);
-  registerStatementChargeTools(server, getSessionManager);
-  registerVehicleMileageTools(server, getSessionManager);
-  registerCustomFieldTools(server, getSessionManager);
-  registerCacheTools(server, getSessionManager);
+  registerCustomerTools(server, getSession);
+  registerCompanyCredentialTools(server, getSession, identity);
+  registerHealthTools(server, getSession);
+  registerVendorTools(server, getSession);
+  registerAccountTools(server, getSession);
+  registerInvoiceTools(server, getSession);
+  registerBillTools(server, getSession);
+  registerItemTools(server, getSession);
+  registerPaymentTools(server, getSession);
+  registerEstimateTools(server, getSession);
+  registerSalesReceiptTools(server, getSession);
+  registerCreditMemoTools(server, getSession);
+  registerPurchaseOrderTools(server, getSession);
+  registerJournalEntryTools(server, getSession);
+  registerEmployeeTools(server, getSession);
+  registerListTools(server, getSession);
+  registerReportTools(server, getSession);
+  registerTransactionTools(server, getSession);
+  registerForm1099Tools(server, getSession);
+  registerReconciliationTools(server, getSession);
+  registerAttachmentTools(server, getSession);
+  registerPreferenceTools(server, getSession);
+  registerDepositTools(server, getSession);
+  registerCheckTools(server, getSession);
+  registerTransferTools(server, getSession);
+  registerClientPacketTools(server, getSession);
+  registerTimeTrackingTools(server, getSession);
+  registerEngagementProfitabilityTools(server, getSession);
+  registerSalesOrderTools(server, getSession);
+  registerSalesTaxTools(server, getSession);
+  registerInventoryAdjustmentTools(server, getSession);
+  registerStatementChargeTools(server, getSession);
+  registerVehicleMileageTools(server, getSession);
+  registerCustomFieldTools(server, getSession);
+  registerCacheTools(server, getSession);
 
   // Phase 18 #86 — workflow-bundle prompts surfaced via the MCP prompts/list +
   // prompts/get API. Bridges the operator's existing skill workflows
@@ -328,7 +347,14 @@ async function main(): Promise<void> {
         stdioConnected: !httpOnly,
         bindTailnet: process.env.QB_WEB_TAILNET !== "0",
         admins: (process.env.QB_WEB_ADMINS ?? "").split(",").filter((a) => a.trim()),
-        ...(workstations ? { workstations, protect: hubPasswordProtector() } : {}),
+        ...(workstations && hubSessions
+          ? {
+              workstations,
+              protect: hubPasswordProtector(),
+              describeWorkstation: (id: string) => hubSessions.describe(id),
+              connectorPackagePath: connectorPackagePath(),
+            }
+          : {}),
       });
     } catch (err) {
       // Typically EADDRINUSE: another instance of this server already serves

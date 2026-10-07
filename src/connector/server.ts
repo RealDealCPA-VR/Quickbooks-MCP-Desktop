@@ -29,6 +29,7 @@ import {
   type PasswordProtector,
 } from "../util/qb-credentials.js";
 import { isLoopback, normalizeIp } from "../util/tailnet.js";
+import { makeLoginExporter, type LoginExporter } from "./login-export.js";
 import {
   COM_OPS,
   CONNECTOR_PROTOCOL,
@@ -77,6 +78,8 @@ export interface ConnectorServerOptions {
   version: string;
   host?: QBHost;
   autofill?: AutofillStarter;
+  /** Saved logins on this PC, decrypted, for a one-time import into the hub. */
+  exportLogins?: LoginExporter;
 }
 
 export interface ConnectorServerHandle {
@@ -128,6 +131,7 @@ function secretMatches(header: string | undefined, secret: string): boolean {
 export async function startConnectorServer(opts: ConnectorServerOptions): Promise<ConnectorServerHandle> {
   const host = opts.host ?? localQBHost;
   const autofill = opts.autofill ?? makeDpapiAutofillStarter();
+  const exportLogins = opts.exportLogins ?? makeLoginExporter({ listDrives: () => host.listDrives() });
   const hubAddresses = new Set(opts.hubAddresses.map(normalizeIp));
 
   const com = new Map<string, { rp: QBRequestProcessor; lastUsed: number }>();
@@ -202,6 +206,8 @@ export async function startConnectorServer(opts: ConnectorServerOptions): Promis
         }
         return entry.done ? { done: true, result: entry.result } : { done: false };
       }
+      case "/v1/logins/export":
+        return { logins: await exportLogins() };
       case "/v1/autofill/cancel": {
         fills.get(String(body.id ?? ""))?.handle.cancel();
         return { ok: true };

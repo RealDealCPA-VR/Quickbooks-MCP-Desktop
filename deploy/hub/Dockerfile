@@ -8,5 +8,6 @@ RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
 COPY scripts ./scripts
-RUN npm run build && npm prune --omit=dev
+# The connector package workstations install from the hub (/connector/package.tgz).
+RUN npm run build && mkdir -p pkg && npm pack --ignore-scripts --pack-destination pkg && npm prune --omit=dev
 ENTRYPOINT ["node", "/app/dist/index.js"]

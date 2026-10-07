@@ -198,6 +198,29 @@ Run agents on your other machines, such as a laptop, an AI box, or a staff works
 - **Who may manage the page:** this PC, devices signed into your own Tailscale account, and anyone you add with `QB_WEB_ADMINS`.
 - **Agents on this PC** (stdio, or `127.0.0.1`) are unrestricted.
 
+## 🏢 Office hub: one always-on server, many QuickBooks workstations
+
+For an office with several QuickBooks PCs and the books on a file server, run the server as a **hub** on an always-on machine (Linux is fine) and give each QuickBooks PC a small **connector**:
+
+```bash
+# On the always-on office server (Docker + Tailscale):
+cd deploy/hub && docker compose up -d     # control page + /mcp on http://<server tailnet IP>:8765
+```
+
+```powershell
+# On each QuickBooks workstation (copy the exact line from the control page → Workstations):
+irm http://<server tailnet IP>:8765/connector/install.ps1 | iex
+```
+
+- **Enable a workstation in one line.** The installer brings its own Node.js 20, installs the connector from the hub, starts it at every logon (restarting if it stops), and opens TCP 8766 to the tailnet only. Run it again to update; `$env:QB_CONNECTOR_UNINSTALL='1'` first removes it.
+- **Available / Offline at a glance.** A workstation appears on the control page while its connector runs.
+- **Several workstations at once.** Each keeps its own QuickBooks session. An agent on a workstation uses **that PC's** QuickBooks; other agents use the **default** workstation.
+- **File-server aware.** Mapped drives are reported as their UNC share, so `Q:\Acme\Acme.qbw` on one PC and `R:\Acme\Acme.qbw` on another are the same company file, with one login and one set of grants.
+- **Logins saved once.** They're kept on the hub (AES-256-GCM) and handed to a workstation only to fill QuickBooks' login window. **Import saved logins** copies an existing PC's logins and grants into the hub.
+- Agents connect to the hub: `{ "type": "http", "url": "http://<server tailnet IP>:8765/mcp" }`. Status `9012` means no workstation is available.
+
+Design and trade-offs: [docs/CONNECTOR_DESIGN.md](docs/CONNECTOR_DESIGN.md).
+
 ## 🩺 Built for a janky desktop
 
 QuickBooks Desktop freezes on big reports, throws dialogs, crashes, and sometimes hands a file to **File Doctor**. The server is built around that:

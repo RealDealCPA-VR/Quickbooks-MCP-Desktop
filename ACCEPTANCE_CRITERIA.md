@@ -8,6 +8,30 @@ Item numbers map to `todo.md`. Add criteria below as you pick up each task. Move
 
 ---
 
+## Item 112 — Several workstations at once _(Phase 21)_
+
+**Status:** partial (core built and tested; two items open).
+
+- [x] `HubSessions` (src/hub/sessions.ts): one QBSessionManager per workstation; an agent on an online workstation uses its own; everyone else (other devices, hub-local callers, the page) uses the default (chosen, else the only one online); its own workstation offline → default.
+- [x] Page: **Default** chip and **Make default**; each workstation shows its open company file; changing the default closes nothing.
+- [x] Tests: two real connectors, two agents, concurrent queries land on the right workstation; offline fallback; nothing available → 9012.
+- [ ] `qb_company_open` optional `workstation` argument.
+- [ ] 9008 names the workstation holding the file, when the hub knows.
+
+---
+
+## Item 111 — One-line installer + login import _(Phase 21)_
+
+**Status:** partial. Built and tested on Linux; live Windows run pending.
+
+- [x] `GET /connector/install.ps1` (owner's devices only): pure ASCII, CRLF, the hub URL baked in (never loopback); `GET /connector/package.tgz` serves the hub image's `npm pack`.
+- [x] Script: private Node 20 (SHA-256 checked against nodejs.org), connector installed from the hub, Startup-folder VBS → hidden `run.cmd` restart loop with log rotation, firewall TCP 8766 from 100.64.0.0/10 (one UAC prompt), refuses to start over a hand-run connector, waits for the port. `QB_CONNECTOR_UNINSTALL=1` removes it all. Parsed clean by PowerShell's parser (pwsh container), as are all `scripts/*.ps1`.
+- [x] **Import saved logins**: the connector decrypts its PC's DPAPI vault (`scripts/qb-dpapi-unprotect.ps1`), paths become UNC; the hub re-encrypts, carries grants and grants the source workstation; unreadable passwords and invalid paths are reported, not fatal.
+- [x] Mapped drives → UNC (`toUncPath`, `withUncPaths`), drive list shows each share.
+- [ ] LIVE (Windows): run the install line on a QB PC → Available within a minute; log off/on → back Available; uninstall line removes it; Import saved logins on `vr` brings its logins with working autofill.
+
+---
+
 ## Item 110 — Hub + connector, single workstation _(Phase 21)_
 
 **Status:** partial. Built, deployed on the tower, tested end to end on Linux; the live Windows check is pending.

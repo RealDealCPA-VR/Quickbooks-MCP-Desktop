@@ -40,6 +40,10 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { QBSessionManager } from "../session/manager.js";
 import { localQBHost, type QBHost } from "../session/qb-host.js";
 import type { WorkstationRegistry } from "../hub/workstations.js";
+import { importWorkstationLogins } from "../hub/import-logins.js";
+import { connectorInstallScript } from "../hub/installer.js";
+import { DEFAULT_CONNECTOR_PORT } from "../connector/protocol.js";
+import { createReadStream } from "node:fs";
 import { CONNECTOR_PROTOCOL } from "../connector/protocol.js";
 import type { CallerIdentity } from "../util/caller-authorization.js";
 import { resolveCompanyRoot } from "../util/company-files.js";
@@ -99,6 +103,10 @@ export interface WebServerOptions {
   listDrives?: DriveLister;
   /** Hub mode: the QuickBooks workstations whose connectors register here. */
   workstations?: WorkstationRegistry;
+  /** Hub mode: the connector package (npm pack of this build) the installer downloads. */
+  connectorPackagePath?: string;
+  /** Hub mode: what each workstation's QuickBooks session has open. */
+  describeWorkstation?: (id: string) => { connected: boolean; companyFile: string } | null;
   /** Test seam: decide the caller identity instead of using the socket address + tailscale whois. */
   identifyCaller?: (req: http.IncomingMessage) => Promise<CallerIdentity | null>;
 }
@@ -365,7 +373,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
       admins: { ownerLogin: selfIdentity?.loginName ?? null, extra: admins },
       hub: opts.workstations
         ? {
-            workstations: opts.workstations.list(),
+            workstations: opts.workstations.list().map((w) => ({ ...w, session: opts.describeWorkstation?.(w.id) ?? null })),
             hostLabel: hostOf().label,
             // What a workstation sets QB_HUB_URL to: this hub's tailnet address.
             hubUrl: mcpUrls.find((u) => !u.includes("127.0.0.1"))?.replace(/\/mcp$/, "") ?? null,
@@ -427,12 +435,22 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
         if (!reg) throw new HttpError(404, "This server is not a hub.");
         const wsId = body.id === null ? null : String(body.id ?? "");
         if (wsId !== null && !reg.get(wsId)) throw new HttpError(404, "Unknown workstation.");
-        // Requests in flight belong to the old workstation's QuickBooks: end that session first.
-        try { await opts.getSession().closeSession(); } catch { /* it may already be gone */ }
+        // Each workstation keeps its own QuickBooks session, so nothing has to close here.
         reg.setActive(wsId);
         const name = wsId ? reg.get(wsId)?.name : null;
-        recordActivity({ level: "info", category: "session", message: name ? `QuickBooks requests now go to ${name}` : "Workstation choice cleared (automatic)", detail: `by ${describeCallerShort(id)}` });
+        recordActivity({ level: "info", category: "session", message: name ? `${name} is now the default workstation` : "Default workstation cleared (automatic)", detail: `by ${describeCallerShort(id)}` });
         sendJson(res, 200, { ok: true, workstations: reg.list() });
+        return;
+      }
+      case "/api/workstations/import-logins": {
+        const reg = opts.workstations;
+        if (!reg) throw new HttpError(404, "This server is not a hub.");
+        if (!opts.protect) throw new HttpError(500, "The hub vault is not configured.");
+        const wsId = String(body.id ?? "");
+        if (!reg.get(wsId)) throw new HttpError(404, "Unknown workstation.");
+        const r = await importWorkstationLogins(reg, wsId, { vaultPath: vaultPath(), protect: opts.protect });
+        recordActivity({ level: "success", category: "logins", message: `Imported ${r.logins} saved login(s) and ${r.grants} device grant(s) from ${r.workstation}`, detail: `by ${describeCallerShort(id)}${r.skipped.length ? `; ${r.skipped.length} need attention` : ""}` });
+        sendJson(res, 200, { ok: true, ...r });
         return;
       }
       case "/api/workstations/forget": {
@@ -570,6 +588,23 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
         if (!isAdmin(id)) {
           if (pathname.startsWith("/api/")) throw new HttpError(403, "This device may not manage QuickBooks logins.");
           sendHtml(res, 403, FORBIDDEN_PAGE_HTML);
+          return;
+        }
+        if (opts.workstations && req.method === "GET" && pathname === "/connector/install.ps1") {
+          // The hub URL the workstation will use: never loopback, which means nothing on another PC.
+          const hostHeader = String(req.headers.host ?? "");
+          const host = /^(127\.|localhost|\[::1\])/i.test(hostHeader)
+            ? `${listenHosts.find((h) => !isLoopback(h)) ?? "127.0.0.1"}:${boundPort()}`
+            : hostHeader;
+          res.writeHead(200, { "Content-Type": "text/plain; charset=us-ascii", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+          res.end(connectorInstallScript(`http://${host}`, DEFAULT_CONNECTOR_PORT));
+          return;
+        }
+        if (opts.workstations && req.method === "GET" && pathname === "/connector/package.tgz") {
+          const pkg = opts.connectorPackagePath;
+          if (!pkg || !existsSync(pkg)) throw new HttpError(404, "This hub has no connector package (set QB_CONNECTOR_TARBALL).");
+          res.writeHead(200, { "Content-Type": "application/gzip", "Content-Length": String(statSync(pkg).size), "Cache-Control": "no-store" });
+          createReadStream(pkg).pipe(res);
           return;
         }
         if (pathname.startsWith("/api/")) {
